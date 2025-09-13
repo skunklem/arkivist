@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QFrame, QInputDialog, QMenu, QToolButton, QHBoxLayout,
 )
 
+from ui.widgets.helpers import PlainNoTab
 from utils.icons import make_checkbox_plus_icon
 
 class TodoTree(QTreeWidget):
@@ -182,7 +183,7 @@ class ChapterTodosWidget(QWidget):
         # ----- Notes column -----
         right = QVBoxLayout()
         lblN = QLabel("Notes")
-        self.notesEdit = QPlainTextEdit()
+        self.notesEdit = PlainNoTab()
         self.notesEdit.setPlaceholderText("Notes for this chapter…")
         self.notesEdit.textChanged.connect(self._mark_notes_dirty)
 

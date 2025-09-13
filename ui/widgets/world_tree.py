@@ -91,7 +91,8 @@ class WorldTree(QTreeWidget):
 
         # --- Handle actions ---
         if act == actEditChar and actEditChar is not None:
-            mw.open_character_editor(obj_id)
+            # mw.open_character_editor(obj_id)
+            mw.open_character_dialog(obj_id)
         elif act == actRename and hasattr(mw, "_rename_world_object"):
             mw._rename_world_object(kind, obj_id)
         elif act == actDelete and hasattr(mw, "_soft_delete_world_object"):

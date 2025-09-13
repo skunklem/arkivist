@@ -1,5 +1,5 @@
-from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Signal
+from PySide6.QtWidgets import QWidget, QPlainTextEdit
+from PySide6.QtCore import Signal, Qt
 
 class DropPane(QWidget):
     fileDropped = Signal(list)  # list[str]
@@ -26,3 +26,27 @@ class DropPane(QWidget):
             event.acceptProposedAction()
             return
         super().dropEvent(event)
+
+class PlainNoTab(QPlainTextEdit):
+    """QPlainTextEdit that uses Tab/Shift+Tab to move focus instead of inserting tabs."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.StrongFocus)   # ensure it can take focus
+        self.setUndoRedoEnabled(True)
+        self.setReadOnly(False)
+
+    def keyPressEvent(self, event):
+        k = event.key()
+        m = event.modifiers()
+        if k == Qt.Key_Tab and not m:
+            # advance focus at the dialog/window level
+            win = self.window()
+            if win:
+                win.focusNextPrevChild(True)
+            return
+        elif k == Qt.Key_Backtab:
+            win = self.window()
+            if win:
+                win.focusNextPrevChild(False)
+            return
+        super().keyPressEvent(event)

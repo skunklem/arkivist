@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem, 
     QInputDialog, QMenu, QFormLayout, QHBoxLayout,
 )
-
+from ui.widgets.helpers import PlainNoTab
 
 class ProjectManagerDialog(QDialog):
     def __init__(self, app, parent=None):
@@ -57,7 +57,7 @@ class ProjectManagerDialog(QDialog):
         self.exportEdit = QLineEdit()
         self.btnBrowseExport = QPushButton("Browse…")
         self.btnBrowseExport.clicked.connect(lambda: self._browse(self.exportEdit))
-        self.descEdit = QPlainTextEdit()
+        self.descEdit = PlainNoTab()
 
         form = QFormLayout()
         form.addRow("Project name:", self.nameEdit)

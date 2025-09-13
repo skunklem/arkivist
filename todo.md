@@ -1,4 +1,5 @@
 TO-Dos
+* Edit button in right panel needs to open character dialog if current world item is type character
 * switch to guids rather than ints as PK if recommended
 * add right click options for chapters in world tree: insert blank chapter before/after | insert chapter from file before/after
 * add chapter reorganization lock to select whether DnD functions for chapter rearrangement (icons with closed or open lock symbols) (goes in line with label over chapter tree)
@@ -23,6 +24,9 @@ TO-Dos
 * Timeline: add since_chapter_id/until_chapter_id to facets to show how traits/goals evolve.
   * some way of tracking when chapters start and end, character appearances, character/item lifespan
   * allow for the creation of calendars to fit novel worlds?
+* update character dialog to have more useful defaults set up rather than just a traits table. I'm imagining this should be fairly similar to a D&D character sheet but we won't go that complex yet. (update character summary in right panel to match)
+* Characters Page:
+  better version of character dialog that overviews lots of characters, have view modes (grid: character cards with the basics; list: character names organized by filters)
 * (asked already - see chatgpt "Characters Page") Characters as a text item feels inadequate. Characters need several linked items (belongings, physical attributes, goals, desires, etc.) and those items should each have an optional short note linked in to add context like where they were acquired or why they're important. As for displaying these things, something more form-like may be better with items able to be added/sorted similar to in the To-Dos section. For items with notes, those could be hover text or the items could be in a table with their extra info in the next cell. Display may vary by the item type, and as this gets more complex, I wonder if it would be best to have a simple version in the right panel for quick viewing but a more complex, better-laid-out version in a dialog box and also anly allow editing in there. Possibly the best option for DB is to keep character as text item but add a features table (or some better name) that can contain name,type,description where the item type can be something like eye color or other physical traits but also a personal goal or belonging. These items can be linked to any or multiple characters by way of possibly the relationships table or some new table. Or do these items fit best in the world_items table? I think belongings could go there, but physical attributes and goals probably can't. What do you suggest? Let me know if I'm missing any alternative ways of looking at this.
 * If world item has aliases, those should be displayed in separate box under text item box
 * Is it possible to add a slider between To-dos and Notes?
@@ -42,3 +46,8 @@ TO-Dos
 * Create visual web of character relationships
 * Swap in better editor
 * View > Focus: Add toggle for focus mode? Include save_all_dirty() beforehand. Hide outer panels. Or add icon buttons to close/open each panel
+* Add created_by and modified_by fields for most columns
+* Enable AI world-item generation based on knowledge of the world/cultures/locations/queries via API
+* Enable AI parsing of chapters to add in world items (ask user to verify before addition to db)
+* Enable AI to create its own stories/videos based on world/situation knowledge
+* Enable gamification (Choose-your-own-adventure style interaction where user is character in project world and interacts with things. AI uses world knowledge to respond appropriately. Creates background images or videos of events. Good way of playtesting world and getting alternate perspective of what NPCs would do based on the details about them present in Arkivist)

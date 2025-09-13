@@ -19,7 +19,7 @@ from ui.widgets.character_editor import CharacterEditorDialog
 from ui.widgets.character_dialog import CharacterDialog
 from ui.widgets.chapter_todos import ChapterTodosWidget
 from ui.widgets.chapters_tree import ChaptersTree
-from ui.widgets.helpers import DropPane
+from ui.widgets.helpers import DropPane, PlainNoTab
 from utils.word_integration import DocxRoundTrip
 from utils.md import docx_to_markdown, md_to_html, read_file_as_markdown
 from utils.files import parse_chapter_filename
@@ -436,13 +436,18 @@ class StoryArkivist(QMainWindow):
                 self.worldDetail._current_world_id = None
 
     def open_character_editor(self, char_id: int):
-        # dlg = CharacterEditorDialog(self, self.db, char_id, self)
-        dlg = CharacterDialog(self, self.db, char_id, self)
+        dlg = CharacterEditorDialog(self, self.db, char_id, self)
         dlg.exec()
         # refresh right panel if it was showing this character
         if getattr(self, "_current_world_id", None) == char_id:
             self.load_world_item(char_id, edit_mode=False)
 
+    def open_character_dialog(self, char_id: int):
+        dlg = CharacterDialog(self, self.db, char_id, self)
+        dlg.exec()
+        # refresh right panel if it was showing this character
+        if getattr(self, "_current_world_id", None) == char_id:
+            self.load_world_item(char_id, edit_mode=False)
 
     def _rename_chapter(self, chap_id: int):
         title = self.db.chapter(chap_id)
@@ -764,9 +769,9 @@ class StoryArkivist(QMainWindow):
         # Bottom tabs
         self.bottomTabs = QTabWidget()
         self.tabTodos = ChapterTodosWidget(self)
-        self.tabProgress = QPlainTextEdit(); self.tabProgress.setPlaceholderText("Progress…")
-        self.tabTimeline = QPlainTextEdit(); self.tabTimeline.setPlaceholderText("Timeline…")
-        self.tabChanges  = QPlainTextEdit(); self.tabChanges.setPlaceholderText("Changes…")
+        self.tabProgress = PlainNoTab(); self.tabProgress.setPlaceholderText("Progress…")
+        self.tabTimeline = PlainNoTab(); self.tabTimeline.setPlaceholderText("Timeline…")
+        self.tabChanges  = PlainNoTab(); self.tabChanges.setPlaceholderText("Changes…")
         self.tabSearch   = QTreeWidget();    self.tabSearch.setHeaderLabels(["Result", "Where"])
         self.tabSearch.itemDoubleClicked.connect(self.open_search_result)
         self.bottomTabs.addTab(self.tabTodos,   "To-Dos/Notes")
@@ -873,7 +878,8 @@ class StoryArkivist(QMainWindow):
         self.titleEdit.textEdited.connect(lambda _=None: self._center_mark_dirty())
 
         # Characters page signals
-        self.charactersPage.characterOpenRequested.connect(self.open_character_editor)
+        # self.charactersPage.characterOpenRequested.connect(self.open_character_editor)
+        self.charactersPage.characterOpenRequested.connect(self.open_character_dialog)
 
     def insert_new_world_item_inline(self, category_id: int, category_item: QTreeWidgetItem,
                                     mode: str = "end", ref_item: QTreeWidgetItem | None = None):
@@ -940,7 +946,8 @@ class StoryArkivist(QMainWindow):
 
         # open characters in character editor
         if item_type == "character":
-            self.open_character_editor(new_id)
+            # self.open_character_editor(new_id)
+            self.open_character_dialog(new_id)
         # Open in right panel, EDIT mode, cursor ready
         else:
             self.load_world_item(new_id, edit_mode=True)  # use your updated method that replaces old load_world_detail

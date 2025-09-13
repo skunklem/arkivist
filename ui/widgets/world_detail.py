@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
 )
 
 from utils.md import md_to_html
+from ui.widgets.helpers import PlainNoTab
 
 class WorldDetailWidget(QWidget):
     """Right panel: shows a world item in View/Edit with back/forward history."""
@@ -50,7 +51,7 @@ class WorldDetailWidget(QWidget):
         self.view.anchorClicked.connect(self._anchor_clicked)
         self.vbox.addWidget(self.view)
 
-        self.edit = QPlainTextEdit()
+        self.edit = PlainNoTab()
         self.edit.setPlaceholderText("Markdown content…")
         self.edit.textChanged.connect(self._mark_dirty)
         self.vbox.addWidget(self.edit)
