@@ -179,3 +179,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# DEV:
+*Test chapter*
+app1*.py
+app2*.py
+storyarkivist_bad_refactor/
+test.ipynb

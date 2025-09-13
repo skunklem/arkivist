@@ -1,0 +1,1 @@
+# common Qt helpers (shortcuts, palettes, message wrappers)
