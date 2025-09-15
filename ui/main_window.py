@@ -442,12 +442,20 @@ class StoryArkivist(QMainWindow):
         if getattr(self, "_current_world_id", None) == char_id:
             self.load_world_item(char_id, edit_mode=False)
 
-    def open_character_dialog(self, char_id: int):
+    # def open_character_dialog(self, char_id: int):
+    #     dlg = CharacterDialog(self, self.db, char_id, self)
+    #     dlg.exec()
+    #     # refresh right panel if it was showing this character
+    #     if getattr(self, "_current_world_id", None) == char_id:
+    #         self.load_world_item(char_id, edit_mode=False)
+
+    def open_character_dialog(self, char_id: int, refresh_world_panel_on_close=True):
         dlg = CharacterDialog(self, self.db, char_id, self)
+        if refresh_world_panel_on_close:
+            dlg.finished.connect(
+                lambda: self.worldDetail.show_item(char_id, add_to_history=False, view_mode=True)
+            )
         dlg.exec()
-        # refresh right panel if it was showing this character
-        if getattr(self, "_current_world_id", None) == char_id:
-            self.load_world_item(char_id, edit_mode=False)
 
     def _rename_chapter(self, chap_id: int):
         title = self.db.chapter(chap_id)

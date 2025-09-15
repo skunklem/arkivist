@@ -18,6 +18,7 @@ TO-Dos
 * recompute_chapter_references needs to account for the potential of some aliases and names spanning multiple words like "Lake Watery" or "the high prince"
 * Add new chapter icon on tree next to "Chapters"
 * How to deal with interludes or Part/Act numbers that should sit between chapters but not imopact the chapter numbering
+  * potential fix: order by setting pointer to chapter/writing that comes before it; add field `is_numbered` where only the true ones get auto-incremented chapter numbers; then `position` can auto-increment (or not if explicit numbering desired); and if all versions of a chapter are marked inactive, numbering will exclude that chapter despite it still being linked between two others by pointer
 * Add facet templates (defaults) per project (“Characters usually have: Eye color, Hair, Height, …”) so the “Add Trait” dialog can present a dropdown of common labels.
 * Add top-level world item defaults based on selected project type (novel:characters,locations,events; memoir:people,locations,events). Certain categories allow nesting (like locations which can have morespecific locations inside them, but characters probably shouldn't allow nesting)
 * Inline linking in goals/notes via your wikilink syntax ([[Some Item]]), reuse your render pipeline.
@@ -44,8 +45,12 @@ TO-Dos
 * ability to pop out any given section of app into its own window (with seamless reordering so it doesn't look too ugly afterward)
 * Add access to soft-deleted books/chapters/world-items
 * Create visual web of character relationships
-* Swap in better editor
 * View > Focus: Add toggle for focus mode? Include save_all_dirty() beforehand. Hide outer panels. Or add icon buttons to close/open each panel
+* Allow exportation of project db
+* Allow merging of multiple projects
+* Auto-detect proper nouns and ask if they need to be incorporated as characters or world items (possibly in bottom panel tab with a number tag that indicates how many potential characters have been found in chapter)
+* on close, save last state so it reopens where user left off
+* Add selector to show bottom panel stuff either by active chapter or all chapters (which would mean figuring out how to display the project to-dos nicely but chapter notes wouldn't appear if showing project details)
 * Add created_by and modified_by fields for most columns
 * Enable AI world-item generation based on knowledge of the world/cultures/locations/queries via API
 * Enable AI parsing of chapters to add in world items (ask user to verify before addition to db)
