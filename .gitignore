@@ -186,3 +186,4 @@ app1*.py
 app2*.py
 storyarkivist_bad_refactor/
 test.ipynb
+dev*.py

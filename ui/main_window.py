@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QPlainTextEdit, QTextBrowser,
     QLineEdit, QLabel, QPushButton, QTabWidget, QFileDialog, QToolBar,
     QDialog, QSizePolicy, QInputDialog, QMenu, QToolButton, QHBoxLayout,
-    QWidgetAction, QAbstractItemDelegate
+    QWidgetAction, QAbstractItemDelegate, QStyle
 )
 from database.db import Database
 from ui.widgets.dialogs import BulkChapterImportDialog, ProjectManagerDialog, WorldImportDialog
@@ -20,6 +20,7 @@ from ui.widgets.character_dialog import CharacterDialog
 from ui.widgets.chapter_todos import ChapterTodosWidget
 from ui.widgets.chapters_tree import ChaptersTree
 from ui.widgets.helpers import DropPane, PlainNoTab
+from utils.icons import make_lock_icon
 from utils.word_integration import DocxRoundTrip
 from utils.md import docx_to_markdown, md_to_html, read_file_as_markdown
 from utils.files import parse_chapter_filename
@@ -162,7 +163,7 @@ class StoryArkivist(QMainWindow):
             self.rebuild_world_item_render(wid)
 
         # Chapters — 4 with 1/2/3/0 mentions
-        base = self.db.chapter_base_index(pid, bid)
+        base = self.db.chapter_base_index(pid, bid) + 1
 
         # C1: 1 mention
         c1 = self.db.chapter_insert(pid, bid, base+0, "Prologue", "The sun rose over the Temple of Dawn.")
@@ -710,8 +711,62 @@ class StoryArkivist(QMainWindow):
         self.refsTree.setHeaderHidden(True)
         self.refsTree.itemClicked.connect(self.on_refs_clicked)
 
-        chapWrap = QWidget(); v1 = QVBoxLayout(chapWrap); v1.setContentsMargins(0,0,0,0)
-        v1.addWidget(QLabel(" Chapters")); v1.addWidget(self.chaptersTree)
+        chapWrap = QWidget()
+        v1 = QVBoxLayout(chapWrap); v1.setContentsMargins(0,0,0,0)
+
+        # --- Chapters header row (label + new + lock) ---
+        chapHeader = QWidget()
+        h = QHBoxLayout(chapHeader); h.setContentsMargins(6,4,6,4); h.setSpacing(6)
+
+        lblChapters = QLabel(" Chapters")
+        # lblChapters.setStyleSheet("font-weight: 600;")  # optional
+
+        h.addWidget(lblChapters)
+        h.addStretch(1)
+
+        # New Chapter button (plus)
+        self.btnNewChapter = QToolButton()
+        self.btnNewChapter.setAutoRaise(True)
+        self.btnNewChapter.setToolTip("New chapter…")
+        self.btnNewChapter.setIcon(
+            QIcon.fromTheme("list-add") or self.style().standardIcon(QStyle.SP_FileIcon)
+        )
+        # quick action: blank new chapter appended at end of current book
+        self.btnNewChapter.clicked.connect(lambda: self.insert_blank_chapter_after_current_last())
+
+        # Lock toggle (reorder lock)
+        self.btnChapterLock = QToolButton()
+        self.btnChapterLock.setObjectName("chapterLock")
+        self.btnChapterLock.setCheckable(True)
+        self.btnChapterLock.setAutoRaise(True)
+        self.btnChapterLock.setChecked(False)
+        self.btnChapterLock.setFocusPolicy(Qt.NoFocus)  # no focus ring
+        self.btnChapterLock.setToolTip("Lock reordering")
+        self.btnChapterLock.setStyleSheet("""
+        #chapterLock,
+        #chapterLock:checked,
+        #chapterLock:hover,
+        #chapterLock:pressed {
+            background: transparent;
+            border: none;
+        }
+        """)
+    
+        # icons: unlocked/locked (fall back to stock)
+        self._iconUnlocked = make_lock_icon(self, locked=False, size=16)
+        self._iconLocked   = make_lock_icon(self, locked=True,  size=16)
+        self.btnChapterLock.setIcon(self._iconUnlocked)
+
+
+        self.btnChapterLock.toggled.connect(self._on_toggle_lock)
+
+        h.addWidget(self.btnNewChapter)
+        h.addWidget(self.btnChapterLock)
+
+        v1.addWidget(chapHeader)
+        v1.addWidget(self.chaptersTree)
+
+        # --- Worldbuilding and referenced-in-chapter trees ---
 
         worldWrap = QWidget(); v2 = QVBoxLayout(worldWrap); v2.setContentsMargins(0,0,0,0)
         v2.addWidget(QLabel(" Worldbuilding")); v2.addWidget(self.worldTree)
@@ -726,6 +781,17 @@ class StoryArkivist(QMainWindow):
         self.leftSplit.setStretchFactor(0, 1)
         self.leftSplit.setStretchFactor(1, 1)
         self.leftSplit.setStretchFactor(2, 1)
+
+    def _on_toggle_lock(self, checked: bool):
+        if checked:
+            self.btnChapterLock.setToolTip("Unlock reordering")
+            self.btnChapterLock.setIcon(self._iconLocked)
+        else:
+            self.btnChapterLock.setToolTip("Lock reordering")
+            self.btnChapterLock.setIcon(self._iconUnlocked)
+        # propagate to the tree so it blocks only internal drags
+        if hasattr(self.chaptersTree, "set_reorder_locked"):
+            self.chaptersTree.set_reorder_locked(checked)
 
     def _add_center_editor(self):
         # Center editor (title + Word sync toggle + view/edit toggle)
@@ -821,6 +887,10 @@ class StoryArkivist(QMainWindow):
         self.addAction(self._mk_shortcut("Ctrl+=", self.zoom_in))   # many keyboards need "=" for "+"
         self.addAction(self._mk_shortcut("Ctrl+-", self.zoom_out))
         self.addAction(self._mk_shortcut("Ctrl+0", self.zoom_reset))
+
+        # Ctrl+N: new blank chapter at end of current book
+        self.addAction(self._mk_shortcut("Ctrl+N", self.insert_blank_chapter_after_current_last))
+
         self._init_zoom_state()
         self._set_zoom(1.0)
 
@@ -985,12 +1055,48 @@ class StoryArkivist(QMainWindow):
                 self.worldTree.takeTopLevelItem(idx)
         self._world_temp_item = None
 
+    def insert_blank_chapter_after_current_last(self):
+        """Append a blank chapter at the end of the current book and open it."""
+        # figure out current book; if you already track self._current_book_id, use that.
+        cur = self.db.conn.cursor()
+        # pick current book or the first book
+        book_id = getattr(self, "_current_book_id", None)
+        if not book_id:
+            cur.execute("SELECT id FROM books WHERE project_id=? AND COALESCE(deleted,0)=0 ORDER BY position, id LIMIT 1",
+                        (self._current_project_id,))
+            row = cur.fetchone()
+            if not row: return
+            book_id = int(row[0])
+
+        # find last position
+        # cur.execute("SELECT COALESCE(MAX(position), -1) FROM chapters WHERE book_id=? AND COALESCE(deleted,0)=0", (book_id,))
+        # last = cur.fetchone()[0] or -1
+        # insert_pos = last + 1
+        # print("insert pos", insert_pos)
+        base_index = self.db.chapter_base_index(self._current_project_id, self._current_book_id)
+        insert_pos = base_index + 1
+        print("base index", base_index)
+        new_id = self.db.chapter_insert(self._current_project_id, self._current_book_id, insert_pos, "New Chapter", "")
+
+        # cur.execute("""
+        #     INSERT INTO chapters (project_id, book_id, title, content, position)
+        #     VALUES (?, ?, ?, ?, ?)
+        # """, (self._current_project_id, book_id, "Untitled Chapter", "", insert_pos))
+        # new_id = cur.lastrowid
+        self.db.conn.commit()
+
+        self.populate_chapters_tree()
+        if hasattr(self, "focus_chapter_in_tree"):
+            self.focus_chapter_in_tree(new_id)
+        if hasattr(self, "load_chapter"):
+            self.load_chapter(new_id)
+
     def insert_chapters_dialog(self):
         """Pick one or more files, then choose placement + name-splitting, then insert contiguously."""
         # 1) Pick files
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Insert Chapters…",
+            "Insert Chapter(s)…",
             self._default_import_dir(),
             "Documents (*.docx *.md *.markdown *.txt);;All Files (*)"
         )
@@ -1026,7 +1132,7 @@ class StoryArkivist(QMainWindow):
         try:
             pid = self._current_project_id
             bid = self._current_book_id
-            cur = self.db.conn.cursor()
+            # cur = self.db.conn.cursor()
 
             # choice fields
             sep        = choice.get("sep")

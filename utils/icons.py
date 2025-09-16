@@ -1,5 +1,5 @@
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QIcon, QPainter, QPixmap, QPen, QColor, QIcon
+from PySide6.QtCore import Qt, QRectF
+from PySide6.QtGui import QIcon, QPainter, QPixmap, QPen, QColor, QPainterPath
 
 def make_checkbox_plus_icon(
     size: int = 16,
@@ -51,4 +51,67 @@ def make_checkbox_plus_icon(
     painter.drawLine(int(cx),       int(cy - arm),   int(cx),       int(cy + arm))
 
     painter.end()
+    return QIcon(pm)
+
+def make_lock_icon(app, locked: bool, size: int = 16) -> QIcon:
+    """Programmatically draw a crisp lock icon (open/closed) that adapts to theme."""
+    dpr = app.devicePixelRatioF() if hasattr(app, "devicePixelRatioF") else 1.0
+    px  = int(size * dpr)
+    pm  = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+
+    fg = app.palette().windowText().color()  # single color used for both states
+
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    penw = max(1.2 * dpr, 1.0)
+    pen  = QPen(fg, penw, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+
+    # Body
+    body = QRectF(px * 0.22, px * 0.46, px * 0.56, px * 0.40)
+    p.setBrush(Qt.NoBrush)
+    p.drawRoundedRect(body, px * 0.08, px * 0.08)
+
+    # # Keyhole (simple vertical line)
+    # kx = body.center().x()
+    # ky1 = body.center().y() - px * 0.05
+    # ky2 = body.center().y() + px * 0.10
+    # p.drawLine(kx, ky1, kx, ky2)
+
+    # # Keyhole
+    # p.setBrush(fg)
+    # keyhole = QPainterPath()
+    # keyhole.addEllipse(QRectF(body.center().x()-px*0.03, body.center().y()-px*0.06, px*0.06, px*0.06))
+    # keyhole.moveTo(body.center().x(), body.center().y())
+    # keyhole.lineTo(body.center().x(), body.center().y()+px*0.10)
+    # p.drawPath(keyhole)
+
+    # Keyhole
+    kx = body.center().x()
+    ky = body.center().y() + px*0.02
+    p.drawEllipse(QRectF(kx - px*0.03, ky - px*0.03, px*0.06, px*0.06))
+    p.drawLine(kx, ky, kx, ky + px*0.08)
+
+    # Shackle
+    sh = QPainterPath()
+    r = px * 0.22  # shackle radius
+    cx = body.center().x()
+    arc_rect = QRectF(cx - r, body.top() - r*1.2, 2*r, 2*r)  # sits above body
+
+    if locked:
+        # Closed arc from left top to right top
+        sh.moveTo(cx - r, body.top())
+        sh.arcTo(arc_rect, 180, -180)  # arc from left→right over the top
+        sh.lineTo(cx + r, body.top())
+    else:
+        # Open arc: leave a gap on one side
+        sh.moveTo(cx - r, body.top())
+        sh.arcTo(arc_rect, 180, -120)  # arc but stop early
+
+    p.drawPath(sh)
+    p.end()
+
+    if dpr != 1.0:
+        pm.setDevicePixelRatio(dpr)
     return QIcon(pm)

@@ -29,22 +29,34 @@ class ChaptersTree(QTreeWidget):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._open_context_menu)
 
+        self._reorder_locked = False
+
     def startDrag(self, actions):
         self._drag_item = self.currentItem()
         super().startDrag(actions)
 
+    def set_reorder_locked(self, locked: bool):
+        self._reorder_locked = bool(locked)
+
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls() or event.source() is self:
+        # External files are always allowed
+        if event.mimeData().hasUrls():
             event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
+            return
+        # Internal drag: block if locked
+        if self._reorder_locked and event.source() is self:
+            event.ignore()
+            return
+        super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
-        # Keep the indicator active anywhere a chapter can be dropped
-        if event.mimeData().hasUrls() or event.source() is self:
+        if event.mimeData().hasUrls():
             event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
+            return
+        if self._reorder_locked and event.source() is self:
+            event.ignore()
+            return
+        super().dragMoveEvent(event)
 
     def _fix_chapter_nesting(self):
         """If any chapter accidentally became a child of another chapter, lift it
@@ -85,6 +97,11 @@ class ChaptersTree(QTreeWidget):
             # emit once; the app-level slot should be connected with UniqueConnection
             self.fileDropped.emit(paths)
             event.acceptProposedAction()
+            return
+
+        # Internal drop: block reorder if locked
+        if self._reorder_locked and event.source() is self:
+            event.ignore()
             return
 
         # --- Internal move (reorder / cross-book move)

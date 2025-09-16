@@ -110,6 +110,11 @@ class Database:
     def chapter_base_index(self, project_id: int, book_id: int) -> int:
         c = self.conn.cursor()
         c.execute("SELECT COALESCE(MAX(position), -1) FROM chapters WHERE project_id=? AND book_id=? AND COALESCE(deleted,0)=0", (project_id, book_id))
+        base_index = c.fetchone()[0]
+        print("base_index - here", base_index)
+        if base_index is None or base_index < 0:
+            return -1
+        return base_index
         return (c.fetchone()[0] or -1) + 1
     
     def chapter_content(self, chapter_id: int) -> Optional[sqlite3.Row]:
