@@ -103,7 +103,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         id INTEGER PRIMARY KEY,
         world_item_id INTEGER NOT NULL,
         alias TEXT NOT NULL,
+        alias_type TEXT DEFAULT 'alias',
+        alias_norm TEXT,
+        deleted BOOLEAN DEFAULT 0,
         FOREIGN KEY(world_item_id) REFERENCES world_items(id)
+    );
+    CREATE TABLE IF NOT EXISTS alias_types (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        UNIQUE(project_id, name)
     );
     CREATE TABLE IF NOT EXISTS world_links (
         id INTEGER PRIMARY KEY,
@@ -132,23 +141,45 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             is_primary      INTEGER DEFAULT 0,          -- e.g., mark a primary trait or signature item
             created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+            deleted         BOOLEAN DEFAULT 0,
             FOREIGN KEY(character_id)  REFERENCES world_items(id),
             FOREIGN KEY(link_world_id) REFERENCES world_items(id),
             FOREIGN KEY(due_chapter_id) REFERENCES chapters(id)
             );
-                        
-            CREATE INDEX IF NOT EXISTS idx_charfac_character_pos
+                      
+        CREATE TABLE IF NOT EXISTS facet_templates (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,       -- 'traits_physical' | 'traits_character' | 'goals' | 'belongings' | 'affiliations' | 'skills' | 'custom'
+            label TEXT NOT NULL,
+            position INTEGER DEFAULT 0,
+            UNIQUE(project_id, kind, label)
+        );
+
+        
+        -- Enforce uniqueness (ignoring soft-deleted rows is tricky in a UNIQUE index;
+        -- we’ll enforce soft-delete in the app logic)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_world_alias_unique
+            ON world_aliases(world_item_id, alias_norm);
+
+        CREATE INDEX IF NOT EXISTS idx_charfac_character_pos
             ON character_facets(character_id, position);
 
-            CREATE INDEX IF NOT EXISTS idx_charfac_type
+        CREATE INDEX IF NOT EXISTS idx_charfac_type
             ON character_facets(facet_type);
 
             -- optional helper view (nice for UI joins)
             -- Shows resolved link titles for belongings/affiliations, etc.
-            CREATE VIEW character_facets_v AS
+        CREATE VIEW character_facets_v AS
             SELECT f.*, wi.title AS linked_title
             FROM character_facets f
             LEFT JOIN world_items wi ON wi.id = f.link_world_id;
+                      
+        -- relationships: no duplicates
+        CREATE UNIQUE INDEX idx_world_link_uniq ON world_links(source_id, target_id, relationship);
+                      
+        -- world categories: no duplicates under same parent
+        CREATE UNIQUE INDEX idx_world_cat_parent_name ON world_categories(project_id, parent_id, lower(name));
     """)
 
     # --- References ---

@@ -148,13 +148,13 @@ class StoryArkivist(QMainWindow):
 
         # World items + aliases
         # People
-        solara = self.db.world_item_insert(pid, characters_cid, "Solara", item_type="character", aliases=("Sun-Goddess","Sol"), content_md="**Solara**: deity of light.")
-        markus = self.db.world_item_insert(pid, characters_cid, "Markus", item_type="character", aliases=("Mark","M."), content_md="**Markus**: captain of the guard.")
-        elyn   = self.db.world_item_insert(pid, characters_cid, "Elyn",   item_type="character", aliases=(), content_md="**Elyn**: novice acolyte.")
+        solara = self.db.world_item_insert(pid, characters_cid, "Solara", item_type="character", aliases={"Sun-Goddess":"title","Sol":"nickname"}, content_md="**Solara**: deity of light.")
+        markus = self.db.world_item_insert(pid, characters_cid, "Markus", item_type="character", aliases={"Mark":"nickname","M.":"nickname"}, content_md="**Markus**: captain of the guard.")
+        elyn   = self.db.world_item_insert(pid, characters_cid, "Elyn",   item_type="character", aliases={}, content_md="**Elyn**: novice acolyte.")
 
         # Places
-        dawn_temple = self.db.world_item_insert(pid, places_cid, "Temple of Dawn", item_type="place", aliases=("Dawn Temple",), content_md="Ancient temple to Solara.")
-        black_gate  = self.db.world_item_insert(pid, places_cid, "Black Gate", item_type="place", aliases=("Gate of Night",), content_md="Northern border fortress.")
+        dawn_temple = self.db.world_item_insert(pid, places_cid, "Temple of Dawn", item_type="place", aliases={"Dawn Temple":"title",}, content_md="Ancient temple to Solara.")
+        black_gate  = self.db.world_item_insert(pid, places_cid, "Black Gate", item_type="place", aliases={"Gate of Night":"title",}, content_md="Northern border fortress.")
 
         world = [solara, markus, elyn, dawn_temple, black_gate]
 
@@ -163,7 +163,7 @@ class StoryArkivist(QMainWindow):
             self.rebuild_world_item_render(wid)
 
         # Chapters — 4 with 1/2/3/0 mentions
-        base = self.db.chapter_base_index(pid, bid) + 1
+        base = self.db.chapter_last_position_index(pid, bid) + 1
 
         # C1: 1 mention
         c1 = self.db.chapter_insert(pid, bid, base+0, "Prologue", "The sun rose over the Temple of Dawn.")
@@ -225,6 +225,19 @@ class StoryArkivist(QMainWindow):
 
         # Make sure there is at least one book so the UI has something to show
         self._current_book_id = self.db.book_create(self._current_project_id)
+
+        # seed some stock alias_types # TODO: make this configurable in project manager
+        self.db.alias_types_seed(self._current_project_id)
+
+        # seed some stock traits # TODO: make this configurable in project manager
+        data = {
+            "trait_physical": ["Eye color","Hair","Height","Build","Skin","Age"],
+            "trait_character": ["Personality","Mannerisms","Goal","Fear","Flaw","Virtue"]
+        }
+        self.db.traits_seed(self._current_project_id, data)
+
+        # # seed some stock world categories # TODO: make this configurable in project manager
+        # self.db.world_categories_seed(self._current_project_id)
 
         # Open the Project Manager with rename box focused and preselected
         self.open_project_manager(focus_rename=True)
@@ -337,14 +350,14 @@ class StoryArkivist(QMainWindow):
         if key.startswith("culture"):   return "culture"
         return "misc"
 
-    def load_world_item(self, world_id: int, edit_mode: bool = False):
+    def load_world_item(self, world_item_id: int, edit_mode: bool = False):
         """Show a world item in the right panel and focus it in the tree."""
         # Prefer the widget’s own loader if present
         if hasattr(self.worldDetail, "show_item"):
-            self.worldDetail.show_item(world_id, view_mode=not edit_mode)
+            self.worldDetail.show_item(world_item_id, view_mode=not edit_mode)
         else:
             # minimal fallback
-            row = self.db.world_item_meta(world_id)
+            row = self.db.world_item_meta(world_item_id)
             if not row:
                 return
             title, md, html = ((row["title"], row["content_md"], row["content_render"])
@@ -356,11 +369,11 @@ class StoryArkivist(QMainWindow):
                 self.worldDetail.view.setHtml(html or "")
             if hasattr(self.worldDetail, "edit"):
                 self.worldDetail.edit.setPlainText(md or "")
-            if hasattr(self.worldDetail, "_current_world_id"):
-                self.worldDetail._current_world_id = world_id
+            if hasattr(self.worldDetail, "_current_world_item_id"):
+                self.worldDetail._current_world_item_id = world_item_id
 
         # focus/select in the world tree if possible
-        self.focus_world_item_in_tree(world_id)
+        self.focus_world_item_in_tree(world_item_id)
 
     def import_world_items_from_paths(self, paths: list[str]):
         if not paths:
@@ -418,7 +431,7 @@ class StoryArkivist(QMainWindow):
             self.db.world_item_rename(obj_id, new.strip())
             self.populate_world_tree()
             # refresh right panel if it's the one currently shown
-            if getattr(self.worldDetail, "_current_world_id", None) == obj_id:
+            if getattr(self.worldDetail, "_current_world_item_id", None) == obj_id:
                 self.load_world_item(obj_id)
 
     def _soft_delete_world_object(self, kind: str, obj_id: int):
@@ -430,24 +443,24 @@ class StoryArkivist(QMainWindow):
             self.db.world_item_soft_delete(obj_id)
             self.populate_world_tree()
             # clear right panel if we just hid the current item
-            if getattr(self.worldDetail, "_current_world_id", None) == obj_id:
+            if getattr(self.worldDetail, "_current_world_item_id", None) == obj_id:
                 if hasattr(self.worldDetail, "set_mode"): self.worldDetail.set_mode("view")
                 if hasattr(self.worldDetail, "view"):     self.worldDetail.view.setHtml("")
                 if hasattr(self.worldDetail, "edit"):     self.worldDetail.edit.setPlainText("")
-                self.worldDetail._current_world_id = None
+                self.worldDetail._current_world_item_id = None
 
     def open_character_editor(self, char_id: int):
         dlg = CharacterEditorDialog(self, self.db, char_id, self)
         dlg.exec()
         # refresh right panel if it was showing this character
-        if getattr(self, "_current_world_id", None) == char_id:
+        if getattr(self, "_current_world_item_id", None) == char_id:
             self.load_world_item(char_id, edit_mode=False)
 
     # def open_character_dialog(self, char_id: int):
     #     dlg = CharacterDialog(self, self.db, char_id, self)
     #     dlg.exec()
     #     # refresh right panel if it was showing this character
-    #     if getattr(self, "_current_world_id", None) == char_id:
+    #     if getattr(self, "_current_world_item_id", None) == char_id:
     #         self.load_world_item(char_id, edit_mode=False)
 
     def open_character_dialog(self, char_id: int, refresh_world_panel_on_close=True):
@@ -556,13 +569,11 @@ class StoryArkivist(QMainWindow):
             if mode == "first":
                 base_index = 0
             elif mode == "last":
-                cur.execute("SELECT COALESCE(MAX(position), -1) FROM chapters WHERE project_id=? AND book_id=?", (pid, bid))
-                base_index = (cur.fetchone()[0] or -1) + 1
+                base_index = self.db.chapter_last_position_index(pid, bid)
             elif mode == "after" and anchor_cid in pos_map:
                 base_index = pos_map[anchor_cid] + 1
             else:
-                cur.execute("SELECT COALESCE(MAX(position), -1) FROM chapters WHERE project_id=? AND book_id=?", (pid, bid))
-                base_index = (cur.fetchone()[0] or -1) + 1
+                base_index = self.db.chapter_last_position_index(pid, bid)
 
             # parse names; preserve original order unless a leading number exists
             parsed = []
@@ -1073,9 +1084,8 @@ class StoryArkivist(QMainWindow):
         # last = cur.fetchone()[0] or -1
         # insert_pos = last + 1
         # print("insert pos", insert_pos)
-        base_index = self.db.chapter_base_index(self._current_project_id, self._current_book_id)
-        insert_pos = base_index + 1
-        print("base index", base_index)
+        last_pos_idx = self.db.chapter_last_position_index(self._current_project_id, self._current_book_id)
+        insert_pos = last_pos_idx + 1
         new_id = self.db.chapter_insert(self._current_project_id, self._current_book_id, insert_pos, "New Chapter", "")
 
         # cur.execute("""
@@ -1157,14 +1167,14 @@ class StoryArkivist(QMainWindow):
             elif mode == "last":
                 # cur.execute("SELECT COALESCE(MAX(position), -1) FROM chapters WHERE project_id=? AND book_id=?", (pid, bid))
                 # base_index = (cur.fetchone()[0] or -1) + 1
-                base_index = self.db.chapter_base_index(pid, bid)
+                base_index = self.db.chapter_last_position_index(pid, bid)
             elif mode == "after" and anchor_cid in pos_map:
                 base_index = pos_map[anchor_cid] + 1
             else:
                 # fallback to end
                 # cur.execute("SELECT COALESCE(MAX(position), -1) FROM chapters WHERE project_id=? AND book_id=?", (pid, bid))
                 # base_index = (cur.fetchone()[0] or -1) + 1
-                base_index = self.db.chapter_base_index(pid, bid)
+                base_index = self.db.chapter_last_position_index(pid, bid)
 
             # Parse names & compute import order
             parsed = []
@@ -1566,7 +1576,7 @@ class StoryArkivist(QMainWindow):
             w = match.group(0)
             wid = alias_map.get(w.lower())
             if wid and wid != world_item_id:
-                return f'<a href="world:{wid}">{w}</a>'
+                return f'<a href="world://{wid}">{w}</a>'
             # optional: style self mentions (commented out)
             # if wid == world_item_id:
             #     return f'<span style="color:#888;text-decoration:underline dotted">{w}</span>'

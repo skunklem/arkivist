@@ -8,9 +8,17 @@ from database.schema import ensure_schema
 from database.migrations import upgrade
 
 import shutil, time, os
+
 def _backup_db_file(path: str) -> None:
     ts = time.strftime("%Y%m%d-%H%M%S")
     shutil.copy2(path, f"{path}.bak-{ts}")
+
+def _normalize_alias(s: str) -> str:
+    # Trim, lower, collapse newlines to space, and normalize internal spaces
+    s = (s or "").strip().lower().replace("\r", "").replace("\n", " ")
+    # collapse multiple spaces
+    s = " ".join(s.split())
+    return s
 
 class Database:
     def __init__(self, path: Path):
@@ -107,15 +115,13 @@ class Database:
                     FROM chapters WHERE id=?""", (chapter_id,))
         return c.fetchone()
 
-    def chapter_base_index(self, project_id: int, book_id: int) -> int:
+    def chapter_last_position_index(self, project_id: int, book_id: int) -> int:
         c = self.conn.cursor()
         c.execute("SELECT COALESCE(MAX(position), -1) FROM chapters WHERE project_id=? AND book_id=? AND COALESCE(deleted,0)=0", (project_id, book_id))
-        base_index = c.fetchone()[0]
-        print("base_index - here", base_index)
-        if base_index is None or base_index < 0:
+        last_pos_idx = c.fetchone()[0]
+        if last_pos_idx is None or last_pos_idx < 0:
             return -1
-        return base_index
-        return (c.fetchone()[0] or -1) + 1
+        return last_pos_idx
     
     def chapter_content(self, chapter_id: int) -> Optional[sqlite3.Row]:
         c = self.conn.cursor()
@@ -180,7 +186,7 @@ class Database:
         for pos, cid in enumerate(rows):
             self._chapter_set_position_and_book(cid, pos, book_id)
 
-    def chapter_position_gap(self, N: int, project_id: int, book_id: int, base_index: int):
+    def chapter_position_gap(self, N: int, project_id: int, book_id: int, last_pos_idx: int):
         # === Open a gap so inserts are contiguous (no interleaving) ===
         cur = self.conn.cursor()
         # cur.execute("SELECT MAX(position) FROM chapters WHERE project_id=? AND book_id=?", (project_id, book_id))
@@ -191,7 +197,7 @@ class Database:
             UPDATE chapters
             SET position = position + ?
             WHERE project_id=? AND book_id=? AND position >= ? AND COALESCE(deleted,0)=0
-        """, (N, project_id, book_id, base_index))
+        """, (N, project_id, book_id, last_pos_idx))
         self.conn.commit()
 
     # ---- World categories/items/aliases/links (examples)
@@ -256,14 +262,106 @@ class Database:
                           (category_id,))
         self.conn.commit()
 
-    def world_aliases_add(self, world_item_id: int, alias: str) -> None:
-        c = self.conn.cursor()
-        c.execute("INSERT INTO world_aliases (world_item_id, alias) VALUES (?, ?)", (world_item_id, alias))
+    def traits_seed(self, project_id: int, data: dict) -> None:
+        rows = []
+        for facet_type, traits in data.items():
+            rows.extend([(project_id, facet_type, l, i) for i,l in enumerate(traits) ])
+        cur = self.conn.cursor()
+        cur.executemany("INSERT OR IGNORE INTO facet_templates(project_id,kind,label,position) VALUES(?,?,?,?)",
+            rows
+        )
         self.conn.commit()
 
-    def world_aliases_add_multiple(self, world_item_id: int, aliases: list[str]) -> None:
+    def alias_types_seed(self, project_id: int, aliases: Iterable[str] = ("nickname","pseudonym","title","alias")) -> None:
         c = self.conn.cursor()
-        c.executemany("INSERT INTO world_aliases (world_item_id, alias) VALUES (?, ?)", ((world_item_id, a) for a in aliases))
+        c.executemany("INSERT OR IGNORE INTO alias_types (project_id, name) VALUES (?, ?)", ((project_id, alias) for alias in aliases))
+        self.conn.commit()
+
+    def alias_types_for_project(self, project_id:int) -> list[str]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT name FROM alias_types WHERE project_id=? ORDER BY name", (project_id,))
+        return [r[0] for r in cur.fetchall()]
+
+    def alias_type_upsert(self, project_id:int, name:str):
+        cur = self.conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO alias_types(project_id,name) VALUES(?,?)", (project_id, name.strip()))
+        self.conn.commit()
+
+    def aliases_for_world_item(self, world_item_id: int) -> list[sqlite3.Row]:
+        c = self.conn.cursor()
+        c.execute("SELECT id, alias, alias_type FROM world_aliases WHERE world_item_id=? AND COALESCE(deleted,0)=0", (world_item_id,))
+        return c.fetchall()
+
+    def alias_exists(self, world_item_id: int, alias: str) -> bool:
+        norm = _normalize_alias(alias)
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT 1 FROM world_aliases
+            WHERE world_item_id=? AND alias_norm=? AND COALESCE(deleted,0)=0
+            LIMIT 1
+        """, (world_item_id, norm))
+        return c.fetchone() is not None
+
+    def alias_add(self, world_item_id: int, alias: str, alias_type: str) -> bool:
+        alias = (alias or "").strip()
+        if not alias:
+            return False
+        norm = _normalize_alias(alias)
+        if self.alias_exists(world_item_id, alias):
+            return False  # silently ignore or raise
+
+        c = self.conn.cursor()
+        c.execute("""
+            INSERT INTO world_aliases (world_item_id, alias, alias_type, alias_norm)
+            VALUES (?, ?, ?, ?)
+        """, (world_item_id, alias, alias_type, norm))
+        self.conn.commit()
+        return True
+
+    def alias_add_multiple(self, world_item_id: int, aliases: dict[str, str]) -> None:
+        c = self.conn.cursor()
+        c.executemany("INSERT INTO world_aliases (world_item_id, alias, alias_type) VALUES (?, ?, ?)", ((world_item_id, alias, alias_type) for alias, alias_type in aliases.items()))
+        self.conn.commit()
+
+    def alias_update(self, alias_id: int, alias: str, alias_type: str) -> None:
+        c = self.conn.cursor()
+        c.execute("UPDATE world_aliases SET alias=?, alias_type=? WHERE id=?", (alias, alias_type, alias_id))
+        self.conn.commit()
+
+    def alias_update_type(self, alias_id: int, alias_type: str) -> None:
+        c = self.conn.cursor()
+        c.execute("UPDATE world_aliases SET alias_type=? WHERE id=?", (alias_type, alias_id))
+        self.conn.commit()
+
+    def alias_update_alias(self, alias_id: int, alias: str) -> bool:
+        alias = (alias or "").strip()
+        if not alias:
+            return False
+        norm = _normalize_alias(alias)
+        # fetch world_item_id for dupe check
+        c = self.conn.cursor()
+        c.execute("SELECT world_item_id FROM world_aliases WHERE id=?", (alias_id,))
+        row = c.fetchone()
+        if not row:
+            return False
+        world_item_id = row[0]
+        # prevent dupes against other aliases
+        c.execute("""
+            SELECT 1 FROM world_aliases
+            WHERE world_item_id=? AND alias_norm=? AND id<>? AND COALESCE(deleted,0)=0
+            LIMIT 1
+        """, (world_item_id, norm, alias_id))
+        if c.fetchone():
+            return False
+
+        c.execute("UPDATE world_aliases SET alias=?, alias_norm=? WHERE id=?", (alias, norm, alias_id))
+        self.conn.commit()
+        return True
+
+    def alias_delete(self, alias_id: int) -> None:
+        """Soft delete an alias."""
+        c = self.conn.cursor()
+        c.execute("UPDATE world_aliases SET deleted=1 WHERE id=?", (alias_id,))
         self.conn.commit()
 
     def world_items_by_category(self, project_id: int, category_id: int) -> list[sqlite3.Row]:
@@ -274,26 +372,26 @@ class Database:
                      ORDER BY position, id""", (project_id, category_id))
         return c.fetchall()
     
-    def world_item_is_character(self, world_id: int) -> bool:
+    def world_item_is_character(self, world_item_id: int) -> bool:
         c = self.conn.cursor()
-        c.execute("SELECT type FROM world_items WHERE id=?", (world_id,))
+        c.execute("SELECT type FROM world_items WHERE id=?", (world_item_id,))
         r = c.fetchone()
         return r["type"] == "character"
 
-    def world_item(self, world_id: int) -> Optional[str]:
+    def world_item(self, world_item_id: int) -> Optional[str]:
         c = self.conn.cursor()
-        c.execute("SELECT title FROM world_items WHERE id=?", (world_id,))
+        c.execute("SELECT title FROM world_items WHERE id=?", (world_item_id,))
         r = c.fetchone()
         return r["title"] if r else None
 
-    def world_item_meta(self, world_id: int) -> Optional[sqlite3.Row]:
+    def world_item_meta(self, world_item_id: int) -> Optional[sqlite3.Row]:
         c = self.conn.cursor()
-        c.execute("SELECT id, category_id, title, type, content_md, content_render FROM world_items WHERE id=?", (world_id,))
+        c.execute("SELECT id, category_id, title, type, content_md, content_render FROM world_items WHERE id=?", (world_item_id,))
         return c.fetchone()
 
-    def world_item_type(self, world_id: int) -> Optional[str]:
+    def world_item_type(self, world_item_id: int) -> Optional[str]:
         c = self.conn.cursor()
-        c.execute("SELECT type FROM world_items WHERE id=?", (world_id,))
+        c.execute("SELECT type FROM world_items WHERE id=?", (world_item_id,))
         r = c.fetchone()
         return r["type"] if r else None
     
@@ -320,7 +418,7 @@ class Database:
         self.conn.commit()
         return new_id
 
-    def world_item_insert(self, project_id: int, category_id: int, title: str = "", content_md: str = "", item_type: str = "", aliases=()) -> int:
+    def world_item_insert(self, project_id: int, category_id: int, title: str = "", content_md: str = "", item_type: str = "", aliases: dict[str, str] = {}) -> int:
         """
         Create a new world item under a category.
         Returns the new world_item id.
@@ -334,23 +432,29 @@ class Database:
         )
         wid = c.lastrowid
         self.conn.commit()
-        self.world_aliases_add_multiple(wid, aliases)
+        self.alias_add_multiple(wid, aliases)
         return int(wid)
 
-    def world_item_update_content(self, world_id: int, md: str) -> None:
+    def world_item_update_content(self, world_item_id: int, md: str) -> None:
         self.conn.execute("""UPDATE world_items
                              SET content_md=?, updated_at=CURRENT_TIMESTAMP
-                             WHERE id=?""", (md, world_id))
+                             WHERE id=?""", (md, world_item_id))
+        self.conn.commit()
+    
+    def world_item_update(self, world_item_id: int, title: Optional[str]=None, position: Optional[int]=None, content_md: Optional[str]=None) -> None:
+        self.conn.execute("""UPDATE world_items
+                             SET title=COALESCE(?, title), position=COALESCE(?, position), content_md=COALESCE(?, content_md), updated_at=CURRENT_TIMESTAMP
+                             WHERE id=?""", (title, position, content_md, world_item_id))
         self.conn.commit()
 
-    def world_item_rename(self, world_id: int, new_title: str) -> None:
+    def world_item_rename(self, world_item_id: int, new_title: str) -> None:
         self.conn.execute("UPDATE world_items SET title=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                          (new_title, world_id))
+                          (new_title, world_item_id))
         self.conn.commit()
 
-    def world_item_soft_delete(self, world_id: int) -> None:
+    def world_item_soft_delete(self, world_item_id: int) -> None:
         self.conn.execute("UPDATE world_items SET deleted=1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                          (world_id,))
+                          (world_item_id,))
         self.conn.commit()
 
     # --- Characters ---
@@ -359,6 +463,16 @@ class Database:
         c.execute("""SELECT * FROM character_facets
                     WHERE character_id=? ORDER BY position, id""", (character_id,))
         return c.fetchall()
+    
+    def character_facet_exists(self, character_id: int, facet_type: str, label: str) -> bool:
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT 1 FROM character_facets
+            WHERE character_id=? AND facet_type=? AND lower(trim(label))=lower(trim(?))
+            AND COALESCE(deleted,0)=0
+            LIMIT 1
+        """, (character_id, facet_type, label))
+        return c.fetchone() is not None
 
     def character_facets_by_type(self, character_id: int, facet_type: str) -> list[sqlite3.Row]:
         c = self.conn.cursor()
@@ -441,6 +555,11 @@ class Database:
                     (pos, fid))
         self.conn.commit()
 
+    def facet_template_labels(self, project_id:int, kind:str) -> list[str]:
+        cur = self.conn.cursor()
+        cur.execute("""SELECT label FROM facet_templates
+                    WHERE project_id=? AND kind=? ORDER BY position, id""", (project_id, kind))
+        return [r[0] for r in cur.fetchall()]
 
     # ---- FTS (chapter & world)
     def fts_rebuild(self) -> None:

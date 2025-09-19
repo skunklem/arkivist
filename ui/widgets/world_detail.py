@@ -1,14 +1,14 @@
 import re
+import traceback
 
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
+    QWidget, QVBoxLayout, QHBoxLayout, QFrame,
     QTextBrowser, QPlainTextEdit,QTableWidget, QTableWidgetItem,
-    QLabel, QPushButton, QSizePolicy, QHBoxLayout,
+    QLabel, QPushButton, QSizePolicy, QHBoxLayout, QApplication
 )
 
-import traceback
 def _safe(fn):
     def wrap(self, *a, **k):
         try:
@@ -22,6 +22,56 @@ def _safe(fn):
 from utils.md import md_to_html
 from ui.widgets.helpers import PlainNoTab
 
+class MiniDoc(QTextBrowser):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setOpenExternalLinks(False)
+        self.setOpenLinks(False)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.anchorClicked.connect(self._relay_anchor)
+
+        # inherit app palette & keep fully transparent background
+        self.setPalette(QApplication.palette(self))
+        self.setAutoFillBackground(False)
+        self.viewport().setAutoFillBackground(False)
+        self.setStyleSheet(
+            "QTextBrowser { background: transparent; border:0; color: palette(window-text); }"
+        )
+
+        # no document margin (this cured the tiny indent)
+        self.document().setDocumentMargin(0)  # ← remove default margin
+
+    def _relay_anchor(self, url):
+        # parent() chain to WorldDetailWidget and reuse its handler
+        w = self.parent()
+        while w and not hasattr(w, "_anchor_clicked"):
+            w = w.parent()
+        if w:
+            w._anchor_clicked(url)
+
+    def setHtmlAndFit(self, html: str):
+        # Strip default margins on body/p
+        html = (
+            "<style>"
+            "html, body { margin:0; padding:0; }"
+            "p { margin:0; }"
+            "</style>" + html
+        )
+        self.setHtml(html)
+        # Fit height to document width
+        doc = self.document()
+        doc.setTextWidth(max(1, self.viewport().width() - 1))
+        h = int(doc.size().height()) + self.frameWidth() * 2 + 1
+        self.setFixedHeight(max(h, self.fontMetrics().height() + 4))
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        # re-fit when the panel resizes
+        self.setHtmlAndFit(self.toHtml())
+
 class WorldDetailWidget(QWidget):
     """Right panel: shows a world item in View/Edit with back/forward history."""
     def __init__(self, app):
@@ -29,10 +79,11 @@ class WorldDetailWidget(QWidget):
         self.app = app
         self.vbox = QVBoxLayout(self)
         self.vbox.setContentsMargins(8, 8, 8, 8)
+        self.vbox.setSpacing(6)
 
         self._history = []
         self._hindex  = -1
-        self._current_world_id = None
+        self._current_world_item_id = None
         self._dirty = False
 
         self._add_top_bar()
@@ -101,29 +152,13 @@ class WorldDetailWidget(QWidget):
             self._hindex = new_index
             _safe(self.show_item(target_id, add_to_history=False))
 
-    def _anchor_clicked(self, url):
-        # Expected url forms: world://<id>  OR  chapter://<id>
-        try:
-            s = url.toString()
-            if s.startswith("world://"):
-                wid = int(s.split("://",1)[1])
-                self.app.show_world_item(wid)   # your main-window method
-            elif s.startswith("chapter://"):
-                cid = int(s.split("://",1)[1])
-                self.app.open_chapter(cid)      # your method to focus a chapter
-            else:
-                # fall back to external open if needed
-                QDesktopServices.openUrl(url)
-        except Exception as e:
-            print("anchor click error:", e)
-
     def _set_mode(self, *, view_mode: bool):
         """Show/hide view vs edit for NON-character items. For characters, the button always says 'Edit'."""
         # If header not built yet, bail quietly
         if not hasattr(self, "modeBtn"):
             return
 
-        meta = self.app.db.world_item_meta(self._current_world_id) if self._current_world_id else None
+        meta = self.app.db.world_item_meta(self._current_world_item_id) if self._current_world_item_id else None
         wtype = (meta["type"] if meta else "") or ""
 
         # Button label shows the alternate action
@@ -147,13 +182,13 @@ class WorldDetailWidget(QWidget):
 
     def toggle_mode(self):
         """Toggles View/Edit for generic world items; opens dialog for characters."""
-        if not self._current_world_id:
+        if not self._current_world_item_id:
             return
-        meta = self.app.db.world_item_meta(self._current_world_id)
+        meta = self.app.db.world_item_meta(self._current_world_item_id)
         wtype = (meta["type"] or "")
         if wtype == "character":
             # open character dialog and refresh panel afterwards
-            self.app.open_character_dialog(self._current_world_id)
+            self.app.open_character_dialog(self._current_world_item_id)
             return
 
         # Non-character: if leaving edit -> save first
@@ -169,18 +204,18 @@ class WorldDetailWidget(QWidget):
             self._refresh_render_only()
 
     def _save_current_if_dirty(self):
-        if not self._current_world_id or not self._dirty:
+        if not self._current_world_item_id or not self._dirty:
             return
         md = self.edit.toPlainText()
         cur = self.app.db.conn.cursor()
         cur.execute("UPDATE world_items SET content_md=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (md, self._current_world_id))
+                    (md, self._current_world_item_id))
         self.app.db.conn.commit()
-        self.app.rebuild_world_item_render(self._current_world_id)
+        self.app.rebuild_world_item_render(self._current_world_item_id)
         self._dirty = False
 
-        if getattr(self.app, "_current_world_id", None) == self.character_id:
-            self.app.show_world_item(self.character_id, edit_mode=False)
+        if getattr(self.app, "_current_world_item_id", None):
+            self.app.show_world_item(self._current_world_item_id, edit_mode=False)
 
     def _delete_layout(self, layout):
         """Recursively delete all items (widgets or sublayouts) from a *child* layout."""
@@ -226,13 +261,13 @@ class WorldDetailWidget(QWidget):
         """Update the rendered HTML/text into self.view/edit (no rebuilding UI)."""
         if not getattr(self, "views_active", False):
             return
-        if self._current_world_id is None:
+        if self._current_world_item_id is None:
             self.view.setHtml("<i>Select a world item</i>")
             self.edit.setPlainText("")
             return
 
         cur = self.app.db.conn.cursor()
-        cur.execute("SELECT content_md, content_render FROM world_items WHERE id=?", (self._current_world_id,))
+        cur.execute("SELECT content_md, content_render FROM world_items WHERE id=?", (self._current_world_item_id,))
         row = cur.fetchone()
         if not row:
             self.view.setHtml("<i>Item not found</i>")
@@ -266,7 +301,7 @@ class WorldDetailWidget(QWidget):
                     self._hindex = len(self._history) - 1
 
             # Set current
-            self._current_world_id = world_item_id
+            self._current_world_item_id = world_item_id
             self._dirty = False
 
             # Fetch meta once
@@ -290,7 +325,7 @@ class WorldDetailWidget(QWidget):
             if wtype == "character":
                 _safe(self._render_character_summary(world_item_id, title, md))
                 self.modeBtn.setText("Edit")
-            else:
+            else: # world item view/edit panel
                 self._add_views()
                 self._set_mode(view_mode=view_mode)   # ← now that header & widgets exist
                 self._refresh_render_only()
@@ -327,47 +362,157 @@ class WorldDetailWidget(QWidget):
 
         return md_to_html("\n".join(character_summary_md))
 
+    def _add_label(self, vbox: QVBoxLayout, label: str, set_size_policy: bool = True):
+        lbl = QLabel(label)
+        if set_size_policy:
+            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        vbox.addWidget(lbl)
+
     def _render_character_summary(self, char_id: int, title: str, md: str):
+        # ----- container that won’t expand vertically -----
+        content = QWidget(self)
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
         # Header
         header = QHBoxLayout()
-        header.addWidget(QLabel(f"<h3 style='margin:4px 0'>{title}</h3>"))
-        header.addStretch(1)
-        btnEdit = QPushButton("Edit…")
-        btnEdit.clicked.connect(lambda: self.app.open_character_dialog(char_id))
-        header.addWidget(btnEdit)
-        self.vbox.addLayout(header)
+        # titleLbl = QLabel(f"<h3 style='margin:4px 0'>{title}</h3>")
+        # titleLbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        # header.addWidget(titleLbl)
+        self._add_label(header, f"<h3 style='margin:4px 0'>{title}</h3>")
+        # header.addStretch(1)
+        # btnEdit = QPushButton("Edit…")
+        # btnEdit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        # btnEdit.clicked.connect(lambda: self.app.open_character_dialog(char_id))
+        # header.addWidget(btnEdit)
+        lay.addLayout(header)
+
+        # Section label
+        # sec = QLabel("<b>Character Description</b>")
+        # sec.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        # self.vbox.addWidget(sec)
+        # self._add_vbox_label("<b>Character Description</b>")
+        self._add_label(lay, "<b>Character Description</b>", set_size_policy=False)
 
         # Description
-        self.vbox.addWidget(QLabel("<b>Character Description</b>"))
-        html = md_to_html(md)  # your existing converter
-        desc = QLabel(); desc.setTextFormat(Qt.RichText); desc.setWordWrap(True)
-        desc.setText(html)
-        self.vbox.addWidget(desc)
+        # html = md_to_html(md)  # your existing converter
+        # desc = QLabel()
+        # desc.setTextFormat(Qt.RichText)
+        # desc.setWordWrap(True)
+        # desc.setTextInteractionFlags(Qt.TextBrowserInteraction)  # allow link clicks
+        # desc.setOpenExternalLinks(False)                         # block OS handler
+        # desc.linkActivated.connect(self._label_link_activated)   # route to handler
+        # desc.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed) # keep height around description compact
+        # desc.setText(html)
+
+        # TEST: alternative
+        desc = MiniDoc(self)
+        html = md_to_html(md or "")
+        desc.setHtmlAndFit(html)
+
+        # self.vbox.addWidget(desc)
+        lay.addWidget(desc)
 
         # Traits (name + value)
-        self.vbox.addWidget(QLabel("<b>Traits</b>"))
-        traits = self.app.db.character_facets_by_type(char_id, "trait")
-        if traits:
-            table = QTableWidget(len(traits), 2)
-            table.setHorizontalHeaderLabels(["Trait", "Value"])
-            table.verticalHeader().setVisible(False)
-            table.setEditTriggers(QTableWidget.NoEditTriggers)
-            table.setSelectionMode(QTableWidget.NoSelection)
-            table.horizontalHeader().setStretchLastSection(True)
-            for r, tr in enumerate(traits):
-                table.setItem(r, 0, QTableWidgetItem(tr["label"] or ""))
-                table.setItem(r, 1, QTableWidgetItem(tr["value"] or ""))
-            self.vbox.addWidget(table)
-        else:
-            self.vbox.addWidget(QLabel("<i>No traits yet</i>"))
+        def _mini_table(traits, title):
+            if not traits:
+                pass
+                # empty = QLabel(f"<i>No {title.lower()} yet</i>")
+                # empty.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+                # # self.vbox.addWidget(empty)
+                # lay.addWidget(empty)
+            else:
+                # self.vbox.addWidget(QLabel(f"<b>{title}</b>"))
+                self._add_label(lay, f"<b>{title}</b>", set_size_policy=False)
+                t = QTableWidget(len(traits), 2)
+                t.setHorizontalHeaderLabels(["Trait", "Value"])
+                t.verticalHeader().setVisible(False)
+                t.setEditTriggers(QTableWidget.NoEditTriggers)
+                t.setSelectionMode(QTableWidget.NoSelection)
+                t.horizontalHeader().setStretchLastSection(True)
+                t.setFrameShape(QFrame.NoFrame)
+                t.setShowGrid(False)
+                t.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+                # ← ensure fixed height = header + rows
+                self._fit_table_height(t, min_rows=1)
+
+                for r, tr in enumerate(traits):
+                    name = tr["label"] or ""
+                    val  = tr["value"] or ""
+                    note = tr["note"] or ""
+                    t.setItem(r, 0, QTableWidgetItem(name))
+                    it = QTableWidgetItem(val)
+                    if note: # hover shows note
+                        it.setToolTip(note)
+                    t.setItem(r, 1, it)
+                # self.vbox.addWidget(t)
+                lay.addWidget(t)
+
+        phys_traits = self.app.db.character_facets_by_type(char_id, "trait_physical")
+        char_traits = self.app.db.character_facets_by_type(char_id, "trait_character")
+        _mini_table(phys_traits, "Physical features")
+        _mini_table(char_traits, "Characteristics")
 
         # Other facet groups (optional for now; pattern identical):
         # for kind in ("goal","belonging","affiliation","skill"):
         #     rows = self.app.db.character_facets_by_type(char_id, kind)
         #     if rows: render a simple 2-col table name/value
 
+
+        # Add ALL content as a single top-aligned block…
+        self.vbox.addWidget(content, 0, Qt.AlignTop)
+
+        # prevent expansion between sections
+        self.vbox.addStretch(1)
+
+    def _fit_table_height(self, table: QTableWidget, min_rows=1, pad=6):
+        hh = table.horizontalHeader()
+        header_h = hh.height() if hh else 0
+        vh = table.verticalHeader()
+        row_h = vh.defaultSectionSize() or (table.fontMetrics().height() + 10)
+        rows = max(min_rows, table.rowCount())
+        frame = table.frameWidth() * 2
+        hscroll = table.horizontalScrollBar()
+        hsb_h = (hscroll.sizeHint().height() if hscroll and hscroll.isVisible() else 0)
+        total_h = header_h + rows * row_h + frame + pad + hsb_h
+        table.setMinimumHeight(total_h)
+        table.setMaximumHeight(total_h)
+
+    def _label_link_activated(self, url: str):
+        # QLabel link -> reuse same logic
+        self._anchor_clicked(QUrl(url))
+
+    def _anchor_clicked(self, qurl):
+        """Handle world:// links from QTextBrowser & QLabel."""
+        print("Using this one")
+        url = qurl.toString()
+        # Accept several patterns:
+        #   world://123
+        #   world://item/123
+        #   world://0.0.0.123   (old buggy pattern you saw)
+        m = re.search(r'world://(?:item/)?(\d+)$', url)
+        if not m:
+            m = re.search(r'world://(?:[\d.]*)(\d+)$', url)
+        if m:
+            wid = int(m.group(1))
+            # Use your centralized loader:
+            if hasattr(self.app, "load_world_item"):
+                self.app.load_world_item(wid, edit_mode=False)
+            return
+
+        # Fallback: ignore unknown schemes (don't hand to OS)
+        # Optionally: handle http(s) internally if you have external docs
+        # e.g., QDesktopServices.openUrl(qurl) for http(s) only:
+        # If you also hyperlink http(s), optionally allow:
+        # if url.startswith("http"):
+        #     QDesktopServices.openUrl(qurl)
+        # else:
+        #     print("Unknown link scheme:", url)
+
     def refresh(self):
-        if self._current_world_id is None:
+        if self._current_world_item_id is None:
             self.lblTitle.setText("World Detail")
             if self.views_active:
                 self.view.setHtml("<i>Select a world item</i>")
@@ -375,7 +520,7 @@ class WorldDetailWidget(QWidget):
             return
         cur = self.app.db.conn.cursor()
         cur.execute("SELECT title, content_md, content_render FROM world_items WHERE id=?",
-                    (self._current_world_id,))
+                    (self._current_world_item_id,))
         row = cur.fetchone()
         if not row:
             self.lblTitle.setText("World Detail (missing)")
@@ -394,5 +539,5 @@ class WorldDetailWidget(QWidget):
                 self.edit.blockSignals(False)
                 self._dirty = False
             # else:
-            #     html = self._render_character_summary_md(char_id=self._current_world_id, title=title, md=md)
+            #     html = self._render_character_summary_md(char_id=self._current_world_item_id, title=title, md=md)
             #     self.character_view.setHtml(html)

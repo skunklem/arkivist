@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QWidget, QPlainTextEdit
+from PySide6.QtWidgets import QWidget, QPlainTextEdit, QSizePolicy, QTableWidget
 from PySide6.QtCore import Signal, Qt
 
 class DropPane(QWidget):
@@ -50,3 +50,42 @@ class PlainNoTab(QPlainTextEdit):
                 win.focusNextPrevChild(False)
             return
         super().keyPressEvent(event)
+
+def auto_grow_plaintext(edit: QPlainTextEdit, min_lines=3, max_lines=24):
+    # make the editor fixed-height so the dialog scrolls, not the editor
+    # edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    edit.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+    def _recalc():
+        # make the doc wrap to the viewport width for correct height
+        doc = edit.document()
+        doc.setTextWidth(edit.viewport().width() - 4)
+        h = int(doc.size().height()) + edit.frameWidth()*2 + 6
+        fm = edit.fontMetrics()
+        min_h = fm.lineSpacing()*min_lines + 8
+        max_h = fm.lineSpacing()*max_lines + 8
+        edit.setFixedHeight(max(min_h, min(h, max_h)))
+
+    edit.textChanged.connect(_recalc)
+
+    # Also update when the editor resizes (dialog or splitter moves)
+    old_resize = edit.resizeEvent
+    def _resize(ev):
+        if old_resize:
+            old_resize(ev)
+        _recalc()
+    edit.resizeEvent = _resize
+
+    edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    edit.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+    _recalc()
+
+
+def fit_table_height_to_rows(table: QTableWidget, min_rows=1):
+    header = table.horizontalHeader().height()
+    print("rows:",table.rowCount(), min_rows)
+    rows = max(table.rowCount(), min_rows) + 1
+    rowh = table.sizeHintForRow(0) if table.rowCount() else table.fontMetrics().height()+8
+    h = header + rows*rowh + 6
+    table.setMinimumHeight(h)
+    table.setMaximumHeight(h)

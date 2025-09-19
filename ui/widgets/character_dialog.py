@@ -1,15 +1,21 @@
 # ui/widgets/character_dialog.py
 from __future__ import annotations
-from typing import Optional
+import sqlite3
+from typing import Optional, Union
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QPlainTextEdit, QTableWidget, QTableWidgetItem, QComboBox, QLineEdit,
-    QToolButton, QMessageBox, QDialogButtonBox
+    QToolButton, QMessageBox, QDialogButtonBox, QHeaderView, QFrame,
+    QAbstractScrollArea, QSizePolicy, QMenu
 )
 
-from ui.widgets.helpers import PlainNoTab
+from ui.widgets.helpers import PlainNoTab, auto_grow_plaintext, fit_table_height_to_rows
+from ui.widgets.inline_alias_table import InlineAliasTable
+from ui.widgets.inline_facet_table import InlineFacetTable
+from ui.widgets.delegates import AliasTypeDelegate
+from ui.widgets.inline_alias_table import TYPE_COL, ALIAS_COL
 
 def _icon_edit():
     icon = QIcon.fromTheme("document-edit")
@@ -49,75 +55,63 @@ class CharacterDialog(QDialog):
         self.resize(860, 640)
 
         # ── header: editable name
-        name = self._character_title()
-        self.nameEdit = QLineEdit(name)
+        self.nameEdit = QLineEdit()
         self.nameEdit.setPlaceholderText("Character name")
         self.nameEdit.textEdited.connect(self._mark_dirty)
 
-        # Close/Cancel/Save buttons (Save enabled iff dirty)
-        self.btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        # self.btnSave   = self.btns.button(QDialogButtonBox.Save)
-        # self.btnCancel = self.btns.button(QDialogButtonBox.Cancel)
-        # self.btnSave.setEnabled(False)
-        self.btns.accepted.connect(self._save_all_and_close)
-        self.btns.rejected.connect(self.reject)
+        # Description section (Markdown source in content_md)
+        self.descEdit = PlainNoTab()
+        self.descEdit.setPlaceholderText("Character backstory, summary, or notes (Markdown)…")
+        auto_grow_plaintext(self.descEdit)
+
+        # aliases (with types)
+        self.aliasTable = InlineAliasTable(lambda: self.db.alias_types_for_project(self.app._current_project_id))
+        self.setup_alias_table(self.aliasTable)
+
+        # facet tables
+        labels_physical  = self.db.facet_template_labels(self.app._current_project_id, "trait_physical")
+        self.tblPhysical   = InlineFacetTable(self.app, labels_physical)
+        self.setup_facet_table(self.tblPhysical, "trait_physical")
+
+        labels_character = self.db.facet_template_labels(self.app._current_project_id, "trait_character")
+        self.tblCharacter  = InlineFacetTable(self.app, labels_character)
+        self.setup_facet_table(self.tblCharacter, "trait_character")
+
+        # footer buttons
+        self.btnSave  = QPushButton("Save")
+        self.btnClose = QPushButton("Cancel")
+        self.btnSave.clicked.connect(self._save_and_close)
+        self.btnClose.clicked.connect(self._cancel_dialog)
+        footer_row = QHBoxLayout(); footer_row.addStretch(1); footer_row.addWidget(self.btnSave); footer_row.addWidget(self.btnClose)
+
+        # --- Dialog layout ---
 
         head = QHBoxLayout()
-        head.addWidget(QLabel("<b>Name</b>"))
+        self._add_label(head, "Name")
         head.addWidget(self.nameEdit, 1)
         head.addStretch(1)
-        head.addWidget(self.btns)
 
         # ── scrollable body
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
 
         body = QWidget(); self.scroll.setWidget(body)
-        b = QVBoxLayout(body); b.setContentsMargins(12,12,12,12); b.setSpacing(16)
+        grid = QVBoxLayout(body); grid.setContentsMargins(12,12,12,12); grid.setSpacing(8)
 
-        # Description section (Markdown source in content_md)
-        b.addWidget(QLabel("<b>Description</b>"))
-        self.descEdit = PlainNoTab()
-        self.descEdit.setPlaceholderText("Character backstory, summary, or notes (Markdown)…")
-        self.descEdit.textChanged.connect(self._mark_dirty)
-        b.addWidget(self.descEdit, 1)
+        # layout sections
+        self._add_label(grid, "Background")
+        grid.addWidget(self.descEdit)
 
-        # Traits section
-        hdr = QHBoxLayout()
-        hdr.addWidget(QLabel("<b>Traits</b>"))
-        hdr.addStretch(1)
-        b.addLayout(hdr)
+        self._add_label(grid, "Aliases")
+        grid.addWidget(self.aliasTable)
 
-        self.traitsTable = QTableWidget(0, 5)
-        self.traitsTable.setHorizontalHeaderLabels(["Trait", "Value", "Note", "", ""])
-        self.traitsTable.verticalHeader().setVisible(False)
-        self.traitsTable.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.traitsTable.setSelectionBehavior(QTableWidget.SelectRows)
-        self.traitsTable.setSelectionMode(QTableWidget.SingleSelection)
-        self.traitsTable.horizontalHeader().setStretchLastSection(False)
-        self.traitsTable.horizontalHeader().setDefaultSectionSize(200)
-        self.traitsTable.setColumnWidth(3, 36)
-        self.traitsTable.setColumnWidth(4, 36)
-        b.addWidget(self.traitsTable, 2)
+        self._add_label(grid, "Physical features")
+        grid.addWidget(self.tblPhysical)
 
-        # New trait inline row (auto-commit on Enter)
-        rowAdd = QHBoxLayout()
-        self.addLabel = QComboBox(); self.addLabel.setEditable(True)
-        self.addLabel.addItems(DEFAULT_TRAIT_LABELS)
-        self.addValue = QLineEdit(); self.addValue.setPlaceholderText("Value")
-        self.addNote  = QLineEdit(); self.addNote.setPlaceholderText("Note (hover shows full)")
-        self.btnAdd   = QToolButton(); self.btnAdd.setIcon(_icon_plus()); self.btnAdd.setToolTip("Add trait")
-        rowAdd.addWidget(self.addLabel, 1)
-        rowAdd.addWidget(self.addValue, 1)
-        rowAdd.addWidget(self.addNote, 2)
-        rowAdd.addWidget(self.btnAdd, 0, Qt.AlignRight)
-        b.addLayout(rowAdd)
+        self._add_label(grid, "Characteristics")
+        grid.addWidget(self.tblCharacter)
 
-        # Save/Cancel at bottom (also in header; this duplicates but keeps an easy reach)
-        self.btnSaveBottom = QPushButton("Save")
-        self.btnSaveBottom.setEnabled(False)
-        self.btnSaveBottom.clicked.connect(self._save_all_and_close)
-        b.addWidget(self.btnSaveBottom, 0, Qt.AlignRight)
+        grid.addLayout(footer_row)
 
         # Prevent QScrollArea internals from taking focus
         self.scroll.setFocusPolicy(Qt.NoFocus)
@@ -127,24 +121,115 @@ class CharacterDialog(QDialog):
         if self.scroll.verticalScrollBar():
             self.scroll.verticalScrollBar().setFocusPolicy(Qt.NoFocus)
 
-        # Defer tab order
-        QTimer.singleShot(0, self._apply_tab_order)
+        # # Defer tab order
+        # QTimer.singleShot(0, self._apply_tab_order)
 
         # Compose dialog
         root = QVBoxLayout(self)
         root.addLayout(head)
         root.addWidget(self.scroll, 1)
 
-        # Hooks
-        self.btnAdd.clicked.connect(self._add_trait_inline)
-        # Enter to add from any of the three fields
-        self.addLabel.lineEdit().returnPressed.connect(self._add_trait_inline)
-        self.addValue.returnPressed.connect(self._add_trait_inline)
-        self.addNote.returnPressed.connect(self._add_trait_inline)
-
         # Initial data
-        self._load_description()
-        self._load_traits()
+        self.load_character(self.character_id)
+
+    def setup_facet_table(self, table: InlineFacetTable, facet_type: str):
+        """
+        table: InlineFacetTable or QTableWidget
+        """
+        # connect signals
+        table.rowAdded.connect(lambda l,v,n: self._add_facet(facet_type, l, v, n))
+        table.rowEdited.connect(self._edit_facet)
+        table.rowDeleted.connect(self._delete_facet)
+
+        # unwrap if it's the wrapper widget
+        t: QTableWidget = getattr(table, "table", table)
+
+        # Make facet tables clean and let the dialog scroll, not the tables
+        t.setFrameShape(QFrame.NoFrame)
+        t.setShowGrid(False)
+        t.setAlternatingRowColors(True)
+        t.setStyleSheet("QTableView { border: none; }")
+        t.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        t.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        t.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
+        t.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+        hh = t.horizontalHeader()
+        hh.setStretchLastSection(True)
+        # (optional, if you want trait column wider)
+        # hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        # hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+
+        # keep table height compact (dialog scrolls, not the table)
+        fit_table_height_to_rows(t, min_rows=1)
+
+    def setup_alias_table(self, table: InlineAliasTable):
+        # keep margins tight
+        self.aliasTable.setContentsMargins(0,0,0,0)
+
+        # connect signals
+        table.rowAdded.connect(lambda alias_type, alias: self._alias_added(alias_type, alias))
+        table.rowEdited.connect(self._alias_edited)
+        table.rowDeleted.connect(self._alias_deleted)
+
+        # unwrap if it's the wrapper widget
+        t: QTableWidget = getattr(table, "table", table)
+
+        t.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        t.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        # # keep table height compact (dialog scrolls, not the table)
+        # fit_table_height_to_rows(t, min_rows=1)
+
+    def _commit_alias_addrow_if_filled(self):
+        """If the add-row has data but user didn't press Enter, insert it once."""
+        t = self.aliasTable.table
+        if t.rowCount() == 0:
+            return
+        # add-row is index 0
+        cb = t.cellWidget(0, TYPE_COL)
+        a_type = cb.currentText().strip() if cb else ""
+        alias_item = t.item(0, ALIAS_COL)
+        alias = (alias_item.text() if alias_item else "").strip()
+
+        if a_type and alias and a_type != "Add alias…":
+            # Same order used everywhere: (alias, alias_type)
+            self.db.alias_type_upsert(self.app._current_project_id, a_type)
+            self.db.alias_add(self.character_id, alias, a_type)
+
+            # reset UI add-row
+            if alias_item:
+                alias_item.setText("")
+            if cb:
+                cb.blockSignals(True)
+                cb.setCurrentIndex(0)
+                cb.blockSignals(False)
+
+    def _reload_alias_table(self):
+        rows = self.db.aliases_for_world_item(self.character_id)
+        self.aliasTable.set_rows(rows)
+
+    def _on_alias_cell_changed(self, it: QTableWidgetItem):
+        r, c = it.row(), it.column()
+        rid = self.aliasTable.item(r,0).data(Qt.UserRole) if self.aliasTable.item(r,0) else None
+        alias = (self.aliasTable.item(r,ALIAS_COL).text() if self.aliasTable.item(r,ALIAS_COL) else "").strip()
+        a_type = (self.aliasTable.item(r,TYPE_COL).text() if self.aliasTable.item(r,TYPE_COL) else "alias").strip() or "alias"
+
+        if c == 1 and a_type:  # ensure new type gets learned for this project
+            self.db.alias_type_upsert(self.app._current_project_id, a_type)
+
+        if not alias:  # ignore incomplete rows
+            return
+        if rid:
+            self.db.alias_update(int(rid), alias, a_type)
+        else:
+            new_id = self.db.alias_add(self.character_id, alias, a_type)
+            self.aliasTable.item(r,0).setData(Qt.UserRole, new_id)
+
+    @staticmethod
+    def _add_label(grid: QVBoxLayout, label: str):
+        grid.addWidget(QLabel(f"<b>{label}</b>"))
 
     def _apply_tab_order(self):
         # name -> description -> new-trait row -> buttons
@@ -183,6 +268,149 @@ class CharacterDialog(QDialog):
         rows = self.db.character_facets_by_type(self.character_id, "trait")
         for r in rows:
             self._append_trait_row(r["id"], r["label"] or "", r["value"] or "", r["note"] or "")
+
+    def load_character(self, character_id: int):
+        self._id = character_id
+        meta = self.app.db.world_item_meta(character_id)  # {title, content_md, ...}
+        self.nameEdit.setText(meta["title"])
+        self.descEdit.setPlainText(meta["content_md"])
+        QTimer.singleShot(0, lambda: auto_grow_plaintext(self.descEdit))
+
+        # aliases
+        self._reload_alias_table()
+
+        # facets
+        phys = self.app.db.character_facets_by_type(character_id, "trait_physical")   # [{id,label,value,note}]
+        char = self.app.db.character_facets_by_type(character_id, "trait_character")
+        self.tblPhysical.set_rows(phys) #;  fit_table_height_to_rows(self.tblPhysical._table, min_rows=1)
+        self.tblCharacter.set_rows(char) #; fit_table_height_to_rows(self.tblCharacter._table, min_rows=1)
+
+    # def _populate_alias_table(self, character_id: int):
+    #     aliases = self.db.aliases_for_world_item(character_id)  # return [{id,alias,alias_type}]
+    #     self.aliasTable.set_rows(aliases)
+
+    def _alias_context_menu(self, pos):
+        r = self.aliasTable.rowAt(pos.y())
+        m = QMenu(self)
+        aAdd = m.addAction("Add alias")
+        aDel = m.addAction("Delete")
+        chosen = m.exec(self.aliasTable.viewport().mapToGlobal(pos))
+        if not chosen: return
+        if chosen == aAdd:
+            self.aliasTable.insertRow(self.aliasTable.table.rowCount())
+            # focus alias cell
+            self.aliasTable.editItem(QTableWidgetItem(""))
+            # you can detect edits on itemChanged and persist on save
+        elif chosen == aDel and r >= 0:
+            rid = self.aliasTable.item(r,0).data(Qt.UserRole)
+            if rid:
+                self.app.db.alias_delete(int(rid))
+            self.aliasTable.removeRow(r)
+
+    def _alias_added(self, alias_type: str, alias: str):
+        alias = (alias or "").strip()
+        if not alias:
+            return
+        self.db.alias_type_upsert(self.app._current_project_id, alias_type)
+        ok = self.db.alias_add(self.character_id, alias, alias_type)
+        if not ok:
+            QMessageBox.information(self, "Duplicate alias",
+                                    f"“{alias}” already exists for this character.")
+            return
+        self._reload_alias_table()
+        # rows = self.db.aliases_for_world_item(self.character_id)
+        # self.aliasTable.set_rows(rows)
+        # self.aliasTable.fit_height()
+
+    # def _alias_edited(self, rid: int, alias: str, a_type: str):
+    #     self.db.alias_type_upsert(self.app._current_project_id, a_type)
+    #     self.db.alias_update(rid, alias, a_type)
+
+    def _alias_edited(self, row_id: int, field: str, value: str):
+        if field == "alias_type":
+            self.db.alias_update_type(row_id, value)
+            self.db.alias_type_upsert(self.app._current_project_id, value)
+        elif field == "alias":
+            self.db.alias_update_alias(row_id, value)
+        # requery to keep table/model synced
+        self._reload_alias_table()
+        # rows = self.db.aliases_for_world_item(self.character_id)
+        # self.aliasTable.set_rows(rows)
+
+    def _alias_deleted(self, rid: int):
+        self.db.alias_delete(rid)
+        # table already removed the row; but refresh to keep _rows in sync
+        self._reload_alias_table()
+        # rows = self.db.aliases_for_world_item(self.character_id)
+        # self.aliasTable.set_rows(rows)
+
+    def _add_facet(self, facet_type: str, label: str, value: str, note: str):
+        # Gentle guard: detect duplicate type+label for this character
+        if self.db.character_facet_exists(self.character_id, facet_type, label):
+            if QMessageBox.question(self, "Duplicate trait",
+                                    f"“{label}” already exists. Add another?",
+                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.No:
+                return
+        self.app.db.character_facet_insert(self._id, facet_type, label, value, note)
+        # reload that table only
+        rows = self.app.db.character_facets_by_type(self._id, facet_type)
+        if facet_type == "trait_physical":
+            self.tblPhysical.set_rows(rows)
+        elif facet_type == "trait_character":
+            self.tblCharacter.set_rows(rows)
+
+    def _edit_facet(self, facet_id: int, label: str, value: str, note: str):
+        self.app.db.character_facet_update(facet_id, label=label, value=value, note=note)
+
+    def _delete_facet(self, facet_id: int):
+        self.app.db.character_facet_delete(facet_id)
+
+    def _save_and_close(self):
+        # Commit any in-place editors so itemChanged fires
+        for t in (self.tblPhysical.table, self.tblCharacter.table, self.aliasTable.table):
+            t.clearFocus()
+            t.setCurrentCell(-1, -1)
+
+        # 2) if add-row was filled but Enter not pressed, insert it now (correct order)
+        self._commit_alias_addrow_if_filled()
+
+        # 3) (your other saves: name, description, facets, etc.)
+        title = self.nameEdit.text().strip()
+        md    = self.descEdit.toPlainText()
+        self.app.db.world_item_update(self._id, title=title, content_md=md)
+        self.app.rebuild_world_item_render(self._id) # render html from md # TODO: Should this not happen until loading world item?
+        # # aliases: iterate table and upsert # NOTE: This might already be done in _alias_edited
+        # self._persist_aliases()
+
+        # 4) refresh alias table from DB so UI mirrors truth
+        self._reload_alias_table()
+
+
+        # 5) notify right panel & close
+        if hasattr(self.app, "worldDetail"):
+            self.app.worldDetail.refresh()
+        self.accept()
+
+    def _persist_aliases(self):
+        t = self.aliasTable.table
+        seen = set()
+        for r in range(t.rowCount()):
+            alias = (t.item(r,0).text() if t.item(r,0) else "").strip()
+            a_type= (t.item(r,1).text() if t.item(r,1) else "alias").strip() or "alias"
+            if not alias: continue
+            rid = t.item(r,0).data(Qt.UserRole)
+            if rid:
+                self.app.db.alias_update(int(rid), alias, a_type)
+                seen.add(int(rid))
+            else:
+                new_id = self.app.db.alias_add(self._id, alias, a_type)
+                t.item(r,0).setData(Qt.UserRole, new_id)
+                seen.add(new_id)
+        # (optional) delete aliases missing from seen
+
+    def _cancel_dialog(self):
+        # if dirty detection wanted: compare to original snapshot and confirm discard
+        self.reject()
 
     # ── table helpers
     def _append_trait_row(self, facet_id: int, label: str, value: str, note: str):
@@ -280,7 +508,7 @@ class CharacterDialog(QDialog):
         )
         self.db.conn.commit()
         # refresh right panel if it's showing this character
-        if getattr(self.app, "_current_world_id", None) == self.character_id:
+        if getattr(self.app, "_current_world_item_id", None) == self.character_id:
             if hasattr(self.app, "show_world_item"):
                 self.app.show_world_item(self.character_id, edit_mode=False)
         # keep tree label in sync if you show titles there

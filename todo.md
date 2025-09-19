@@ -1,4 +1,9 @@
 TO-Dos
+## New
+* add links to other characters/belongings/ into character dialog/summary
+  * for characters, track relationship name(sibling, friend, enemy, etc), thoughts about people
+* Input hygiene: trim user strings, cap absurd length (e.g., 512 chars) before insert
+## Old
 * Edit button in right panel needs to open character dialog if current world item is type character
 * switch to guids rather than ints as PK if recommended
 * add right click options for chapters in world tree: insert blank chapter before/after | insert chapter from file before/after
