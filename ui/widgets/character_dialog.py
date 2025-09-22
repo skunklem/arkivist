@@ -1,8 +1,8 @@
 # ui/widgets/character_dialog.py
 from __future__ import annotations
 import sqlite3
-from typing import Optional, Union
-from PySide6.QtCore import Qt, QTimer
+from typing import List, Optional, Union
+from PySide6.QtCore import Qt, QTimer, QDateTime
 from PySide6.QtGui import QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
@@ -16,6 +16,7 @@ from ui.widgets.inline_alias_table import InlineAliasTable
 from ui.widgets.inline_facet_table import InlineFacetTable
 from ui.widgets.delegates import AliasTypeDelegate
 from ui.widgets.inline_alias_table import TYPE_COL, ALIAS_COL
+from ui.widgets.common import StatusLine
 
 def _icon_edit():
     icon = QIcon.fromTheme("document-edit")
@@ -51,18 +52,21 @@ class CharacterDialog(QDialog):
         self.db = db
         self.character_id = character_id
         self._dirty = False
-        self.setWindowTitle("Character Details")
+        # self.setWindowTitle("Character Details")
+        self.setWindowTitle(f"Character Details — {self.db.world_item(character_id)} [*]")
         self.resize(860, 640)
 
         # ── header: editable name
         self.nameEdit = QLineEdit()
         self.nameEdit.setPlaceholderText("Character name")
         self.nameEdit.textEdited.connect(self._mark_dirty)
+        self.nameEdit.textEdited.connect(lambda _: self._mark_dirty_status())
 
         # Description section (Markdown source in content_md)
         self.descEdit = PlainNoTab()
         self.descEdit.setPlaceholderText("Character backstory, summary, or notes (Markdown)…")
         auto_grow_plaintext(self.descEdit)
+        self.descEdit.textChanged.connect(lambda: self._mark_dirty_status())
 
         # aliases (with types)
         self.aliasTable = InlineAliasTable(lambda: self.db.alias_types_for_project(self.app._current_project_id))
@@ -77,6 +81,9 @@ class CharacterDialog(QDialog):
         self.tblCharacter  = InlineFacetTable(self.app, labels_character)
         self.setup_facet_table(self.tblCharacter, "trait_character")
 
+        # Ensure table changes impact staus line
+        self.setup_tables_mark_dirty([self.aliasTable, self.tblPhysical, self.tblCharacter])
+
         # footer buttons
         self.btnSave  = QPushButton("Save")
         self.btnClose = QPushButton("Cancel")
@@ -90,6 +97,9 @@ class CharacterDialog(QDialog):
         self._add_label(head, "Name")
         head.addWidget(self.nameEdit, 1)
         head.addStretch(1)
+
+        self.status = StatusLine(self)
+        self.status.show_neutral("Viewing")
 
         # ── scrollable body
         self.scroll = QScrollArea()
@@ -127,6 +137,7 @@ class CharacterDialog(QDialog):
         # Compose dialog
         root = QVBoxLayout(self)
         root.addLayout(head)
+        root.addWidget(self.status) 
         root.addWidget(self.scroll, 1)
 
         # Initial data
@@ -163,6 +174,18 @@ class CharacterDialog(QDialog):
 
         # keep table height compact (dialog scrolls, not the table)
         fit_table_height_to_rows(t, min_rows=1)
+
+    def _mark_dirty_status(self):
+        self._dirty = True
+        if hasattr(self, "status"):
+            self.status.set_dirty()
+        self.setWindowModified(True)
+
+    def setup_tables_mark_dirty(self, tables: List[Union[InlineAliasTable, InlineFacetTable]]):
+        for table in tables:
+            table.rowAdded.connect(lambda *_: self._mark_dirty_status())
+            table.rowEdited.connect(lambda *_: self._mark_dirty_status())
+            table.rowDeleted.connect(lambda *_: self._mark_dirty_status())
 
     def setup_alias_table(self, table: InlineAliasTable):
         # keep margins tight
@@ -231,6 +254,22 @@ class CharacterDialog(QDialog):
     def _add_label(grid: QVBoxLayout, label: str):
         grid.addWidget(QLabel(f"<b>{label}</b>"))
 
+    def _begin_populating(self):
+        # block change signals while we load data
+        self.nameEdit.blockSignals(True)
+        self.descEdit.blockSignals(True)
+        # If your tables emit rowEdited when you set rows, temporarily disconnect or block:
+        self.tblPhysical.table.blockSignals(True)
+        self.tblCharacter.table.blockSignals(True)
+        self.aliasTable.table.blockSignals(True)
+
+    def _end_populating(self):
+        self.nameEdit.blockSignals(False)
+        self.descEdit.blockSignals(False)
+        self.tblPhysical.table.blockSignals(False)
+        self.tblCharacter.table.blockSignals(False)
+        self.aliasTable.table.blockSignals(False)
+
     def _apply_tab_order(self):
         # name -> description -> new-trait row -> buttons
         try:
@@ -242,10 +281,10 @@ class CharacterDialog(QDialog):
             self.setTabOrder(self.addValue, self.addNote)
             self.setTabOrder(self.addNote, self.btnAdd)
             # use the BOTTOM buttons to avoid mixing top header/buttonbox
-            self.setTabOrder(self.btnAdd, self.btnSaveBottom)
+            self.setTabOrder(self.btnAdd, self.btnSave)
             # if you also have a bottom cancel, put it here; if not, remove this line
             if hasattr(self, "btnCancelBottom"):
-                self.setTabOrder(self.btnSaveBottom, self.btnCancelBottom)
+                self.setTabOrder(self.btnSave, self.btnCancelBottom)
         except Exception:
             # silent guard: in case any widget got renamed/removed
             pass
@@ -270,20 +309,30 @@ class CharacterDialog(QDialog):
             self._append_trait_row(r["id"], r["label"] or "", r["value"] or "", r["note"] or "")
 
     def load_character(self, character_id: int):
-        self._id = character_id
-        meta = self.app.db.world_item_meta(character_id)  # {title, content_md, ...}
-        self.nameEdit.setText(meta["title"])
-        self.descEdit.setPlainText(meta["content_md"])
-        QTimer.singleShot(0, lambda: auto_grow_plaintext(self.descEdit))
+        self._begin_populating()
+        try:
+            self._id = character_id
+            meta = self.app.db.world_item_meta(character_id)  # {title, content_md, ...}
+            self.nameEdit.setText(meta["title"])
+            self.descEdit.setPlainText(meta["content_md"])
+            QTimer.singleShot(0, lambda: auto_grow_plaintext(self.descEdit))
 
-        # aliases
-        self._reload_alias_table()
+            # aliases
+            self._reload_alias_table()
 
-        # facets
-        phys = self.app.db.character_facets_by_type(character_id, "trait_physical")   # [{id,label,value,note}]
-        char = self.app.db.character_facets_by_type(character_id, "trait_character")
-        self.tblPhysical.set_rows(phys) #;  fit_table_height_to_rows(self.tblPhysical._table, min_rows=1)
-        self.tblCharacter.set_rows(char) #; fit_table_height_to_rows(self.tblCharacter._table, min_rows=1)
+            # facets
+            phys = self.app.db.character_facets_by_type(character_id, "trait_physical")   # [{id,label,value,note}]
+            char = self.app.db.character_facets_by_type(character_id, "trait_character")
+            self.tblPhysical.set_rows(phys) #;  fit_table_height_to_rows(self.tblPhysical._table, min_rows=1)
+            self.tblCharacter.set_rows(char) #; fit_table_height_to_rows(self.tblCharacter._table, min_rows=1)
+        finally:
+            self._end_populating()
+
+        # reset dirty and status/modified dot
+        self._dirty = False
+        self.setWindowModified(False)
+        if hasattr(self, "status"):
+            self.status.show_neutral("Unchanged")
 
     # def _populate_alias_table(self, character_id: int):
     #     aliases = self.db.aliases_for_world_item(character_id)  # return [{id,alias,alias_type}]
@@ -331,7 +380,13 @@ class CharacterDialog(QDialog):
             self.db.alias_update_type(row_id, value)
             self.db.alias_type_upsert(self.app._current_project_id, value)
         elif field == "alias":
-            self.db.alias_update_alias(row_id, value)
+            ok = self.db.alias_update_alias(row_id, value)
+            print(f"ok: {ok}, row_id: {row_id}, value: {value}")
+            if not ok:
+                QMessageBox.information(self, "Duplicate alias",
+                                        f"“{value}” already exists for this character.")
+                self._reload_alias_table()
+                return
         # requery to keep table/model synced
         self._reload_alias_table()
         # rows = self.db.aliases_for_world_item(self.character_id)
@@ -365,6 +420,12 @@ class CharacterDialog(QDialog):
     def _delete_facet(self, facet_id: int):
         self.app.db.character_facet_delete(facet_id)
 
+    def _after_saved(self):
+        self._dirty = False
+        if hasattr(self, "status"):
+            self.status.set_saved_now()
+        self.setWindowModified(False)
+
     def _save_and_close(self):
         # Commit any in-place editors so itemChanged fires
         for t in (self.tblPhysical.table, self.tblCharacter.table, self.aliasTable.table):
@@ -389,6 +450,8 @@ class CharacterDialog(QDialog):
         # 5) notify right panel & close
         if hasattr(self.app, "worldDetail"):
             self.app.worldDetail.refresh()
+
+        self._after_saved()
         self.accept()
 
     def _persist_aliases(self):
@@ -492,33 +555,33 @@ class CharacterDialog(QDialog):
         self._mark_dirty()
 
     # ── save/close
-    def _save_all_and_close(self):
-        self._save_all()
-        self.accept()
+    # def _save_all_and_close(self):
+    #     self._save_all()
+    #     self.accept()
 
-    def _save_all(self):
-        if not self._dirty:
-            return
-        # update name + description
-        name = self.nameEdit.text().strip()
-        md   = self.descEdit.toPlainText()
-        self.db.conn.execute(
-            "UPDATE world_items SET title=?, content_md=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (name, md, self.character_id)
-        )
-        self.db.conn.commit()
-        # refresh right panel if it's showing this character
-        if getattr(self.app, "_current_world_item_id", None) == self.character_id:
-            if hasattr(self.app, "show_world_item"):
-                self.app.show_world_item(self.character_id, edit_mode=False)
-        # keep tree label in sync if you show titles there
-        if hasattr(self.app, "reload_world_tree"):
-            self.app.reload_world_tree(keep_expansion=True, focus_id=self.character_id)
-        self._dirty = False
-        # self.btnSave.setEnabled(False)
-        self.btnSaveBottom.setEnabled(False)
+    # def _save_all(self):
+    #     if not self._dirty:
+    #         return
+    #     # update name + description
+    #     name = self.nameEdit.text().strip()
+    #     md   = self.descEdit.toPlainText()
+    #     self.db.conn.execute(
+    #         "UPDATE world_items SET title=?, content_md=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+    #         (name, md, self.character_id)
+    #     )
+    #     self.db.conn.commit()
+    #     # refresh right panel if it's showing this character
+    #     if getattr(self.app, "_current_world_item_id", None) == self.character_id:
+    #         if hasattr(self.app, "show_world_item"):
+    #             self.app.show_world_item(self.character_id, edit_mode=False)
+    #     # keep tree label in sync if you show titles there
+    #     if hasattr(self.app, "reload_world_tree"):
+    #         self.app.reload_world_tree(keep_expansion=True, focus_id=self.character_id)
+    #     self._dirty = False
+    #     # self.btnSave.setEnabled(False)
+    #     self.btnSaveBottom.setEnabled(False)
 
     def _mark_dirty(self):
         self._dirty = True
         # self.btnSave.setEnabled(True)
-        self.btnSaveBottom.setEnabled(True)
+        self.btnSave.setEnabled(True)

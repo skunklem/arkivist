@@ -289,7 +289,7 @@ class Database:
 
     def aliases_for_world_item(self, world_item_id: int) -> list[sqlite3.Row]:
         c = self.conn.cursor()
-        c.execute("SELECT id, alias, alias_type FROM world_aliases WHERE world_item_id=? AND COALESCE(deleted,0)=0", (world_item_id,))
+        c.execute("SELECT id, alias, alias_type, alias_norm FROM world_aliases WHERE world_item_id=? AND COALESCE(deleted,0)=0", (world_item_id,))
         return c.fetchall()
 
     def alias_exists(self, world_item_id: int, alias: str) -> bool:
@@ -300,6 +300,8 @@ class Database:
             WHERE world_item_id=? AND alias_norm=? AND COALESCE(deleted,0)=0
             LIMIT 1
         """, (world_item_id, norm))
+        print("alias:", alias, "norm:", norm)
+        print([f'norm={r["alias_norm"]}' for r in self.aliases_for_world_item(world_item_id)])
         return c.fetchone() is not None
 
     def alias_add(self, world_item_id: int, alias: str, alias_type: str) -> bool:
@@ -320,7 +322,10 @@ class Database:
 
     def alias_add_multiple(self, world_item_id: int, aliases: dict[str, str]) -> None:
         c = self.conn.cursor()
-        c.executemany("INSERT INTO world_aliases (world_item_id, alias, alias_type) VALUES (?, ?, ?)", ((world_item_id, alias, alias_type) for alias, alias_type in aliases.items()))
+        c.executemany(
+            "INSERT INTO world_aliases (world_item_id, alias, alias_type, alias_norm) VALUES (?, ?, ?, ?)", 
+            ((world_item_id, alias, alias_type, _normalize_alias(alias)) for alias, alias_type in aliases.items())
+        )
         self.conn.commit()
 
     def alias_update(self, alias_id: int, alias: str, alias_type: str) -> None:
@@ -345,6 +350,8 @@ class Database:
         if not row:
             return False
         world_item_id = row[0]
+        if self.alias_exists(world_item_id, alias):
+            return False  # silently ignore or raise
         # prevent dupes against other aliases
         c.execute("""
             SELECT 1 FROM world_aliases

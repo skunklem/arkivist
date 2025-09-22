@@ -3,6 +3,12 @@ TO-Dos
 * add links to other characters/belongings/ into character dialog/summary
   * for characters, track relationship name(sibling, friend, enemy, etc), thoughts about people
 * Input hygiene: trim user strings, cap absurd length (e.g., 512 chars) before insert
+* Figure out logging of user actions
+* When creating blank chapter, start in edit mode
+* to-dos/notes are great, but I'd love a more intuitive and comprehensive outlining feature. Perhaps it needs to be a sidebar or another panel that can sit next to the chapter or in a second window while the user writes. Ideally, there would be one major outline with lots of bullets that can be peiced together chronologically, but each character (or location or major plotline) might have its own arc or personal outline that you want to look at individually without the noise of everything else. Each chapter would only include certain plot points, so it would be great if there could be a sliding sidebar next to the bullets for the user to specify where one chapter begins or ends. It could look like bars that lengthen up or down depending on whether the top is being slid, and that would snap to points above or below any given bullet point. Then, when you're in a chapter, the chapter outline would auto-populate to display oly the relevant section or clicking "outline" within a chapter could open the major outline overview with the relevant section already scrolled into view. The bullets also need to be able to move very easily among each other (perhaps a little grabber for obvious sliding but maybe not necessary). It could be kind of like a table format with new cells each time user clicks enter and each cell is draggable, but it needs to feel less clunky than using a table and clicking into each cell. The indentation of nested items needs to be preserved, so it could be like a tree, only with everything easier to edit at any time. It could be more like visual studio's alt+up or alt+down to move any lines that are fully or partially highlighted up or down.
+* Make status line more subtle (no need to span the whole width with the box - only as wide as text)
+  * change positioning to look better
+* world panel header and label don't need to be redundant - make header row only specify what type of world item overview we're getting (character summary, item details, setting details, or similar)
 ## Old
 * Edit button in right panel needs to open character dialog if current world item is type character
 * switch to guids rather than ints as PK if recommended

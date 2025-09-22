@@ -1,7 +1,7 @@
 import re, sqlite3
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QSize, Slot, QEvent, QRectF
+from PySide6.QtCore import Qt, QTimer, QSize, Slot, QEvent, QRectF, QDateTime
 from PySide6.QtGui import QAction, QKeySequence, QIcon, QPainter, QPixmap, QPen, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
@@ -20,6 +20,7 @@ from ui.widgets.character_dialog import CharacterDialog
 from ui.widgets.chapter_todos import ChapterTodosWidget
 from ui.widgets.chapters_tree import ChaptersTree
 from ui.widgets.helpers import DropPane, PlainNoTab
+from ui.widgets.common import StatusLine
 from utils.icons import make_lock_icon
 from utils.word_integration import DocxRoundTrip
 from utils.md import docx_to_markdown, md_to_html, read_file_as_markdown
@@ -29,7 +30,6 @@ class StoryArkivist(QMainWindow):
     def __init__(self, dev_mode: bool = False, db_path: str = "db.sqlite3"):
         super().__init__()
         self.dev_mode = dev_mode
-        self.setWindowTitle("StoryArkivist")
         self.resize(1200, 800)
 
         self.db = Database(db_path)
@@ -40,6 +40,8 @@ class StoryArkivist(QMainWindow):
 
         # Pick or create a project immediately
         self._ensure_project_exists_or_prompt()
+        # self.setWindowTitle("StoryArkivist")
+        self.setWindowTitle(f"StoryArkivist — {self.db.project_name(self._current_project_id)} [*]")
 
         # current state
         self._current_chapter_id = None
@@ -211,6 +213,7 @@ class StoryArkivist(QMainWindow):
             return
         name = self.db.project_name(pid) or "(Unknown)"
         self.projectBtn.setText(name)
+        self.setWindowTitle(f"StoryArkivist - {name} [*]")
 
     def _ensure_project_exists_or_prompt(self):
         """On first launch (or if all projects are deleted), create 'New Project' and open the manager focused on rename."""
@@ -811,6 +814,9 @@ class StoryArkivist(QMainWindow):
         self.titleEdit.setMaximumWidth(900)  # cap growth
         self.titleEdit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+        # Status bar
+        self.centerStatus = StatusLine(self)
+
         # Word sync toggle button
         self.wordSyncBtn = QPushButton("Edit in Word")
         self.wordSyncBtn.setToolTip("Open this chapter in Word and live-sync changes")
@@ -842,6 +848,7 @@ class StoryArkivist(QMainWindow):
         cv.addWidget(topBar)
         cv.addWidget(self.centerView)   # default: start in View mode
         cv.addWidget(self.centerEdit)
+        cv.addWidget(self.centerStatus)
 
         # start in view mode
         self._center_set_mode(view_mode=True)
@@ -1458,6 +1465,9 @@ class StoryArkivist(QMainWindow):
 
         self._chapter_dirty = False
 
+        if hasattr(self, "centerStatus"):
+            self.centerStatus.show_neutral("Viewing")
+
         # Always show View mode on load (per your preference)
         self._render_center_preview()
         self._center_set_mode(view_mode=True)
@@ -1470,6 +1480,9 @@ class StoryArkivist(QMainWindow):
 
     def mark_chapter_dirty(self):
         self._chapter_dirty = True
+        if hasattr(self, "centerStatus"):
+            self.centerStatus.set_dirty()
+        self.setWindowModified(True)
 
     def autosave_chapter_title(self):
         if self._current_chapter_id is None: return
@@ -1499,6 +1512,10 @@ class StoryArkivist(QMainWindow):
                         (title, md, chap_id))
             self.db.conn.commit()
             self._chapter_dirty = False
+            if hasattr(self, "centerStatus"):
+                self.centerStatus.set_saved_now()
+            # mark chapter or word-cync dirty
+            self.setWindowModified(bool(self._chapter_dirty or getattr(self.worldDetail, "_dirty", False)))
 
             # Update preview + references (only if this is the active chapter)
             self._render_center_preview()
