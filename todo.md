@@ -9,6 +9,7 @@ TO-Dos
 * Make status line more subtle (no need to span the whole width with the box - only as wide as text)
   * change positioning to look better
 * world panel header and label don't need to be redundant - make header row only specify what type of world item overview we're getting (character summary, item details, setting details, or similar)
+* stop word sync closes the word doc but leaves Word open if there weren't already any other documents open. It should close the whole application (but not any other documents). If other docs are open, it works fine, currently, leaving them up.
 ## Old
 * Edit button in right panel needs to open character dialog if current world item is type character
 * switch to guids rather than ints as PK if recommended

@@ -1,8 +1,8 @@
 # ui/widgets/common.py
 from __future__ import annotations
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QObject, Signal
 from PySide6.QtGui import QPalette, QColor
-from PySide6.QtWidgets import QLabel, QFrame
+from PySide6.QtWidgets import QLabel, QFrame, QSizePolicy
 
 def _blend(a: QColor, b: QColor, t: float) -> QColor:
     """Linear blend between two colors: 0 -> a, 1 -> b."""
@@ -34,6 +34,10 @@ class StatusLine(QLabel):
         self.setFrameStyle(QFrame.Panel | QFrame.Sunken)
         self.setLineWidth(1)
         self.setMidLineWidth(0)
+
+        # Make it look like a pill
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         # Internal timer for auto-reverting transient states
         self._timer = QTimer(self)
@@ -152,3 +156,27 @@ class StatusLine(QLabel):
     def closeEvent(self, ev):
         self._timer.stop()
         super().closeEvent(ev)
+
+
+
+class EditStateController(QObject):
+    stateChanged = Signal(str)   # "Viewing" | "Editing"
+
+    def __init__(self, initial="Viewing", parent=None):
+        super().__init__(parent)
+        self._state = initial
+
+    @property
+    def state(self):
+        return self._state
+
+    def set_viewing(self):
+        self._set("Viewing")
+
+    def set_editing(self):
+        self._set("Editing")
+
+    def _set(self, val):
+        if self._state != val:
+            self._state = val
+            self.stateChanged.emit(val)

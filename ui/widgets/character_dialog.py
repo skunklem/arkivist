@@ -93,13 +93,15 @@ class CharacterDialog(QDialog):
 
         # --- Dialog layout ---
 
+        self.status = StatusLine(self)
+        self.status.show_neutral("Viewing")
+
+        # ── header
         head = QHBoxLayout()
         self._add_label(head, "Name")
         head.addWidget(self.nameEdit, 1)
         head.addStretch(1)
-
-        self.status = StatusLine(self)
-        self.status.show_neutral("Viewing")
+        head.addWidget(self.status, 0)
 
         # ── scrollable body
         self.scroll = QScrollArea()
@@ -137,7 +139,6 @@ class CharacterDialog(QDialog):
         # Compose dialog
         root = QVBoxLayout(self)
         root.addLayout(head)
-        root.addWidget(self.status) 
         root.addWidget(self.scroll, 1)
 
         # Initial data

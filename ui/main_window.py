@@ -266,6 +266,7 @@ class StoryArkivist(QMainWindow):
         self.centerView.setVisible(view_mode)
         self.centerEdit.setVisible(not view_mode)
         self.centerModeBtn.setText("Edit" if view_mode else "View")
+        self.centerStatus.show_neutral("Viewing" if view_mode else "Editing")
 
         # If locked by Word (for this chapter), force View mode & disable editor
         locked = getattr(self, "_word_lock_chapter_id", None)
@@ -284,6 +285,8 @@ class StoryArkivist(QMainWindow):
         if getattr(self, "_word_lock_chapter_id", None) == getattr(self, "_current_chapter_id", None):
             return
         self._chapter_dirty = True
+        self.centerStatus.set_dirty()
+        self.setWindowModified(True)
 
     def _center_toggle_mode(self):
         """Toggle center editor view/edit. Save on leaving Edit."""
@@ -323,6 +326,8 @@ class StoryArkivist(QMainWindow):
         # (optional) visibly read-only title field when locked
         self.titleEdit.setReadOnly(active)
         # self.titleEdit.setStyleSheet("QLineEdit{background:#f6f6f6;}" if active else "")
+        if active:
+            self.centerStatus.show_info("Editing in Word")
 
     def ensure_world_roots(self):
         """Ensure the project has a basic set of world root categories."""
@@ -831,6 +836,8 @@ class StoryArkivist(QMainWindow):
         topLay = QHBoxLayout(topBar); topLay.setContentsMargins(0,0,0,0)
         topLay.addWidget(self.titleEdit, 1)          # stretch title to use space
         topLay.addSpacing(8)
+        topLay.addWidget(self.centerStatus)
+        topLay.addSpacing(8)
         topLay.addWidget(self.wordSyncBtn, 0)
         topLay.addSpacing(8)
         topLay.addWidget(self.centerModeBtn, 0)
@@ -848,7 +855,6 @@ class StoryArkivist(QMainWindow):
         cv.addWidget(topBar)
         cv.addWidget(self.centerView)   # default: start in View mode
         cv.addWidget(self.centerEdit)
-        cv.addWidget(self.centerStatus)
 
         # start in view mode
         self._center_set_mode(view_mode=True)

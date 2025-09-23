@@ -238,9 +238,9 @@ class WorldDetailWidget(QWidget):
             self.app.open_character_dialog(self._current_world_item_id)
             return
 
-        v = self._views.get("view")
+        v = self._views.get("view"); e = self._views.get("edit")
         # Non-character: if leaving edit -> save first
-        currently_viewing = bool(v and v.isVisible())
+        currently_viewing = bool(v and e and v.isVisible())
         if not currently_viewing:
             self._save_current_if_dirty()
 
