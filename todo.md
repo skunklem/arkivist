@@ -1,15 +1,25 @@
 TO-Dos
 ## New
+* character summary: show aliases as list (aka: john, jacob,...)
 * add links to other characters/belongings/ into character dialog/summary
   * for characters, track relationship name(sibling, friend, enemy, etc), thoughts about people
 * Input hygiene: trim user strings, cap absurd length (e.g., 512 chars) before insert
 * Figure out logging of user actions
-* When creating blank chapter, start in edit mode
-* to-dos/notes are great, but I'd love a more intuitive and comprehensive outlining feature. Perhaps it needs to be a sidebar or another panel that can sit next to the chapter or in a second window while the user writes. Ideally, there would be one major outline with lots of bullets that can be peiced together chronologically, but each character (or location or major plotline) might have its own arc or personal outline that you want to look at individually without the noise of everything else. Each chapter would only include certain plot points, so it would be great if there could be a sliding sidebar next to the bullets for the user to specify where one chapter begins or ends. It could look like bars that lengthen up or down depending on whether the top is being slid, and that would snap to points above or below any given bullet point. Then, when you're in a chapter, the chapter outline would auto-populate to display oly the relevant section or clicking "outline" within a chapter could open the major outline overview with the relevant section already scrolled into view. The bullets also need to be able to move very easily among each other (perhaps a little grabber for obvious sliding but maybe not necessary). It could be kind of like a table format with new cells each time user clicks enter and each cell is draggable, but it needs to feel less clunky than using a table and clicking into each cell. The indentation of nested items needs to be preserved, so it could be like a tree, only with everything easier to edit at any time. It could be more like visual studio's alt+up or alt+down to move any lines that are fully or partially highlighted up or down.
+* How to ensure center/right align persists through markdown conversion (or switch to better editor)
+  * We'd also want to preserve comments and allow merging in external edits
+* Edit in word should bring up word in front of app, not behind
+* When creating blank chapter, start in edit mode with "New Chapter" title highlighted and ready to edit (or as the recommended text)
+* to-dos/notes are great, but I'd love a more intuitive and comprehensive outlining feature. Perhaps it needs to be a sidebar or another panel that can sit next to the chapter or in a second window while the user writes. Ideally, there would be one major outline with lots of bullets that can be pieced together chronologically, but each character (or location or major plotline) might have its own arc or personal outline that you want to look at individually without the noise of everything else. Each chapter would only include certain plot points, so it would be great if there could be a sliding sidebar next to the bullets for the user to specify where one chapter begins or ends. It could look like bars that lengthen up or down depending on whether the top is being slid, and that would snap to points above or below any given bullet point. Then, when you're in a chapter, the chapter outline would auto-populate to display oly the relevant section or clicking "outline" within a chapter could open the major outline overview with the relevant section already scrolled into view. The bullets also need to be able to move very easily among each other (perhaps a little grabber for obvious sliding but maybe not necessary). It could be kind of like a table format with new cells each time user clicks enter and each cell is draggable, but it needs to feel less clunky than using a table and clicking into each cell. The indentation of nested items needs to be preserved, so it could be like a tree, only with everything easier to edit at any time. It could be more like visual studio's alt+up or alt+down to move any lines that are fully or partially highlighted up or down.
 * Make status line more subtle (no need to span the whole width with the box - only as wide as text)
   * change positioning to look better
 * world panel header and label don't need to be redundant - make header row only specify what type of world item overview we're getting (character summary, item details, setting details, or similar)
 * stop word sync closes the word doc but leaves Word open if there weren't already any other documents open. It should close the whole application (but not any other documents). If other docs are open, it works fine, currently, leaving them up.
+* In the Outline window, attach a proxy like `QSortFilterProxyModel` to match chapter list to chapter tree from main app with separate `QItemSelectionModel`s
+* allow multiple books in Outline: add a book selector above the Outline list and call workspace.load_from_db(db, project_id, chosen_book_id) on change; the same reorder signal will keep ordering consistent per book.
+### Small fixes
+* center mode button needs to be off when no character id selected
+* enter/save in character dialog shouldn't close it but take focus out of whatever was being edited (and save it)
+* shouldn't need to hit enter twice to save/defocus from trait tables
 ## Old
 * Edit button in right panel needs to open character dialog if current world item is type character
 * switch to guids rather than ints as PK if recommended
@@ -26,11 +36,12 @@ TO-Dos
 * bulk import dialog: Insert line should have button(first), dropdown(select location), button(last) (or use radiobuttons with dropdown in the selection option); Split on first --> Number detection, radiobuttons for "N. ", "N - ", "N " (needs to be clear where the spaces are)
 * Export individual chapters or whole book as docx, ideally in project directory (use project default or select outdir). Add export option to right click for given chapter.
 * Right click book in chapter tree: Export book (writes .docx), New book (adds new book and has user name it in chapter tree), Import book (select file -> attempt to separate into multiple chapters else one)
-* mass rename capabilities (of something like a character name) across all chapters/world items. Add old name to aliases with marking indicating that it's not used anymore. Defunct aliases will bring up a warning if found in text prior to export.
+* mass rename capabilities (of something like a character name) across all chapters/world items. Add old name to aliases with marking indicating that it's not used anymore. Defunct aliases will bring up a warning if found in text prior to export. NOTE: probably need to call pane.refresh_from_model() after changes implement
 * recompute_chapter_references needs to account for the potential of some aliases and names spanning multiple words like "Lake Watery" or "the high prince"
 * Add new chapter icon on tree next to "Chapters"
 * How to deal with interludes or Part/Act numbers that should sit between chapters but not imopact the chapter numbering
   * potential fix: order by setting pointer to chapter/writing that comes before it; add field `is_numbered` where only the true ones get auto-incremented chapter numbers; then `position` can auto-increment (or not if explicit numbering desired); and if all versions of a chapter are marked inactive, numbering will exclude that chapter despite it still being linked between two others by pointer
+  * This will work well by updating chapter_display_label and its inputs and possibly setting a numbering policy (we can offer a few defaults (purely numerical, don't number parts, user-explicit numbering,...))
 * Add facet templates (defaults) per project (“Characters usually have: Eye color, Hair, Height, …”) so the “Add Trait” dialog can present a dropdown of common labels.
 * Add top-level world item defaults based on selected project type (novel:characters,locations,events; memoir:people,locations,events). Certain categories allow nesting (like locations which can have morespecific locations inside them, but characters probably shouldn't allow nesting)
 * Inline linking in goals/notes via your wikilink syntax ([[Some Item]]), reuse your render pipeline.

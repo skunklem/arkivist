@@ -181,7 +181,7 @@ class ProjectManagerDialog(QDialog):
             self.app.refresh_project_header()
 
     def _new_project(self):
-        name, ok = QInputDialog.getText(self, "New Project", "Project name:")
+        name, ok = QInputDialog.getText(self, "Untitled Project", "Project name:")
         if not ok or not name.strip(): return
         c = self.app.db.conn.cursor()
         c.execute("INSERT INTO projects(name) VALUES(?)", (name.strip(),))

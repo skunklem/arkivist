@@ -51,11 +51,34 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         chapter_id INTEGER NOT NULL,
         version_number INTEGER NOT NULL,
         content TEXT,
+        name TEXT,                     -- optional label like “Draft A”
+        is_active INTEGER DEFAULT 1,   -- one active per chapter at a time
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        is_active BOOLEAN DEFAULT 0,
         FOREIGN KEY(chapter_id) REFERENCES chapters(id)
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chver_active
+        ON chapter_versions(chapter_id)
+        WHERE is_active=1;
+
+    -- Outline items for a specific chapter version
+    CREATE TABLE IF NOT EXISTS outline_items (
+        id INTEGER PRIMARY KEY,
+        chapter_version_id INTEGER NOT NULL,
+        parent_id INTEGER,                 -- null = root (per chapter version)
+        order_key REAL NOT NULL,           -- fractional ordering
+        text TEXT NOT NULL,
+        tags TEXT,                         -- JSON array of strings (simple for v1)
+        notes TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(chapter_version_id) REFERENCES chapter_versions(id),
+        FOREIGN KEY(parent_id) REFERENCES outline_items(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ol_items_ver_parent
+        ON outline_items(chapter_version_id, parent_id, order_key);
+
     CREATE TABLE IF NOT EXISTS chapter_notes (
         id INTEGER PRIMARY KEY,
         chapter_id INTEGER NOT NULL,

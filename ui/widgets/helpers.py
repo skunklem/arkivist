@@ -89,3 +89,9 @@ def fit_table_height_to_rows(table: QTableWidget, min_rows=1):
     h = header + rows*rowh + 6
     table.setMinimumHeight(h)
     table.setMaximumHeight(h)
+
+
+def chapter_display_label(index_zero_based: int, title: str) -> str:
+    # tweak to your policy (Prologue, Parts, “Ch. N — Title”, etc.)
+    n = index_zero_based + 1
+    return f"{n}. {title}" if title else f"Chapter {n}"

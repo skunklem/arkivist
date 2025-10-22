@@ -187,3 +187,8 @@ app2*.py
 storyarkivist_bad_refactor/
 test.ipynb
 dev*.py
+# DEPRECATED:
+outline_model.py
+outline_panel.py
+flat_outline_editor.py
+outline.json

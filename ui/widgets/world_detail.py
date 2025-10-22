@@ -481,7 +481,6 @@ class WorldDetailWidget(QWidget):
 
     def _anchor_clicked(self, qurl):
         """Handle world:// links from QTextBrowser & QLabel."""
-        print("Using this one")
         url = qurl.toString()
         # Accept several patterns:
         #   world://123

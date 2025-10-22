@@ -26,6 +26,8 @@ class StatusLine(QLabel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("StatusPill")  # ADD
+
         # Look & feel
         self.setTextInteractionFlags(Qt.NoTextInteraction)
         self.setContentsMargins(0, 0, 0, 0)
@@ -34,6 +36,7 @@ class StatusLine(QLabel):
         self.setFrameStyle(QFrame.Panel | QFrame.Sunken)
         self.setLineWidth(1)
         self.setMidLineWidth(0)
+        self.setMinimumWidth(0)           # allow pill to hug text
 
         # Make it look like a pill
         self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
@@ -81,7 +84,18 @@ class StatusLine(QLabel):
         self._apply_state_style(kind="error")
         self.setText(text)
 
+    def set_ok(self):    self._apply_variant("StatusPill--ok")
+    def set_warn(self):  self._apply_variant("StatusPill--warn")
+    def set_err(self):   self._apply_variant("StatusPill--err")
+
     # ---------- Internals ----------
+
+    def _apply_variant(self, cls: str):
+        # drop previous variants
+        cur = self.property("class") or ""
+        kept = " ".join([c for c in cur.split() if not c.startswith("StatusPill--")])
+        self.setProperty("class", (kept + " " + cls).strip())
+        self.style().unpolish(self); self.style().polish(self); self.update()
 
     def _revert_to_neutral(self):
         self._apply_neutral_style()

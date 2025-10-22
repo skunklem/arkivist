@@ -74,7 +74,7 @@ class Database:
                      WHERE id=?""", (name, import_dir, export_dir, description, project_id))
         self.conn.commit()
 
-    def project_create(self, name: str="New Project") -> int:
+    def project_create(self, name: str="Untitled Project") -> int:
         c = self.conn.cursor()
         c.execute("INSERT INTO projects(name) VALUES (?)", (name,))
         self.conn.commit()
@@ -198,6 +198,46 @@ class Database:
             SET position = position + ?
             WHERE project_id=? AND book_id=? AND position >= ? AND COALESCE(deleted,0)=0
         """, (N, project_id, book_id, last_pos_idx))
+        self.conn.commit()
+
+    # ---- Chapter versions / outline ----
+    def chapter_active_version_id(self, chapter_id: int) -> int:
+        c = self.conn.cursor()
+        c.execute("""SELECT id FROM chapter_versions
+                    WHERE chapter_id=? AND is_active=1
+                    ORDER BY id LIMIT 1""", (chapter_id,))
+        r = c.fetchone()
+        if r: return int(r["id"])
+        # Create one lazily if missing
+        c.execute("INSERT INTO chapter_versions(chapter_id, is_active) VALUES (?,1)", (chapter_id,))
+        self.conn.commit()
+        return int(c.lastrowid)
+
+    def outline_items_for_version(self, chver_id: int) -> list:
+        c = self.conn.cursor()
+        c.execute("""SELECT id, parent_id, order_key, text, tags, notes
+                    FROM outline_items
+                    WHERE chapter_version_id=?
+                    ORDER BY parent_id IS NOT NULL, order_key, id""", (chver_id,))
+        return c.fetchall()
+
+    def outline_insert_item(self, chver_id: int, parent_id: int|None, order_key: float,
+                            text: str, tags_json: str="[]", notes: str="") -> int:
+        c = self.conn.cursor()
+        c.execute("""INSERT INTO outline_items(chapter_version_id, parent_id, order_key, text, tags, notes)
+                    VALUES (?,?,?,?,?,?)""", (chver_id, parent_id, order_key, text, tags_json, notes))
+        self.conn.commit()
+        return int(c.lastrowid)
+
+    def outline_update_text(self, item_id: int, text: str) -> None:
+        self.conn.execute("""UPDATE outline_items
+                            SET text=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""", (text, item_id))
+        self.conn.commit()
+
+    def outline_delete_items(self, item_ids: list[int]) -> None:
+        if not item_ids: return
+        q = ",".join("?"*len(item_ids))
+        self.conn.execute(f"DELETE FROM outline_items WHERE id IN ({q})", item_ids)
         self.conn.commit()
 
     # ---- World categories/items/aliases/links (examples)
@@ -567,6 +607,21 @@ class Database:
         cur.execute("""SELECT label FROM facet_templates
                     WHERE project_id=? AND kind=? ORDER BY position, id""", (project_id, kind))
         return [r[0] for r in cur.fetchall()]
+
+    # ---- UI Preferences (per-project key-value store)
+    def ui_pref_get(self, project_id: int, key: str) -> str | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT value FROM ui_prefs WHERE project_id=? AND key=?", (project_id, key))
+        row = cur.fetchone()
+        return (row["value"] if hasattr(row, "keys") and "value" in row.keys() else row[0]) if row else None
+
+    def ui_pref_set(self, project_id: int, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO ui_prefs(project_id, key, value) VALUES(?,?,?) "
+            "ON CONFLICT(project_id, key) DO UPDATE SET value=excluded.value",
+            (project_id, key, value),
+        )
+        self.conn.commit()
 
     # ---- FTS (chapter & world)
     def fts_rebuild(self) -> None:

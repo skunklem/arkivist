@@ -1,15 +1,18 @@
+import json
 import re, sqlite3
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QSize, Slot, QEvent, QRectF, QDateTime
-from PySide6.QtGui import QAction, QKeySequence, QIcon, QPainter, QPixmap, QPen, QIcon
+from PySide6.QtCore import Qt, QTimer, QSize, Slot, QEvent, QRectF, QDateTime, QSignalBlocker, Signal, QObject
+from PySide6.QtGui import QAction, QKeySequence, QIcon, QPainter, QPixmap, QPen, QIcon, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
-    QTreeWidget, QTreeWidgetItem, QPlainTextEdit, QTextBrowser,
+    QTreeWidget, QTreeWidgetItem, QPlainTextEdit, QTextBrowser, QMessageBox,
     QLineEdit, QLabel, QPushButton, QTabWidget, QFileDialog, QToolBar,
     QDialog, QSizePolicy, QInputDialog, QMenu, QToolButton, QHBoxLayout,
-    QWidgetAction, QAbstractItemDelegate, QStyle
+    QWidgetAction, QAbstractItemDelegate, QStyle, QApplication, QComboBox
 )
+from ui.widgets.theme_manager import theme_manager
+from ui.widgets.ui_zoom import UiZoom
 from database.db import Database
 from ui.widgets.dialogs import BulkChapterImportDialog, ProjectManagerDialog, WorldImportDialog
 from ui.widgets.world_detail import WorldDetailWidget
@@ -19,21 +22,45 @@ from ui.widgets.character_editor import CharacterEditorDialog
 from ui.widgets.character_dialog import CharacterDialog
 from ui.widgets.chapter_todos import ChapterTodosWidget
 from ui.widgets.chapters_tree import ChaptersTree
-from ui.widgets.helpers import DropPane, PlainNoTab
+from ui.widgets.helpers import DropPane, PlainNoTab, chapter_display_label
 from ui.widgets.common import StatusLine
 from utils.icons import make_lock_icon
 from utils.word_integration import DocxRoundTrip
 from utils.md import docx_to_markdown, md_to_html, read_file_as_markdown
 from utils.files import parse_chapter_filename
+from ui.widgets.outline import OutlineWorkspace
+from ui.widgets.outline import MiniOutlineTab
+from ui.widgets.outline.window import OutlineWindow
 
 class StoryArkivist(QMainWindow):
+    chaptersOrderChanged = Signal(int, int, 'QVariantList')
+
+    # StoryArkivist.__init__ (temporary)
+    def _install_key_tracer(self):
+        app = QApplication.instance()
+        class _Tracer(QObject):
+            def eventFilter(self, obj, ev):
+                if ev.type() == QEvent.KeyPress:
+                    print("TRACER KeyPress", type(obj).__name__, ev.key(), ev.modifiers())
+                return False
+        self._tracer = _Tracer()
+        app.installEventFilter(self._tracer)
+
     def __init__(self, dev_mode: bool = False, db_path: str = "db.sqlite3"):
         super().__init__()
+        
+        # self._install_key_tracer()
+
         self.dev_mode = dev_mode
-        self.resize(1200, 800)
+        self.resize(1200, 700)
 
         self.db = Database(db_path)
         self.charactersPage = CharactersPage(self, self.db)
+        self.outlineWorkspace = OutlineWorkspace()
+        print("APP sees controller", id(self.outlineWorkspace.page.undoController))
+        self._install_outline_undo_actions()
+        QApplication.instance().installEventFilter(self)
+        # self.outlineWorkspace.install_global_shortcuts(self)  # pass main window as host
 
         self._build_ui()
         self._wire_actions()
@@ -47,9 +74,36 @@ class StoryArkivist(QMainWindow):
         self._current_chapter_id = None
         self._chapter_dirty = False
 
+        # load some data (dev mode)
+        if self.dev_mode:
+            # populate some demo data for dev mode
+            self.populate_demo_data()
+            self._emit_chapter_order()
+
         # Now that a project is guaranteed, render left trees / center panels for it
         self.refresh_project_header()
         self.populate_all()
+        self._select_startup_chapter()
+
+    def _install_outline_undo_actions(self):
+        if getattr(self, "_outline_actions_installed", False):
+            return
+        ctrl = self.outlineWorkspace.page.undoController
+
+        self._actUndo = QAction("Undo Outline", self)
+        self._actUndo.setShortcuts([QKeySequence.Undo])  # Ctrl+Z
+        self._actUndo.setShortcutContext(Qt.ApplicationShortcut)
+        self._actUndo.triggered.connect(ctrl.undo)
+        self.addAction(self._actUndo)
+
+        self._actRedo = QAction("Redo Outline", self)
+        self._actRedo.setShortcuts([QKeySequence.Redo, QKeySequence("Ctrl+Shift+Z")])
+        self._actRedo.setShortcutContext(Qt.ApplicationShortcut)
+        self._actRedo.triggered.connect(ctrl.redo)
+        self.addAction(self._actRedo)
+
+        self._outline_actions_installed = True
+        print("APP: outline undo/redo actions installed; ctrl id", id(ctrl))
 
     # ---- Zoom state ----
     def _init_zoom_state(self):
@@ -181,12 +235,69 @@ class StoryArkivist(QMainWindow):
             txt = self.db.chapter_content(cid)
             self.recompute_chapter_references(cid, txt)
 
+        # Example versioned outlines for demo:
+        v1_c1 = [
+            "Opening image",
+            "Inciting incident",
+            "Hero refuses the call",
+        ]
+        v2_c1 = [
+            "Alternate opening image",
+            "Incident happens off-screen",
+            "Mentor foreshadowed earlier",
+        ]
+        v1_c2 = [
+            "Enter new world",
+            "Meet allies",
+            "First threshold",
+        ]
+        v1_c3 = [
+            "Trials",
+            "Midpoint reversal",
+            "New stakes",
+        ]
+
+        # Store version names list
+        self.db.ui_pref_set(pid, f"outline_versions:{c1}", json.dumps(["v1","v2"]))
+        self.db.ui_pref_set(pid, f"outline_versions:{c2}", json.dumps(["v1"]))
+        self.db.ui_pref_set(pid, f"outline_versions:{c3}", json.dumps(["v1"]))
+        self.db.ui_pref_set(pid, f"outline_versions:{c4}", json.dumps(["v1"]))
+
+        # Store lines per version
+        self.db.ui_pref_set(pid, f"outline:{c1}:v1", json.dumps(v1_c1))
+        self.db.ui_pref_set(pid, f"outline:{c1}:v2", json.dumps(v2_c1))
+        self.db.ui_pref_set(pid, f"outline:{c2}:v1", json.dumps(v1_c2))
+        self.db.ui_pref_set(pid, f"outline:{c3}:v1", json.dumps(v1_c3))
+        self.db.ui_pref_set(pid, f"outline:{c4}:v1", json.dumps(v1_c3))
+
         # refresh UI
         self.populate_chapters_tree()
         self.populate_world_tree()
         self.load_chapter(c1)
 
+        # refresh outline workspace
+        self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
+        self.tabMiniOutline.set_workspace(self.outlineWorkspace)
+        self.tabMiniOutline.set_chapter(self._current_chapter_id)
+
         self.rebuild_search_indexes()
+
+    def _select_startup_chapter(self):
+        pid, bid = self._current_project_id, self._current_book_id
+        last = self.db.ui_pref_get(pid, f"chapters:last:{bid}")
+        if last:
+            try:
+                chap_id = int(last)
+            except ValueError:
+                chap_id = None
+        else:
+            # fallback to first chapter in this book
+            rows = self.db.chapter_list(pid, bid)  # ordered
+            chap_id = rows[0]["id"] if rows else None
+
+        if chap_id:
+            self.focus_chapter_in_tree(chap_id)  # your existing helper
+            self.load_chapter(chap_id)           # keeps everything in sync
 
     def _make_fallback_book_icon(self, size: int = 16) -> QIcon:
         # create a simple book icon as fallback
@@ -216,7 +327,7 @@ class StoryArkivist(QMainWindow):
         self.setWindowTitle(f"StoryArkivist - {name} [*]")
 
     def _ensure_project_exists_or_prompt(self):
-        """On first launch (or if all projects are deleted), create 'New Project' and open the manager focused on rename."""
+        """On first launch (or if all projects are deleted), create 'Untitled Project' and open the manager focused on rename."""
         if self.db.project_quantity() > 0:
             # ensure we have a current project id
             # just pick the first active project (#TODO: remember last used?)
@@ -627,7 +738,7 @@ class StoryArkivist(QMainWindow):
     # ---------- UI ----------
 
     def _add_menu(self, name: str) -> QMenu:
-        return self.menuBar().addMenu(name)
+        return self.menuBar().addMenu(f"&{name}")
 
     def _add_file_menu(self):
         self.fileMenu = self._add_menu("File")
@@ -655,6 +766,63 @@ class StoryArkivist(QMainWindow):
     def _add_view_menu(self):
         self.viewMenu = self._add_menu("View")
         # View menu actions
+        # Submenu for Theme
+        theme_menu = QMenu("Theme", self)
+        self.viewMenu.addMenu(theme_menu)
+
+        # Direct select actions
+        self._theme_actions = []
+        for idx, t in enumerate(theme_manager._themes):
+            act = QAction(t.name, self, checkable=True)
+            act.setChecked(idx == theme_manager._idx)
+            def make_handler(i=idx, a=act):
+                def _():
+                    for other in self._theme_actions:
+                        other.setChecked(False)
+                    a.setChecked(True)
+                    theme_manager.set_index(i)
+                    theme_manager.apply(QApplication.instance())
+                return _
+            act.triggered.connect(make_handler())
+            theme_menu.addAction(act)
+            self._theme_actions.append(act)
+
+        # Next Theme action + shortcut
+        next_theme_act = QAction("Next Theme", self)
+        next_theme_act.setShortcut(QKeySequence("Ctrl+`"))
+        def _next_theme():
+            theme_manager.next()
+            # sync radio checks
+            for i, a in enumerate(self._theme_actions):
+                a.setChecked(i == theme_manager._idx)
+            theme_manager.apply(QApplication.instance())
+        next_theme_act.triggered.connect(_next_theme)
+
+        self.viewMenu.addAction(next_theme_act)
+
+        # # --- Zoom submenu
+        # zoom_in_act = QAction("Zoom In", self)
+        # zoom_in_act.setShortcut(QKeySequence("Ctrl++"))  # on some keyboards use Ctrl+='
+        # def _zoom_in():
+        #     theme_manager.zoom_in()
+        #     theme_manager.apply(QApplication.instance())
+        # zoom_in_act.triggered.connect(_zoom_in)
+
+        # zoom_out_act = QAction("Zoom Out", self)
+        # zoom_out_act.setShortcut(QKeySequence("Ctrl+-"))
+        # def _zoom_out():
+        #     theme_manager.zoom_out()
+        #     theme_manager.apply(QApplication.instance())
+        # zoom_out_act.triggered.connect(_zoom_out)
+
+        # zoom_reset_act = QAction("Reset Zoom", self)
+        # zoom_reset_act.setShortcut(QKeySequence("Ctrl+0"))
+        # def _zoom_reset():
+        #     theme_manager.zoom_reset()
+        #     theme_manager.apply(QApplication.instance())
+        # zoom_reset_act.triggered.connect(_zoom_reset)
+
+        # self.viewMenu.addActions([zoom_in_act, zoom_out_act, zoom_reset_act])
 
     def _add_dev_menu(self):
         self.devMenu  = self._add_menu("Dev")
@@ -812,7 +980,68 @@ class StoryArkivist(QMainWindow):
         if hasattr(self.chaptersTree, "set_reorder_locked"):
             self.chaptersTree.set_reorder_locked(checked)
 
+    def _on_workspace_version_changed(self, chap_id: int, name: str):
+        if chap_id == getattr(self, "_current_chapter_id", None):
+            # keep header combo and mini tab aligned
+            with QSignalBlocker(self.cmbChapterVersion):
+                self.cmbChapterVersion.setCurrentText(name)
+            self.tabMiniOutline.refresh_from_workspace()
+
+    def _on_outline_delete_chapter(self, chap_id: int):
+        # Your existing soft-delete (keeps outline in ui_prefs for potential restore)
+        self._soft_delete_chapter(chap_id)
+
+        # Remove from the outline model
+        row = self.outlineWorkspace.row_for_chapter_id(chap_id)
+        if row >= 0:
+            self.outlineWorkspace.model.removeRow(row)
+            # keep maps/panes consistent
+            self.outlineWorkspace._rebuild_id_map()
+        
+        if self._current_chapter_id == chap_id:
+            self.tabMiniOutline.set_chapter(chap_id)  # clears if gone
+
+    def _row_for_chapter_id(self, chap_id: int) -> int:
+        return self.db.chapter_meta(chap_id)["position"]
+
+    def _on_header_version_changed(self, name: str):
+        chap_id = getattr(self, "_current_chapter_id", None)
+        if not chap_id or not name:
+            return
+        if name == "➕ New version…":
+            # suggest v{n+1}
+            count = len(self.outlineWorkspace.versions_for_chapter_id(chap_id))
+            suggested = f"v{count+1}"
+            while True:
+                new_name, ok = QInputDialog.getText(self, "New version", "Version name:", text=suggested)
+                if not ok:
+                    # restore selection to current version
+                    cur = self.outlineWorkspace.current_version_for_chapter_id(chap_id)
+                    with QSignalBlocker(self.cmbChapterVersion):
+                        if cur: self.cmbChapterVersion.setCurrentText(cur)
+                    return
+                new_name = new_name.strip()
+                if new_name:
+                    break
+                QMessageBox.warning(self, "Name required", "Please provide a version name.")
+
+            self.outlineWorkspace.add_version_for_chapter_id(chap_id, new_name, clone_from_current=True)
+            # repopulate and select
+            self._populate_header_versions(chap_id)
+            with QSignalBlocker(self.cmbChapterVersion):
+                self.cmbChapterVersion.setCurrentText(new_name)
+            return
+        # normal switch
+        self.outlineWorkspace.select_version_for_chapter_id(chap_id, name)
+        self.tabMiniOutline.refresh_from_workspace()
+
+        # row = self._current_outline_row()
+        # if row >= 0 and name:
+        #     self.outlineWorkspace.select_version_for_row(row, name)
+
     def _add_center_editor(self):
+        topBar = QWidget()
+
         # Center editor (title + Word sync toggle + view/edit toggle)
         self.titleEdit = QLineEdit()
         self.titleEdit.setMinimumWidth(200)
@@ -832,7 +1061,11 @@ class StoryArkivist(QMainWindow):
         self.centerModeBtn.setFixedWidth(72)
         self.centerModeBtn.clicked.connect(self._center_toggle_mode)
 
-        topBar = QWidget()
+        # Version toggle
+        self.cmbChapterVersion = QComboBox(topBar)  # wherever your header widgets live
+        self.cmbChapterVersion.setMinimumWidth(140)
+        self.cmbChapterVersion.currentTextChanged.connect(self._on_header_version_changed)
+
         topLay = QHBoxLayout(topBar); topLay.setContentsMargins(0,0,0,0)
         topLay.addWidget(self.titleEdit, 1)          # stretch title to use space
         topLay.addSpacing(8)
@@ -841,6 +1074,8 @@ class StoryArkivist(QMainWindow):
         topLay.addWidget(self.wordSyncBtn, 0)
         topLay.addSpacing(8)
         topLay.addWidget(self.centerModeBtn, 0)
+        topLay.addSpacing(8)
+        topLay.addWidget(self.cmbChapterVersion)
 
         # editor (markdown source) & preview (rendered HTML)
         self.centerEdit = QPlainTextEdit()
@@ -866,16 +1101,33 @@ class StoryArkivist(QMainWindow):
     def _add_bottom_tabs(self):
         # Bottom tabs
         self.bottomTabs = QTabWidget()
+
+        # Mini Outline tab
+        self.tabMiniOutline = MiniOutlineTab(self)
+        self.outlineWorkspace.set_single_mini(self.tabMiniOutline)
+        print("MAIN: set page.single_mini →", bool(self.outlineWorkspace.page.single_mini))
+        # If you later support multiple minis, change single_mini to a list and iterate. ^
+        self.tabMiniOutline.set_workspace(self.outlineWorkspace)  # share workspace/undo
+        self.tabMiniOutline.openFullRequested.connect(self._open_full_outline_window)
+        self.bottomTabs.addTab(self.tabMiniOutline, "Outline")
+
+        # TO-DOs tab
         self.tabTodos = ChapterTodosWidget(self)
+        self.bottomTabs.addTab(self.tabTodos,   "To-Dos/Notes")
+
+        # Progress / Timeline / Changes tabs (placeholders for now)
         self.tabProgress = PlainNoTab(); self.tabProgress.setPlaceholderText("Progress…")
+        self.bottomTabs.addTab(self.tabProgress,"Progress")
+
         self.tabTimeline = PlainNoTab(); self.tabTimeline.setPlaceholderText("Timeline…")
+        self.bottomTabs.addTab(self.tabTimeline,"Timeline")
+
         self.tabChanges  = PlainNoTab(); self.tabChanges.setPlaceholderText("Changes…")
+        self.bottomTabs.addTab(self.tabChanges, "Changes")
+
+        # Search results tab
         self.tabSearch   = QTreeWidget();    self.tabSearch.setHeaderLabels(["Result", "Where"])
         self.tabSearch.itemDoubleClicked.connect(self.open_search_result)
-        self.bottomTabs.addTab(self.tabTodos,   "To-Dos/Notes")
-        self.bottomTabs.addTab(self.tabProgress,"Progress")
-        self.bottomTabs.addTab(self.tabTimeline,"Timeline")
-        self.bottomTabs.addTab(self.tabChanges, "Changes")
         self.bottomTabs.addTab(self.tabSearch,  "Search")
 
     def _add_splitters(self):
@@ -911,6 +1163,11 @@ class StoryArkivist(QMainWindow):
         self.addAction(self._mk_shortcut("Ctrl+=", self.zoom_in))   # many keyboards need "=" for "+"
         self.addAction(self._mk_shortcut("Ctrl+-", self.zoom_out))
         self.addAction(self._mk_shortcut("Ctrl+0", self.zoom_reset))
+
+        # Zoom menu (see ui_zoom.py, search for "IMPORTANT:" if you want to have global zoom in a single button)
+        # or see chatGPT > Writing tool > Streamlit vs. PySide6
+        self.uiZoom = UiZoom(base_pt=None, parent=self)  # auto-detect baseline from app font
+        self.uiZoom.attach_menu(self.viewMenu, add_shortcuts=True)
 
         # Ctrl+N: new blank chapter at end of current book
         self.addAction(self._mk_shortcut("Ctrl+N", self.insert_blank_chapter_after_current_last))
@@ -982,6 +1239,54 @@ class StoryArkivist(QMainWindow):
         # Characters page signals
         # self.charactersPage.characterOpenRequested.connect(self.open_character_editor)
         self.charactersPage.characterOpenRequested.connect(self.open_character_dialog)
+
+        # Outline workspace signals
+        self.outlineWorkspace.versionChanged.connect(self._on_workspace_version_changed)
+        self.outlineWorkspace.chapterDeleteRequested.connect(self._on_outline_delete_chapter)
+        self.chaptersOrderChanged.connect(self.outlineWorkspace.apply_order_by_ids)
+
+    def _outline_controller(self):
+        return self.outlineWorkspace.page.undoController
+
+    def _is_outline_surface_active(self) -> bool:
+        w = QApplication.focusWidget()
+        if not w:
+            return False
+        ws = getattr(self, "outlineWorkspace", None)
+        if not ws or not getattr(ws, "page", None):
+            return False
+        page = ws.page
+        # any pane editor/tree OR the mini itself
+        in_pane = any(p.editor.isAncestorOf(w) or p.isAncestorOf(w) for p in page.panes)
+        mini = getattr(page, "single_mini", None)
+        in_mini = bool(mini and (mini.editor.isAncestorOf(w) or mini.isAncestorOf(w)))
+        return in_pane or in_mini
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.KeyPress and self._is_outline_surface_active():
+            key = ev.key(); mods = ev.modifiers()
+            if (mods & Qt.ControlModifier) and key == Qt.Key_Z and not (mods & Qt.ShiftModifier):
+                print("APP-ROUTER: Ctrl+Z → OutlineController.undo()")
+                self._outline_controller().undo()
+                return True
+            if ((mods & Qt.ControlModifier) and key == Qt.Key_Y) or \
+            ((mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier) and key == Qt.Key_Z):
+                print("APP-ROUTER: Redo → OutlineController.redo()")
+                self._outline_controller().redo()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _outline_undo(self):
+        ctrl = self._outline_controller()
+        print("MAIN: Ctrl+Z")
+        if ctrl:
+            ctrl.undo()
+
+    def _outline_redo(self):
+        ctrl = self._outline_controller()
+        print("MAIN: Ctrl+Y / Ctrl+Shift+Z")
+        if ctrl:
+            ctrl.redo()
 
     def insert_new_world_item_inline(self, category_id: int, category_item: QTreeWidgetItem,
                                     mode: str = "end", ref_item: QTreeWidgetItem | None = None):
@@ -1249,7 +1554,7 @@ class StoryArkivist(QMainWindow):
 
             # Add chapters under book
             for ch in self.db.chapter_list(pid, bid):
-                label = f'{(ch["position"] or 0)+1}. {ch["title"]}'
+                label = chapter_display_label(ch["position"], ch["title"])
                 citem = QTreeWidgetItem([label])
                 flags = citem.flags()
                 flags |= (Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
@@ -1257,6 +1562,13 @@ class StoryArkivist(QMainWindow):
                 citem.setFlags(flags)
                 bitem.addChild(citem)
         self.chaptersTree.expandAll()
+
+        self._emit_chapter_order()
+
+    def _emit_chapter_order(self):
+        rows = self.db.chapter_list(self._current_project_id, self._current_book_id)
+        ordered_ids = [r["id"] for r in rows]
+        self.chaptersOrderChanged.emit(self._current_project_id, self._current_book_id, ordered_ids)
 
     def populate_world_tree(self):
         self.worldTree.clear()
@@ -1450,17 +1762,35 @@ class StoryArkivist(QMainWindow):
             self.worldDetail.show_item(int(data[1]))
 
     # ---------- Chapter load/save ----------
+    def _current_outline_row(self) -> int:
+        # ask the workspace’s list view
+        idx = self.outlineWorkspace.list.currentIndex()
+        return idx.row() if idx.isValid() else -1
+
+    def _populate_header_versions(self, chap_id: int):
+        row = self._current_outline_row()
+        names = self.outlineWorkspace.versions_for_row(row) if row >= 0 else ["v1"]
+        current = self.outlineWorkspace.current_version_for_row(row) or (names[0] if names else "")
+        with QSignalBlocker(self.cmbChapterVersion):
+            self.cmbChapterVersion.clear()
+            self.cmbChapterVersion.addItems(names)
+            # self.cmbChapterVersion.addItem("➕ New version…")
+            self.cmbChapterVersion.setCurrentText(current)
+
     def load_chapter(self, chap_id: int):
         """Load a chapter into the center pane. Saves current edits first."""
         # Save current if needed
         self.save_current_if_dirty()
 
         self._current_chapter_id = chap_id
+
+        # --- fetch title/content from DB (unchanged) ---
         cur = self.db.conn.cursor()
         cur.execute("SELECT title, content FROM chapters WHERE id=?", (chap_id,))
         row = cur.fetchone()
         title, md = ((row["title"], row["content"]) if isinstance(row, sqlite3.Row) else row) if row else ("", "")
 
+        # center title/content
         self.titleEdit.blockSignals(True)
         self.titleEdit.setText(title or "")
         self.titleEdit.blockSignals(False)
@@ -1483,6 +1813,58 @@ class StoryArkivist(QMainWindow):
         self.tabTodos.set_chapter(chap_id)
         self.populate_refs_tree(chap_id)
         self.focus_chapter_in_tree(chap_id)
+
+        # --- resolve the *outline row* safely ---
+        # 1) try current selection in outline list
+        outline_row = self._current_outline_row()   # returns -1 if none
+        # 2) if none, try workspace id→row map
+        if outline_row < 0 and hasattr(self.outlineWorkspace, "row_for_chapter_id"):
+            outline_row = self.outlineWorkspace.row_for_chapter_id(chap_id)
+        # 3) if still none, default to 0 when the model has rows and select it
+        ow_model = getattr(self.outlineWorkspace, "model", None)
+        if (outline_row < 0) and ow_model and ow_model.rowCount() > 0:
+            outline_row = 0
+            # keep the left list visually in sync (won't steal focus)
+            try:
+                idx = ow_model.index(outline_row, 0)
+                # outline list widget may be named `list` in your workspace
+                outline_list = getattr(self.outlineWorkspace, "list", None)
+                if outline_list is not None:
+                    outline_list.setCurrentIndex(idx)
+            except Exception:
+                pass
+
+        # --- populate the center header version combo based on the resolved row ---
+        with QSignalBlocker(self.cmbChapterVersion):
+            self.cmbChapterVersion.clear()
+            versions = []
+            current_name = ""
+
+            if outline_row is not None and outline_row >= 0:
+                try:
+                    versions = self.outlineWorkspace.versions_for_row(outline_row) or []
+                    current_name = self.outlineWorkspace.current_version_for_row(outline_row) or (versions[0] if versions else "")
+                except Exception:
+                    # guard if workspace isn’t fully initialized yet
+                    versions = []
+                    current_name = ""
+
+            if not versions:
+                versions = ["v1"]  # safe default if nothing is loaded yet
+
+            self.cmbChapterVersion.addItems(versions)
+            if current_name:
+                self.cmbChapterVersion.setCurrentText(current_name)
+            else:
+                self.cmbChapterVersion.setCurrentIndex(0)
+
+        # set most recently viewed chapter (for use on reopen)
+        self.db.ui_pref_set(self._current_project_id, "outline:last_chapter_id", str(chap_id))
+        self.db.ui_pref_set(self._current_project_id, f"chapters:last:{self._current_book_id}", str(chap_id))
+
+        # keep mini pinned
+        self.tabMiniOutline.set_workspace(self.outlineWorkspace)
+        self.tabMiniOutline.set_chapter(self._current_chapter_id)
 
     def mark_chapter_dirty(self):
         self._chapter_dirty = True
@@ -1846,6 +2228,21 @@ class StoryArkivist(QMainWindow):
             self.recompute_chapter_references(target_id, md)
             self.populate_refs_tree(target_id)
 
+
+    # ---------- Mini outline ----------
+    def _open_full_outline_window(self):
+        if not hasattr(self, "_outlineWin") or self._outlineWin is None:
+            self._outlineWin = OutlineWindow(None)
+            self._outlineWin.setAttribute(Qt.WA_QuitOnClose, False)
+            # Adopt the *same* OutlineWorkspace instance you already use in main:
+            self._outlineWin.adopt_workspace(self.outlineWorkspace)
+
+        self._outlineWin.show()
+        # focus current chapter and expand prev/current/next
+        self._outlineWin.focus_chapter_id(self._current_chapter_id)
+        if not self._outlineWin._first_open_done:
+            self._outlineWin.workspace.expand_prev_current_next(chap_id=self._current_chapter_id)
+            self._outlineWin._first_open_done = True
 
     # ---------- Search ----------
     def run_search(self):

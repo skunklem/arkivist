@@ -1,16 +1,5 @@
 ## Phase 1 — Core stability & editing (unblockers first)
 Goal: lock down daily-use flows (edit/view, DnD, imports, character edit ↔ right-panel refresh).
-1. Right panel + character flow
-Edit button in right panel opens CharacterDialog when item is a character. (You partially have this; keep it as a hard rule.)
-Right panel refreshes when CharacterDialog closes (already added refresh_world_panel_on_close=True; propagate to all dialog entry points).
-CharacterDialog: Enter-to-add traits, Save closes if not dirty, name editable, Tab behavior done (keep PlainNoTab for multiline only).
-2. Chapter structure & organization
-Add chapter reorganization lock (toolbar toggle over chapter tree; disables DnD & context moves when locked).
-Context menu for chapters: Insert blank chapter before/after, Insert from file before/after.
-“Add new chapter” icon next to “Chapters”.
-3. Bulk import correctness
-Bulk import dialog: “Insert line” controls (First / After <dropdown> / Last) + filename split presets (“N. ”, “N - ”, “N ”, custom separator).
-After import: recompute chapter refs + compact/renumber (ignore soft-deleted); fix off-by-one/becoming-last cases.
 4. Exports (quick win)
 Export single chapter (Docx) from chapter right-click; use project export dir or picker.
 Export book (Docx) from book right-click.
@@ -98,3 +87,18 @@ Add:
 3. Export chapter/book (docx).
 4. CharacterDialog: enter-to-add & Save/Close updates right panel (all entry points).
 5. Recompute refs with multi-word aliases (improves “Referenced in chapter”).
+
+# Probably done
+## Phase 1
+1. Right panel + character flow
+Edit button in right panel opens CharacterDialog when item is a character. (You partially have this; keep it as a hard rule.)
+Right panel refreshes when CharacterDialog closes (already added refresh_world_panel_on_close=True; propagate to all dialog entry points).
+CharacterDialog: Enter-to-add traits, Save closes if not dirty, name editable, Tab behavior done (keep PlainNoTab for multiline only).
+2. Chapter structure & organization
+Add chapter reorganization lock (toolbar toggle over chapter tree; disables DnD & context moves when locked).
+Context menu for chapters: Insert blank chapter before/after, Insert from file before/after.
+“Add new chapter” icon next to “Chapters”.
+3. Bulk import correctness
+Bulk import dialog: “Insert line” controls (First / After <dropdown> / Last) + filename split presets (“N. ”, “N - ”, “N ”, custom separator).
+After import: recompute chapter refs + compact/renumber (ignore soft-deleted); fix off-by-one/becoming-last cases.
+## Phase 2
