@@ -193,16 +193,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
             -- optional helper view (nice for UI joins)
             -- Shows resolved link titles for belongings/affiliations, etc.
-        CREATE VIEW character_facets_v AS
+        CREATE VIEW IF NOT EXISTS character_facets_v AS
             SELECT f.*, wi.title AS linked_title
             FROM character_facets f
             LEFT JOIN world_items wi ON wi.id = f.link_world_id;
                       
         -- relationships: no duplicates
-        CREATE UNIQUE INDEX idx_world_link_uniq ON world_links(source_id, target_id, relationship);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_world_link_uniq ON world_links(source_id, target_id, relationship);
                       
         -- world categories: no duplicates under same parent
-        CREATE UNIQUE INDEX idx_world_cat_parent_name ON world_categories(project_id, parent_id, lower(name));
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_world_cat_parent_name ON world_categories(project_id, parent_id, lower(name));
     """)
 
     # --- References ---

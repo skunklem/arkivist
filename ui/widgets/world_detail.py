@@ -361,6 +361,8 @@ class WorldDetailWidget(QWidget):
                 self.lblTitle.setText("World Detail (missing)")
                 self.statusLine.show_neutral("Missing")
                 return
+            
+            self.app.db.ui_pref_set(self.app._current_project_id, "world:last_item_id", str(world_item_id))
 
             self.lblTitle.setText(item["title"] or "World Detail")
 

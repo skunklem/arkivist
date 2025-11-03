@@ -2,7 +2,7 @@ import json
 import re, sqlite3
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QSize, Slot, QEvent, QRectF, QDateTime, QSignalBlocker, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, QSize, Slot, QEvent, QRectF, QDateTime, QSignalBlocker, Signal, QObject, QSettings
 from PySide6.QtGui import QAction, QKeySequence, QIcon, QPainter, QPixmap, QPen, QIcon, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
@@ -62,10 +62,12 @@ class StoryArkivist(QMainWindow):
         QApplication.instance().installEventFilter(self)
         # self.outlineWorkspace.install_global_shortcuts(self)  # pass main window as host
 
-        # Pick or create a project immediately
-        self._ensure_project_exists_or_prompt()
-
         self._build_ui()
+
+        # Pick or create a project immediately
+        # self._ensure_project_exists_or_prompt()
+        self._startup_pick_project()
+
         self._wire_actions()
         # self.setWindowTitle("StoryArkivist")
         self.setWindowTitle(f"StoryArkivist — {self.db.project_name(self._current_project_id)} [*]")
@@ -84,6 +86,66 @@ class StoryArkivist(QMainWindow):
         self.refresh_project_header()
         self.populate_all()
         self._select_startup_chapter()
+        self._select_startup_world_item()
+
+        # If it’s the first-ever run, show the PM after the window is visible
+        if getattr(self, "_show_pm_overlay_on_first_show", False):
+            QTimer.singleShot(0, self._open_project_manager_overlay)
+
+    def _startup_pick_project(self):
+        """Pick MRU project or create 'Untitled Project' on first-ever run."""
+        settings = QSettings("Arkivist", "StoryArkivist")
+        mru = settings.value("mru_project_id", type=int)
+
+        count = self.db.project_quantity()
+        if count == 0:
+            # First-ever run: create a project immediately so UI can render
+            self._current_project_id = self.db.project_create("Untitled Project")
+            settings.setValue("mru_project_id", int(self._current_project_id))
+            self._current_book_id = self.db.book_create(self._current_project_id)
+            print("Created book id:", self._current_book_id)
+            # mark that we should show PM as overlay after show()
+            self._show_pm_overlay_on_first_show = True
+        else:
+            # Prefer MRU if still active; else first active
+            if self.db.project_deleted(mru) == False:
+                # Validate the MRU still exists and isn't soft-deleted
+                self._current_project_id = mru
+            else:
+                self._current_project_id = self.db.project_first_active()
+
+            self._current_project_id = self._current_project_id or self.db.project_first_active()
+            # TODO: save most recent book and chapter ids too
+            self._current_book_id = self.db.book_list(self._current_project_id)[0]["id"]
+            settings.setValue("mru_project_id", int(self._current_project_id))
+
+        # Ensure world roots exist now that we have a project id
+        self.ensure_world_roots()
+
+    def _open_project_manager_overlay(self):
+        """Open Project Manager non-modally, hovering above the main window for first-run onboarding."""
+        dlg = ProjectManagerDialog(self, self)
+
+        # Make it hover without blocking
+        dlg.setModal(False)
+        dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        self._projectManager = dlg  # keep a ref if needed
+
+    def _select_startup_world_item(self):
+        pid = getattr(self, "_current_project_id", None)
+        if not pid: 
+            return
+        wid = self.db.ui_pref_get(pid, "world:last_item_id")
+        if wid:
+            try:
+                self.load_world_item(int(wid))
+                return
+            except Exception:
+                pass
 
     def _install_outline_undo_actions(self):
         if getattr(self, "_outline_actions_installed", False):
@@ -834,7 +896,14 @@ class StoryArkivist(QMainWindow):
         # Help menu actions
 
     def _setup_menus(self):
-        # Menus
+        """
+        Sets up the menus for the main window.
+
+        This method is called from the constructor and is responsible for
+        setting up the menus, including the file menu, edit menu, view menu,
+        and help menu. If the application is running in dev mode, the
+        dev menu is also added.
+        """
         self._add_file_menu()
         self._add_edit_menu()
         self._add_view_menu()

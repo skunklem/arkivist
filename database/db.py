@@ -84,6 +84,11 @@ class Database:
         self.conn.execute("UPDATE projects SET deleted=1 WHERE id=?", (project_id,))
         self.conn.commit()
 
+    def project_deleted(self, project_id: int) -> bool:
+        c = self.conn.cursor()
+        c.execute("SELECT id FROM projects WHERE id=? AND COALESCE(deleted,0)=0", (project_id,))
+        return bool(c.fetchone())
+
     # ---- Books
     def book_list(self, project_id: int) -> list[sqlite3.Row]:
         c = self.conn.cursor()
