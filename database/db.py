@@ -111,7 +111,7 @@ class Database:
     
     def chapter_meta(self, chapter_id: int) -> dict:
         c = self.conn.cursor()
-        c.execute("""SELECT id, title, content, position, book_id
+        c.execute("""SELECT id, title, content, position, book_id, project_id
                     FROM chapters WHERE id=?""", (chapter_id,))
         return c.fetchone()
 
@@ -163,11 +163,20 @@ class Database:
                           (chapter_id,))
         self.conn.commit()
 
+    def chapter_undelete(self, chapter_id: int) -> None:
+        self.conn.execute("UPDATE chapters SET deleted=0, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                          (chapter_id,))
+        self.conn.commit()
+
     def chapter_compact_positions(self, project_id: int, book_id: int) -> None:
-        rows = self.chapter_list(project_id, book_id)
-        c = self.conn.cursor()
-        for pos, r in enumerate(rows):
-            c.execute("UPDATE chapters SET position=? WHERE id=?", (pos, r["id"]))
+        """
+        Rewrite chapter positions within (project_id, book_id) to 0..N-1,
+        skipping soft-deleted chapters.
+        """
+        rows = self.chapter_list(project_id, book_id)  # assumed to exclude deleted
+        for new_pos, row in enumerate(rows):
+            cid = row["id"]
+            self.conn.execute("UPDATE chapters SET position=? WHERE id=?", (new_pos, cid))
         self.conn.commit()
 
     def _chapter_set_position_and_book(self, chapter_id: int, position: int, book_id: int) -> None:

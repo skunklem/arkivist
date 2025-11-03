@@ -32,11 +32,11 @@ class OutlineEditor(QtWidgets.QPlainTextEdit):
         self.textChanged.connect(self._on_text_changed)
         self._undoStack: QtGui.QUndoStack | None = None
         self._suppress_text_undo_event = False  # set True when set_lines() updates doc
-        self._last_text_snapshot_text = self.toPlainText()
+        # self._last_text_snapshot_text = self.toPlainText()
         self._last_delete_kind = None              # "bksp" | "del" | None
         # store last known caret as (line, col)
         c = self.textCursor()
-        self._last_text_snapshot_cursor = (c.blockNumber(), c.positionInBlock())
+        # self._last_text_snapshot_cursor = (c.blockNumber(), c.positionInBlock())
 
         self._text_can_undo = False
         self._text_can_redo = False
@@ -111,11 +111,12 @@ class OutlineEditor(QtWidgets.QPlainTextEdit):
         t = e.text()
         return bool(t) and not t.isspace()
     
-    def insertFromMimeData(self, source: QtGui.QMimeData):
-        # Pasting should be a discrete T step and acts as boundary for word-coalescing
-        self._force_new_text_step = True
-        self._last_typed_char = "\n"
-        super().insertFromMimeData(source)
+    def insertFromMimeData(self, md: QtCore.QMimeData):
+        # break the next text step (no specific cursor pos)
+        if hasattr(self, "_outline_undo_controller"):
+            self._outline_undo_controller.force_break_next_text(self)
+
+        super().insertFromMimeData(md)
 
     def set_lines(self, lines: list[str]):
         text = "\n".join(lines)
@@ -136,14 +137,10 @@ class OutlineEditor(QtWidgets.QPlainTextEdit):
         try:
             self.setPlainText(text)
             # clamp and place
-            print(f"set_text_and_cursor: at ({line},{col})")
+            print(f"apply set_text_and_cursor ({line},{col}) ed {id(self)}")
             self.clamp_and_place_cursor(line, col)
         finally:
             self._suppress_text_undo_event = False
-
-        # keep local snapshots in sync so the next register_text has accurate BEFORE
-        self._last_text_snapshot_text   = self.toPlainText()
-        self._last_text_snapshot_cursor = self.get_line_col()
 
     def lines(self) -> list[str]:
         L = []
@@ -358,6 +355,16 @@ class OutlineEditor(QtWidgets.QPlainTextEdit):
         super().focusOutEvent(ev)
         self.viewport().update()
 
+        # Only set to none if the new focus is *not* inside any outline editors
+        fw = QtWidgets.QApplication.focusWidget()
+        page = getattr(self, "_page", None)  # stash the ChaptersPage on the editor during wiring
+        if not page:
+            return
+        inside_outline = bool(fw) and (any(p.editor.isAncestorOf(fw) for p in page.panes) or
+                        (getattr(page, "mini", None) and page.mini.editor.isAncestorOf(fw)))
+        if not inside_outline:
+            page.undoController.set_active_surface_none()
+
     # --- key handling ---
 
     # OutlineEditor.keyPressEvent – drop-in replacement
@@ -367,6 +374,7 @@ class OutlineEditor(QtWidgets.QPlainTextEdit):
         c = self.textCursor()
         has_sel = c.hasSelection()
         ctrl = bool(e.modifiers() & QtCore.Qt.ControlModifier)
+        ch = e.text()[:1] if e.text() else ""
 
         # make editors ignore ctrl+Z/Y so the app-level shortcuts win
         if ctrl and (
@@ -446,6 +454,30 @@ class OutlineEditor(QtWidgets.QPlainTextEdit):
         # Home toggle (don’t pass to super)
         if k == QtCore.Qt.Key_Home and m == QtCore.Qt.NoModifier:
             self._cmd_home(); return
+        
+        # track whitespace and word state
+        prev_is_ws = getattr(self, "_last_char_is_ws", False)
+        cur_is_ws  = bool(ch and ch.isspace())
+
+        # If we just typed the first whitespace after a non-whitespace → start a new run *at the space*.
+        # That groups the leading space(s) with the word that follows.
+        if ch and cur_is_ws and not prev_is_ws:
+            self.commandIssued.emit("word-boundary")
+
+        # Track for next press
+        self._last_char_is_ws = cur_is_ws
+
+        # Keep your _current_typed_char for register_text:
+        self._current_typed_char = ch if ch and not ctrl else ""
+
+        # Delete runs stay separate from typing runs
+        if ch and not ctrl:
+            if getattr(self, "_last_delete_kind", None) is not None:
+                self.commandIssued.emit("type-after-delete")  # break RIGHT BEFORE this typed char
+                self._last_delete_kind = None
+        else:
+            # Non-printing keys; keep current_typed_char empty
+            self._current_typed_char = ""
 
         # Tag special edits so the controller can force a break:
         if ctrl and k == QtCore.Qt.Key_V:
@@ -468,6 +500,33 @@ class OutlineEditor(QtWidgets.QPlainTextEdit):
             # Any other key ends a delete run
             self._last_delete_kind = None
 
+        # 2) PRE-INSERT: decide if we must FORCE a new step *with a BEFORE cursor position*
+        #    (a) Selection replacement by typing → must be its own step, anchored at sel start
+        if ch and not ctrl and has_sel:
+            aL, aC, pL, pC = self.get_selection_anchor_and_pos()
+            startL, startC = (aL, aC) if (aL, aC) <= (pL, pC) else (pL, pC)
+            if hasattr(self, "_outline_undo_controller"):
+                print(f"calling on_nav_commit for sel-replace, startL {startL}, startC {startC}")
+                self._outline_undo_controller.on_nav_commit(self, startL, startC)
+
+        #    (b) Typing ends a delete run → break at current caret BEFORE the insert
+        if ch and not ctrl and getattr(self, "_last_delete_kind", None):
+            if hasattr(self, "_outline_undo_controller"):
+                ln, col = self.get_line_col()
+                print(f"calling on_nav_commit for {_last_delete_kind}, ln {ln}, col {col}")
+                self._outline_undo_controller.on_nav_commit(self, ln, col)
+            self._last_delete_kind = None  # end delete-run now
+
+        #    (c) Typing a non-word char (whitespace or punctuation) → "word end"
+        if ch and not ctrl and (not self._is_word_char(ch)):
+            if hasattr(self, "_outline_undo_controller"):
+                ln, col = self.get_line_col()
+                print(f"calling on_nav_commit for word-end, ln {ln}, col {col}")
+                self._outline_undo_controller.on_nav_commit(self, ln, col)
+
+        # 3) Track what was typed (your register_text can read this)
+        self._current_typed_char = ch
+
         # make a replacement of highlighted text its own step (no accidental coalesce with previous run)
         if e.text() and has_sel:
             self.commandIssued.emit("type-replace")
@@ -489,11 +548,22 @@ class OutlineEditor(QtWidgets.QPlainTextEdit):
 
     def _commit_mouse_nav(self, reason: str = "nav"):
         # Update the BEFORE snapshot the controller will read for the next T step
-        self._last_text_snapshot_cursor = self.get_line_col()
-        self._last_text_snapshot_text   = self.toPlainText()
+        # self._last_text_snapshot_cursor = self.get_line_col()
+        # self._last_text_snapshot_text   = self.toPlainText()
         # Arm a hard break so next keystroke becomes a NEW text step
         uc = getattr(self, "_outline_undo_controller", None)
         if uc:
-            uc.force_break_next_text(self)
+            print("_commit_mouse_nav for:", reason)
+            # uc.force_break_next_text(self)
+            uc.on_nav_commit(self, *self.get_line_col())
         # Optional: print for tracing
-        print(f"_commit_mouse_nav updated cursor: {self._last_text_snapshot_cursor}, editor: {id(self)}")
+        # print(f"_commit_mouse_nav updated cursor: {self._last_text_snapshot_cursor}, editor: {id(self)}")
+
+    def contextMenuEvent(self, ev):
+        # Hide standard context menu's undo/redo, since they're turned off an useless anyway
+        print("editor contextMenuEvent")
+        menu = self.createStandardContextMenu()
+        for text in ("Undo", "Redo"):
+            act = next((a for a in menu.actions() if a.text().startswith(text)), None)
+            if act: menu.removeAction(act)
+        menu.exec(ev.globalPos())

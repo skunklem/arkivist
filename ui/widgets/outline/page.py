@@ -24,27 +24,25 @@ class _PaneClickFilter(QtCore.QObject):
             QtCore.QTimer.singleShot(0, self._after_release)
         return False
     def _after_release(self):
-        line, col = self.ed.get_line_col()
-        # supply the click caret as the 'before' for the *next* T-step
-        self.uc.set_nav_cursor_for(self.ed, (line, col))
-        # and force a step break
-        self.uc.force_break_next_text(self.ed)
-        # also clear delete coalescing and one-shot local break flag
+        # anchor BEFORE-pos at the caret where the user clicked
+        ln, col = self.ed.get_line_col()
+        print(f"calling on_nav_commit for _PaneClickFilter {ln},{col}")
+        self.uc.on_nav_commit(self.ed, ln, col)
+        # optional: end a delete-run started before the click
         self.ed._last_delete_kind = None
-        self.ed._force_new_text_step = True
-
 
 class ChaptersPage(QtWidgets.QWidget):
     def __init__(self, model: "ChaptersModel", parent=None):
         super().__init__(parent)
         self._pending_focus_row: int | None = None
         self._pending_focus_policy: str | None = None   # "first" | "last" | None
-        self._suppress_focus_on_list_change = False
+        self._suppress_focus = False
         # Connect once 
         QtWidgets.QApplication.instance().focusChanged.connect(self._on_focus_changed)
 
         self.model = model
         self.panes: list[ChapterPane] = []
+        self._pane_by_cid: dict[int, ChapterPane] = {}
         self.single_mini = None
         self.workspace = parent
         print(f"workspace: {self.workspace}")
@@ -57,7 +55,7 @@ class ChaptersPage(QtWidgets.QWidget):
         self.list_view = None  # workspace may set this later
 
         self.undoStack = QtGui.QUndoStack(self)
-        self.undoController = UnifiedUndoController(self)
+        self.undoController = UnifiedUndoController(self, self.workspace)
         print("PAGE binds after_apply_cb to controller", id(self.undoController))
         self.undoController.after_apply_cb = self._after_apply_for_editor  # <- explicit post-apply mirror
 
@@ -78,12 +76,13 @@ class ChaptersPage(QtWidgets.QWidget):
         # build initial panes
         self._rebuild_all_panes()
 
+    def suppress_focus(self, on: bool):
+        self._suppress_focus = bool(on)
+
     def _on_pane_text_changed(self, ed):
         uc = self.undoController
-        if uc.is_applying():
+        if uc.is_applying() or ed._suppress_text_undo_event:
             return
-        # 1) keep last T step 'after' up to date while the Qt doc is still coalescing typing
-        uc.live_update_after(ed)
 
         # 2) mirror pane → mini as you already do
         mini = getattr(self.workspace.page, "single_mini", None)
@@ -130,26 +129,16 @@ class ChaptersPage(QtWidgets.QWidget):
     #         mini._mirror_from_pane()
 
     def _after_apply_for_editor(self, ed):
-        # 1) mirror the mini for this chapter if present
-        mini = getattr(self._workspace.page, "single_mini", None) if hasattr(self, "_workspace") else None
+        self.undoController._refresh_all_snapshots()
+
+        # mirror the mini for this chapter if present
+        mini = self.workspace.page.single_mini
         if mini:
             try:
                 if mini._chap_id == self.undoController._chapter_id_for_editor(ed):
                     mini._mirror_from_pane()
             except Exception:
                 pass  # be robust — mirroring is best-effort
-
-        # 2) focus the pane that owns 'ed'
-        pane = None
-        for p in self.panes:
-            if p.editor is ed:
-                pane = p
-                break
-        if pane:
-            # move Qt focus so the visible caret matches the editor we just changed
-            pane.editor.setFocus(QtCore.Qt.OtherFocusReason)
-            # also ensure controller surface is pane
-            self.undoController.set_active_surface_pane()
 
     def _pane_for_widget(self, w: QtWidgets.QWidget | None):
         if not w: return None
@@ -172,8 +161,8 @@ class ChaptersPage(QtWidgets.QWidget):
     # Let the list drive viewport + (optionally) focus
     def _on_list_current_changed(self, current, previous):
         row = current.row()
-        give_focus = not self._suppress_focus_on_list_change
-        self._suppress_focus_on_list_change = False
+        give_focus = not self._suppress_focus
+        self.suppress_focus(False)
         # expand but only scroll if not fully visible
         if row >= 0:
             if self.panes[row].btnCollapse.isChecked():
@@ -193,7 +182,7 @@ class ChaptersPage(QtWidgets.QWidget):
         row = self._pane_index(pane)
         idx = self.model.index(row, 0)
         # Tell the list change handler NOT to give focus (we only want highlight + scroll)
-        self._suppress_focus_on_list_change = True
+        self.suppress_focus(True)
         self.list_view.setCurrentIndex(idx)
 
     def _is_pane_fully_visible(self, row: int) -> bool:
@@ -205,9 +194,23 @@ class ChaptersPage(QtWidgets.QWidget):
         y = pane.mapTo(self.container, QtCore.QPoint(0, 0)).y()
         return (y >= top) and (y + pane.height() <= bottom)
 
-    def focus_chapter(self, row: int, give_focus: bool = True):
+    def row_for_chapter_id(self, chap_id: int) -> int:
+        return self.model.row_for_chapter_id(chap_id) if self.model else -1
+
+    def focus_chapter_id(self, chap_id: int, caret = None, give_focus: bool = True):
+        print("focus_chapter_id", chap_id, "caret", caret, "give_focus", give_focus)
+        row = self.row_for_chapter_id(chap_id)
+        if row >= 0:
+            self.focus_chapter(row=row, caret=caret, give_focus=give_focus)
+        
+    def focus_chapter(self, row: int, caret = None, give_focus: bool = True):
+        print("FOCUS request row", row, "give_focus", give_focus, "suppressed?", self._suppress_focus)
         if row < 0 or row >= len(self.panes): return
         pane = self.panes[row]
+        
+        print("checking for suppressed focus")
+        if self._suppress_focus:
+            return
 
         # expand if collapsed
         if pane.btnCollapse.isChecked():
@@ -221,7 +224,11 @@ class ChaptersPage(QtWidgets.QWidget):
         if give_focus:
             fw = QtWidgets.QApplication.focusWidget()
             inside = fw and (pane is fw or pane.isAncestorOf(fw))
+            print("focus inside pane?", inside)
             if not inside:
+                if caret is not None:
+                    print("FOCUS request caret", caret, "row", row, "pane_id", pane.chapter.id)
+                    pane.editor.clamp_and_place_cursor(*caret)
                 pane.editor.setFocus(QtCore.Qt.OtherFocusReason)
 
     def _on_rows_moved(self, src_parent, src_start, src_end, dst_parent, dst_row):
@@ -266,35 +273,59 @@ class ChaptersPage(QtWidgets.QWidget):
         if getattr(ch, "id", None) is not None:
             self.versionChanged.emit(ch.id, name)
 
-    def _install_undo_hooks(self, ed):
+    def _install_undo_hooks(self, pane):
+        ed = pane.editor
         if getattr(ed, "_undo_hooks_installed", False):
             return
 
-        # PANE editors must have the Qt doc undo enabled
-        ed.setUndoRedoEnabled(True)
+        print("installing undo hooks")
+        # # PANE editors must have the Qt doc undo enabled
+        # ed.setUndoRedoEnabled(True)
+        # don't let Qt build its own undo stack; we'll do it ourselves
+        ed.setUndoRedoEnabled(False)
 
-        # seed snapshots so first T step has a correct BEFORE
-        ed._last_text_snapshot_text   = ed.toPlainText()
-        ed._last_text_snapshot_cursor = ed.get_line_col()
+        # 5) seed snapshots so first T step has a correct BEFORE
+        self.undoController.bind_editor_cid(ed, pane.chapter.id)
 
-        # SINGLE connection: Qt doc → our controller
-        ed.document().undoCommandAdded.connect(
-            lambda e=ed: self.undoController.register_text(e)
-        )
+        # # record text edits that Qt groups (1 per QUndoCommand)
+        # ed.document().undoCommandAdded.connect(lambda e=ed: self.undoController.register_text(e))
 
-        # Optional: debug tap so you can see the Qt signal
-        ed.document().undoCommandAdded.connect(
-            lambda e=ed: print("DOC undoCommandAdded", id(e))
-        )
+        # # record one step per *textChanged* and coalesce in our controller
+        # ed.textChanged.connect(lambda e=ed: self.undoController.register_text(e))
+
+        # make the pane report *every* real text change to your controller
+        ed.textChanged.connect(lambda e=ed: self.undoController.on_editor_text_changed(e))
+
+        # 6) Nav committed (keyboard nav) → controller learns the BEFORE position & force-break
+        ed.navCommitted.connect(lambda ln, col, e=ed: self.undoController.on_nav_commit(e, ln, col))
+
+        # 7) Paste/cut/enter/bulk-delete/type-over-selection → force-break
+        ed.commandIssued.connect(lambda kind, e=ed: self._on_editor_command(e, kind))
+
+        # # SINGLE connection: Qt doc → our controller
+        # ed.document().undoCommandAdded.connect(
+        #     lambda e=ed: self.undoController.register_text(e)
+        # )
+
+        # # Optional: debug tap so you can see the Qt signal
+        # ed.document().undoCommandAdded.connect(
+        #     lambda e=ed: print("DOC undoCommandAdded", id(e))
+        # )
 
         ed._undo_hooks_installed = True
 
     def _wire_pane(self, row, pane: "ChapterPane"):
+        cid = pane.chapter.id
         ed = pane.editor
+        self._pane_by_cid[cid] = pane
+        # ensure cleanup if the pane/editor is destroyed
+        pane.destroyed.connect(lambda _=None, c=cid: self._pane_by_cid.pop(c, None))
+
         print("WIRE pane:", row, "ed", id(ed))
+        ed._page = self
 
         # 1) Hook doc→controller ONCE, seed snapshots
-        self._install_undo_hooks(ed)                 # sets UndoRedoEnabled(True), seeds snapshots,
+        self._install_undo_hooks(pane)                 # sets UndoRedoEnabled(True), seeds snapshots,
                                                     # connects doc.undoCommandAdded → controller.register_text
         ed._outline_undo_controller = self.undoController
 
@@ -312,16 +343,10 @@ class ChaptersPage(QtWidgets.QWidget):
         # 4) Pane→mini live mirror for normal typing; ignore during applying
         ed.textChanged.connect(lambda e=ed: self._on_pane_text_changed(e))
 
-        # 5) Nav committed (keyboard nav) → controller learns the BEFORE position & force-break
-        ed.navCommitted.connect(lambda ln, col, e=ed: self.undoController.on_nav_commit(e, ln, col))
-
-        # 6) Paste/cut/enter/bulk-delete/type-over-selection → force-break
-        ed.commandIssued.connect(lambda kind, e=ed: self._on_editor_command(e, kind))
-
-        # 7) Keep left list in sync when pane is interacted with
+        # 8) Keep left list in sync when pane is interacted with
         pane.activated.connect(lambda p=pane: self._select_in_list_by_pane(p))
 
-        # 8) Mark “pane” active on focus
+        # 9) Mark “pane” active on focus
         pane.activated.connect(lambda e=ed: self.undoController.set_active_surface_pane())
 
         if not hasattr(ed, "_focus_filter"):
@@ -347,25 +372,68 @@ class ChaptersPage(QtWidgets.QWidget):
         # These edits should be their own atomic step
         if kind in ("paste", "cut", "enter", "bulk-delete"):
             self.undoController.force_break_next_text(ed)
+        if kind in ("word-boundary", "type-replace"):
+            print(f"calling on_nav_commit for _on_editor_command {kind}")
+            self.undoController.on_nav_commit(ed, *ed.get_line_col())
         # backspace/delete series is handled via ed._last_delete_kind on the editor
     
     def _indent_outdent(self, pane: "ChapterPane", delta: int):
-        has_sel, sL, sC, eL, eC, active_end = pane.editor.current_selection_line_cols()
+        ed   = pane.editor
+        cid  = self.workspace.cid_for_editor(ed)
+        i0,i1 = ed._selected_line_range()
+        # BEFORE caret (where user initiated)
+        caret_before = ed.get_line_col()
+
+        # run the command (QUndoStack immediately .redo()s on push)
+        has_sel, sL, sC, eL, eC, active_end = ed.current_selection_line_cols()
         cmd = IndentCommand(page=self, pane=pane, levels=delta, active_end=active_end)
         self.undoStack.push(cmd)
-        # Track structural step with source pane + data
-        self.undoController.register_structural(pane, "indent", {"delta": delta})
 
-    def _move_within(self, pane, direction):
-        ed = pane.editor
+        # AFTER caret (where the editor left it)
+        caret_after = ed.get_line_col()
+
+        payload = {
+            "op": "indent" if delta > 0 else "outdent",
+            "delta": delta,
+            "sel_lines": (i0, i1),
+
+            "caret_before_cid": cid,
+            "caret_before": caret_before,
+            "caret_after_cid": cid,
+            "caret_after": caret_after,
+        }
+        self.undoController.register_structural(cid, payload["op"], payload)
+        # stamp last step’s AFTER state so redo has a crisp target
+        self.undoController.live_update_after(cid=cid, pos=caret_after)
+
+    def _move_within(self, pane, direction: int):
+        ed   = pane.editor
+        cid  = self.workspace.cid_for_editor(ed)
         i0,i1 = ed._selected_line_range()
-        cl, cc = ed._caret_line_and_column()
-        has_sel, sL, sC, eL, eC, active_end = pane.editor.current_selection_line_cols()
-        cmd = MoveWithinCommand(self, pane, i0, i1, direction, cl, cc, active_end=active_end)
-        if cmd.valid:
-            self.undoStack.push(cmd)
-            self.undoController.register_structural(pane, "move_within", {"dir": direction})
-        # else: edge-cross handled in editor (Alt+Up/Down) emitting requestMoveOutTop/Bottom
+        caret_before = ed.get_line_col()
+
+        has_sel, sL, sC, eL, eC, active_end = ed.current_selection_line_cols()
+        cmd = MoveWithinCommand(self, pane, i0, i1, direction, *ed._caret_line_and_column(),
+                                active_end=active_end)
+        if not cmd.valid:
+            return
+
+        self.undoStack.push(cmd)
+
+        caret_after = ed.get_line_col()
+
+        payload = {
+            "op": "move_within",
+            "sel_lines": (i0, i1),
+            "delta": direction,
+
+            "caret_before_cid": cid,
+            "caret_before": caret_before,
+            "caret_after_cid": cid,
+            "caret_after": caret_after,
+        }
+        self.undoController.register_structural(cid, "move_within", payload)
+        self.undoController.live_update_after(cid=cid, pos=caret_after)
 
     def _on_rows_inserted(self, parent, first, last):
         for r in range(first, last + 1):
@@ -379,6 +447,11 @@ class ChaptersPage(QtWidgets.QWidget):
             p.row = i
             p.reload_chapter_ref()
 
+        # If we're suppressing focus (e.g. during load_from_db), do NOT schedule any focusing.
+        if self._suppress_focus:
+            print("suppressing focus after rows inserted")
+            return
+
         # Default policy if not explicitly set (prevents first-time None)
         policy = self._pending_focus_policy or "first"
         self._pending_focus_policy = None
@@ -388,14 +461,11 @@ class ChaptersPage(QtWidgets.QWidget):
 
         # Left list highlight without stealing editor focus
         if self.list_view:
-            self._suppress_focus_on_list_change = True
+            self.suppress_focus(True)
             self.list_view.setCurrentIndex(self.model.index(r, 0))
 
         # Defer focus/scroll until layout settles
         QtCore.QTimer.singleShot(0, partial(self._focus_newly_inserted_row, r))
-
-    def suppress_next_list_focus(self):
-        self._suppress_focus_on_list_change = True
 
     def request_focus_after_insert(self, policy: str = "first"):
         # "first": focus 'first' row of newly inserted range; "last": focus 'last'
@@ -414,6 +484,7 @@ class ChaptersPage(QtWidgets.QWidget):
         pane.titleEdit.selectAll()
 
     def _scroll_to_pane(self, row: int, margin: int = 24):
+        print("scroll_to_pane", row)
         if row < 0 or row >= len(self.panes):
             return
         pane = self.panes[row]
@@ -433,9 +504,99 @@ class ChaptersPage(QtWidgets.QWidget):
             p.row = i
             p.reload_chapter_ref()
 
+    def get_neighbor_pane(self, cid: int) -> "ChapterPane":
+        """Return the pane that comes after the pane for cid, or before if cid comes last. Return None if there isn't one."""
+        cids = list(self._pane_by_cid.keys())
+        pane_num = cids.index(cid)
+        if pane_num == len(cids) - 1:
+            neighbor_pane = self._pane_by_cid.get(cids[0])
+        else:
+            neighbor_pane = self._pane_by_cid.get(cids[pane_num + 1])
+        return neighbor_pane
+
+    def current_outline_version_name_for(self, cid: int) -> str:
+        db  = self.workspace.db
+        pid = self.workspace.project_id
+        v   = db.ui_pref_get(pid, f"outline_active:{cid}")
+        if v:
+            return v
+        js  = db.ui_pref_get(pid, f"outline_versions:{cid}") or "[]"
+        try:
+            names = json.loads(js)
+        except Exception:
+            names = []
+        return names[0] if names else "v1"
+
+    def set_current_outline_version_name_for(self, cid: int, name: str):
+        db  = self.workspace.db
+        pid = self.workspace.project_id
+        db.ui_pref_set(pid, f"outline_active:{cid}", name)
+
+    def flush_outline_for_cid(self, cid: int):
+        db = self.workspace.db
+        pid = self.workspace.project_id
+        ed = self.editor_for_chapter_id(cid)
+        if not ed:
+            return
+        vname = self.current_outline_version_name_for(cid)
+        lines = ed.lines()  # your OutlineEditor should expose this
+        db.ui_pref_set(pid, f"outline:{cid}:{vname}", json.dumps(lines))
+        # ensure versions list contains vname
+        js = db.ui_pref_get(pid, f"outline_versions:{cid}") or "[]"
+        try:
+            names = json.loads(js)
+        except Exception:
+            names = []
+        if vname not in names:
+            names.append(vname)
+            db.ui_pref_set(pid, f"outline_versions:{cid}", json.dumps(names))
+
+    def flush_all_outline_versions(self):
+        """Persist every open pane’s active outline version to ui_prefs."""
+        ws = self.workspace
+        db = ws.db
+        pid = ws.project_id
+
+        for pane in getattr(self, "panes", []):
+            cid = pane.chapter.id
+            # use your helper that fetches the current/active version name
+            vname = self.current_outline_version_name_for(cid)
+            # collect lines from editor
+            lines = pane.editor.lines()
+            # persist to ui_prefs (JSON list of lines)
+            db.ui_pref_set(pid, f"outline:{cid}:{vname}", json.dumps(lines))
+
+    def close_panes_for_deleted_chapter(self, cid: int):
+        p = self._pane_by_cid.pop(cid, None)
+        p.deleteLater()
+
+        # purge controller’s snapshots/break flags for this cid
+        self.undoController._purge_for_cid(cid)
+
+        # If mini was showing it, flip out of mini surface and clear
+        mini = getattr(self, "single_mini", None)
+        if mini and mini._chap_id == cid:
+            self.undoController.set_active_surface_none()
+            mini.set_chapter(-1)       # or mini.clear()
+
+    def pane_for_cid(self, cid: int):
+        return self._pane_by_cid.get(cid)
+
+    def editor_for_chapter_id(self, cid: int, ensure_open: bool = False):
+        row = self.row_for_chapter_id(cid)
+        if row < 0 or row >= len(self.panes):
+            if ensure_open:
+                self.focus_chapter_id(cid, give_focus=False)  # opens/expands if needed
+                row = self.row_for_chapter_id(cid)
+            else:
+                return None
+        if row < 0 or row >= len(self.panes):
+            return None
+        return getattr(self.panes[row], "editor", None)
+
     def _pane_index(self, pane: ChapterPane) -> int:
         return self.panes.index(pane)
-    
+
     def _connect_model_signals(self, model):
         model.rowsInserted.connect(self._on_rows_inserted)
         model.rowsRemoved.connect(self._on_rows_removed)
@@ -494,25 +655,52 @@ class ChaptersPage(QtWidgets.QWidget):
 
     # --- Cross-chapter logic ---
     def chapter_move_out(self, src_pane, _lines, up: bool):
-        si = self._pane_index(src_pane); di = si-1 if up else si+1
-        if di < 0 or di >= len(self.panes): return
+        si = self._pane_index(src_pane)
+        di = si - 1 if up else si + 1
+        if di < 0 or di >= len(self.panes):
+            return
+
+        src = src_pane
         dst = self.panes[di]
+        ed_src, ed_dst = src.editor, dst.editor
+        src_cid = self.workspace.cid_for_editor(ed_src)
+        dst_cid = self.workspace.cid_for_editor(ed_dst)
 
-        ed = src_pane.editor
-        i0, i1 = ed._selected_line_range()
-        cl, cc = ed._caret_line_and_column()
+        # selection + BEFORE caret at source
+        i0, i1 = ed_src._selected_line_range()
+        cl, cc = ed_src._caret_line_and_column()
         caret_rel = max(0, min(cl - i0, i1 - i0))
-        # Up → end of previous; Down → top of next
-        insert_at = len(dst.editor.lines()) if up else 0
+        insert_at = len(ed_dst.lines()) if up else 0
+        keep_sel  = ed_src.textCursor().hasSelection() or (i1 > i0)
+        active_end = ed_src.current_selection_line_cols()[-1]
 
-        c = ed.textCursor()
-        keep_sel = c.hasSelection() or (i1 > i0)
-        active_end = ed.current_selection_active_end()
+        caret_before = ed_src.get_line_col()
+
+        # Push the command (this performs the move)
         self.undoStack.push(MoveAcrossChaptersCommand(
-            self, src_pane, dst, i0, i1, insert_at, caret_rel, cc,
+            self, src, dst, i0, i1, insert_at, caret_rel, cc,
             keep_selection=keep_sel, active_end=active_end
         ))
-        self.undoController.register_structural(src_pane, "move_out", {"dir": "up" if up else "down"})
+
+        # AFTER caret will now be in dst (your command should set it)
+        caret_after = ed_dst.get_line_col()
+
+        payload = {
+            "op": "move_out",
+            "dir": "up" if up else "down",
+            "src_cid": src_cid,
+            "dst_cid": dst_cid,
+            "insert_at": insert_at,
+            "sel_lines": (i0, i1),
+
+            "caret_before_cid": src_cid,
+            "caret_before": caret_before,
+            "caret_after_cid": dst_cid,
+            "caret_after": caret_after,
+        }
+        # anchor the timeline step to the destination chapter (that’s where we land)
+        self.undoController.register_structural(dst_cid, "move_out", payload)
+        self.undoController.live_update_after(cid=dst_cid, pos=caret_after)
 
     def cursor_cross_chapter(self, src_pane, up: bool):
         si = self._pane_index(src_pane)
@@ -563,7 +751,10 @@ class _ListKeyFilter(QtCore.QObject):
 
 class OutlineWorkspace(QtWidgets.QMainWindow):
     versionChanged = QtCore.Signal(int, str)  # (chapter_row, version_name)
-    chapterDeleteRequested = QtCore.Signal(int)  # chap_id
+    chapterInsertRequested = QtCore.Signal(int, int, str)  # (book_id, insert_at_index, title)
+    chapterRenameRequested = QtCore.Signal(int, str)       # (chap_id, new_title)
+    chapterMoveRequested   = QtCore.Signal(int, int, int)  # (chap_id, to_book_id, to_index)
+    chapterDeleteRequested = QtCore.Signal(int)            # chap_id
 
     def __init__(self):
         super().__init__()
@@ -573,6 +764,10 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         self.model = ChaptersModel([])
         self._id_to_row = {}
         self._sel_model = None
+
+        self.db = None               # set by main window
+        self.project_id = None       # active project
+        self.book_id = None          # active book
 
         # --- Build UI ---
 
@@ -616,7 +811,6 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         self.page.attach_list_view(self.list) # Also call this when loading outline from chapter in main app
         self.page.set_model(self.model)
         QtWidgets.QApplication.instance().installEventFilter(self)
-        self._rebuild_id_map()
 
         self._listKeyFilter = _ListKeyFilter(self.page)
         self.list.installEventFilter(self._listKeyFilter)
@@ -669,7 +863,7 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
 
     def _on_list_context_menu(self, pos: QtCore.QPoint):
         # suppress list-driven focus during menu open
-        self.page.suppress_next_list_focus()
+        self.page.suppress_focus(True)
         self._in_context_menu = True
 
         view = self.list
@@ -743,15 +937,211 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         # treat Tab/Shift+Tab as structural (indent); we don't want text coalescing to eat those
         return False
 
+    # called by main window when wiring the workspace
+    def adopt_db_and_scope(self, db, project_id: int, book_id: int):
+        self.db = db
+        self.project_id = int(project_id)
+        self.book_id = int(book_id)
+
+    def most_recent_editor_or_neighbor(self):
+        uc = self.page.undoController
+
+        # Current, non-deleted chapters in visual order
+        items = self.model._chapters
+        existing_cids = [ch.id for ch in items]
+
+        def _iter_reversed_steps():
+            tl = uc.timeline
+            cut = uc.index
+            # Respect current undo pointer if present; otherwise scan full timeline
+            rng = tl[:cut]
+            return reversed(rng)
+
+        def _step_kind(step):
+            return step[0] if step and len(step) > 0 else None
+
+        def _step_cid(step):
+            # T: ('T', cid, b_text, b_pos, a_text, a_pos, run_id)
+            # S: either ('S', cid, 'kind', payload) or ('S', cid, pane, 'kind', payload)
+            if not step or len(step) < 2:
+                return None
+            return step[1]
+
+        def _step_struct_kind_payload(step):
+            # Returns (kind, payload) for S-steps across both shapes
+            if not step or step[0] != 'S':
+                return None, None
+            if len(step) >= 4 and isinstance(step[2], str):
+                # ('S', cid, 'kind', payload)
+                return step[2], (step[3] if len(step) > 3 else None)
+            if len(step) >= 5 and isinstance(step[3], str):
+                # ('S', cid, pane, 'kind', payload)
+                return step[3], (step[4] if len(step) > 4 else None)
+            return None, None
+
+        # 1) Most-recent edited chapter that still exists
+        recent_existing_cid = None
+        for st in _iter_reversed_steps():
+            k = _step_kind(st)
+            if k in ('T', 'S'):
+                cid = _step_cid(st)
+                if cid in existing_cids:
+                    recent_existing_cid = cid
+                    break
+
+        if recent_existing_cid is not None:
+            print("Found recent existing chapter", recent_existing_cid)
+            return recent_existing_cid
+
+        # 2) Fallback: neighbor of the last deleted chapter (prefer below)
+        # position of last deleted chapter (assuming we were working on it and deleted it and now want to shoift focus to a neighbor)
+        deleted_pos = None
+        for st in _iter_reversed_steps():
+            if _step_kind(st) == 'S':
+                kind, payload = _step_struct_kind_payload(st)
+                if kind == "delete_chapter":
+                    deleted_pos = (payload.get("position", None))
+                    break
+
+        if existing_cids:
+            if isinstance(deleted_pos, int):
+                if 0 <= deleted_pos < len(existing_cids):
+                    print("Found neighbor below")
+                    neighbor_cid = existing_cids[deleted_pos]        # the chapter that shifted up into the gap (below)
+                elif deleted_pos - 1 >= 0:
+                    print("Found neighbor above")
+                    neighbor_cid = existing_cids[deleted_pos - 1]    # otherwise, the one above
+                else:
+                    print("Found first chapter")
+                    neighbor_cid = existing_cids[0]
+            else:
+                # No position info; pick the first visible chapter
+                neighbor_cid = existing_cids[0]
+                print("Found first chapter because no position info", neighbor_cid)
+            return neighbor_cid
+
+        else: # no chapters remain → intentionally do nothing
+            print("No chapters remain")
+            return None
+
+    def load_from_db(self, db, project_id: int, book_id: int, focus=None):
+        """
+        Eagerly load chapters + versioned outlines from db.ui_prefs
+        Keys used:
+          outline_versions:{chap_id}  -> '["v1","v2",...]'
+          outline:{chap_id}:{vname}   -> '["line1","line2",...]'
+        """
+        self.page.suppress_focus(True)
+
+        try:
+            # rebuild model + panes
+
+            # keep workspace scope up to date
+            self.adopt_db_and_scope(db, project_id, book_id)
+
+            chapters: list[Chapter] = []
+            # db.chapter_list(...) should return rows with ["id", "title"] at least
+            for ch in db.chapter_list(project_id, book_id):
+                chap_id = int(ch["id"])
+                title   = str(ch["title"])
+
+                # version names (fallback to ["v1"])
+                js_names = db.ui_pref_get(project_id, f"outline_versions:{chap_id}") or "[]"
+                try:
+                    names = json.loads(js_names)
+                except Exception:
+                    names = []
+                if not names:
+                    names = ["v1"]
+
+                versions: list[ChapterVersion] = []
+                for name in names:
+                    key = f"outline:{chap_id}:{name}"
+                    js_lines = db.ui_pref_get(project_id, key) or "[]"
+                    try:
+                        lines = json.loads(js_lines) if js_lines else []
+                    except Exception:
+                        lines = []
+                    versions.append(ChapterVersion(name=name, lines=lines))
+
+                chapters.append(Chapter(id=chap_id, title=title, versions=versions))
+
+            # swap model in (use your existing setter so panes rebind correctly)
+            model = ChaptersModel(chapters)
+            # If your workspace has set_model(), prefer it; it typically wires page + panes.
+            # Otherwise, set both and then wire.
+            self.set_model(model)
+            self._wire_model_for_requests() # ensure rename/move emits are connected
+
+            # DO NOT set any focus inside the rebuild above.
+        finally:
+            # release suppression after the event loop has pumped one turn,
+            # so queued signals (e.g., currentChanged) can be ignored safely.
+            QtCore.QTimer.singleShot(0, lambda: self.page.suppress_focus(False))
+
+        pending = getattr(self, "_pending_focus_cid", None)
+
+        def _finalize_focus():
+            if focus is False:
+                return  # honor "no focus change"
+            elif isinstance(focus, tuple):
+                cid, pos = focus
+                print("focusing in load_from_db", focus)
+                self.focus_chapter(cid, pos)  # pos may be None
+            else:  # focus is None → auto
+                # focus most recently edited (non-deleted) chapter
+                cid = pending or self.most_recent_editor_or_neighbor()
+                self._pending_focus_cid = None
+                self.focus_chapter(cid, None)
+
+        print("LOAD: focusing", focus)
+        QtCore.QTimer.singleShot(0, _finalize_focus)
+
+    def _wire_model_for_requests(self):
+        # rename via model edits (pane title edit, inline tree edit, etc.)
+        self.model.dataChanged.connect(self._on_model_data_changed)
+        # reorders (intra-/inter-book) → tell main window to apply in DB
+        self.model.rowsMoved.connect(self._on_rows_moved)
+
+    # utility: chapter id from index (adjust to your model API)
+    def _cid_for_index(self, idx: QtCore.QModelIndex) -> int:
+        # Prefer a method on the model; otherwise stash id in UserRole
+        return int(self.model.chapter_id_for_index(idx))
+
     def _insert_chapter(self, row: int):
         # Ask for a title (optional)
         title, ok = QtWidgets.QInputDialog.getText(self, "New chapter", "Title:", text="New Chapter")
         if not ok:
             return
         # focus AFTER insert; “above/append” → first is enough, “below” also first (since we calculate row+1)
-        ch = Chapter(title.strip() or "New Chapter")  # empty version stub inside
-        new_row = self.model.insertChapter(row, ch)
+        title = Chapter(title.strip() or "New Chapter")  # empty version stub inside
+        # emit request for DB insert (don’t mutate the model directly)
+        self.chapterInsertRequested.emit(int(self.book_id), row, title)
+        # new_row = self.model.insertChapter(row, title)
         self.page.request_focus_after_insert("first") # the page will scroll/focus inside rowsInserted
+
+    def _on_model_data_changed(self, topLeft, bottomRight, roles):
+        if QtCore.Qt.EditRole not in roles:
+            return
+        if topLeft.column() != 0:
+            return
+        # emit one rename per topLeft (assume single-cell edits for titles)
+        cid = self._cid_for_index(topLeft)
+        new_title = str(self.model.data(topLeft, QtCore.Qt.DisplayRole) or "").strip()
+        if new_title:
+            self.chapterRenameRequested.emit(cid, new_title)
+
+    # Model → rows moved (drag/drop)
+    def _on_rows_moved(self, srcParent, srcStart, srcEnd, dstParent, dstRow):
+        # Single-row move expected for chapter panels; extend if needed
+        if srcEnd != srcStart:
+            return
+        idx = self.model.index(dstRow, 0, dstParent)
+        cid = self._cid_for_index(idx)
+        # intra-book reorder (most common)
+        to_index = int(dstRow)
+        to_book_id = int(self.book_id)
+        self.chapterMoveRequested.emit(cid, to_book_id, to_index)
 
     # def _focus_new_chapter(self, row: int):
     #     # select + scroll into view; put caret in title for quick rename
@@ -795,6 +1185,21 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         #     self.list.setCurrentIndex(idx)
         #     self.page.focus_chapter(next_row, give_focus=False)
 
+    def _emit_insert_after_current(self, pane):
+        """Context menu / toolbar action: insert a blank chapter right after this pane."""
+        ws  = self.workspace
+        bid = ws.book_id
+        idx = pane.row + 1
+        self.chapterInsertRequested.emit(int(bid), int(idx), "New Chapter")
+
+    def _emit_rename_current(self, pane):
+        """Context menu / toolbar action: rename this pane’s chapter."""
+        cid = pane.chapter.id
+        title = pane.chapter.title or ""
+        new, ok = QtWidgets.QInputDialog.getText(self, "Rename Chapter", "New title:", text=title)
+        if ok and new.strip():
+            self.chapterRenameRequested.emit(int(cid), new.strip())
+
     def _request_delete_row(self, row: int):
         if row < 0 or row >= self.model.rowCount():
             return
@@ -823,6 +1228,10 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
             idx = self.model.index(next_row, 0)
             self.list.setCurrentIndex(idx)
             self.page.focus_chapter(next_row, give_focus=False)
+
+    def flush_outline_for_cid(self, cid: int):
+        if hasattr(self, "page"):
+            self.page.flush_outline_for_cid(cid)
 
     def _export_json(self):
         # ensure panes wrote back
@@ -867,36 +1276,24 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         # refresh id map afterwards
         self._rebuild_id_map()
 
+    def focus_chapter(self, chap_id: int, caret = None, give_focus: bool = True):
+        # convenience: route to page API
+        print("focus_chapter", chap_id, "caret", caret, "give_focus", give_focus)
+        if hasattr(self, "page"):
+            print(f"FOCUS request cid {chap_id} row {self} give_focus True suppressed? {self.page._suppress_focus is True}")
+            self.page.focus_chapter_id(chap_id=chap_id, caret=caret, give_focus=give_focus)
+
+    def editor_for_chapter_id(self, cid: int, ensure_open: bool = False):
+        return self.page.editor_for_chapter_id(cid, ensure_open) if hasattr(self, "page") else None
+
+    # Optional: deprecate the row API, or re-route it:
     def focus_chapter_row(self, row: int, give_focus: bool = True):
-        if not self.model or row < 0 or row >= self.model.rowCount():
+        # Keep working for callers that still pass a row:
+        if not hasattr(self, "page") or not self.page.model:
             return
-        # highlight in the left list (if present)
-        lst = getattr(self, "list", None)  # or list_view if that's your name
-        if lst is not None:
-            idx = self.model.index(row, 0)
-            lst.setCurrentIndex(idx)
-
-        # ensure the pane is expanded and visible
-        try:
-            pane = self.page.panes[row]
-        except Exception:
-            return
-        if getattr(pane, "btnCollapse", None) and pane.btnCollapse.isChecked():
-            pane.btnCollapse.setChecked(False)
-
-        # scroll it into view
-        scroll = getattr(self.page, "scroll", None)
-        if scroll is not None:
-            try:
-                scroll.ensureWidgetVisible(pane)
-            except Exception:
-                pass
-
-        if give_focus:
-            # prefer editor focus; fallback to title
-            target = getattr(pane, "editor", None) or getattr(pane, "titleEdit", None)
-            if target is not None:
-                target.setFocus(QtCore.Qt.TabFocusReason)
+        idx = max(0, min(row, self.page.model.rowCount()-1))
+        cid = self.page.model.chapter_id_for_row(idx)
+        self.focus_chapter(chap_id=cid, give_focus=give_focus)
 
     def versions_for_row(self, row: int) -> list[str]:
         if self.model is None:
@@ -919,6 +1316,7 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
     def select_version_for_row(self, row: int, name: str):
         if row < 0 or row >= len(self.page.panes):
             return
+        self.page.flush_outline_for_cid(p.chapter.id)
         pane = self.page.panes[row]
         i = pane.verCombo.findText(name)
         if i >= 0:
@@ -930,6 +1328,9 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         self.page.panes[row]._on_add_version_with_name(name, clone_from_current=clone_from_current)
 
     def _on_list_current_changed(self, cur: QtCore.QModelIndex, prev: QtCore.QModelIndex):
+        if self.page._suppress_focus:
+            return
+        print("LIST changed fired; suppressed?", self.page._suppress_focus)
         row = cur.row()
         if row >= 0:
             # bring selection into view
@@ -952,7 +1353,7 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         last_id = None
         try:
             # expects your Database instance on self.db; if not, pass it in or call from Main
-            last_id_str = self.db.ui_pref_get(self.current_project_id, "outline:last_chapter_id")
+            last_id_str = self.db.ui_pref_get(self.project_id, "outline:last_chapter_id")
             last_id = int(last_id_str) if last_id_str else None
         except Exception:
             last_id = None
@@ -967,9 +1368,10 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
             idx = self.model.index(row, 0)
             self.list.setCurrentIndex(idx)      # highlights in the tree
             # do not collapse/expand here; just bring into view
+            print("INITIAL ROW:", row)
             self.focus_chapter_row(row, give_focus=False)
 
-    def set_model(self, model: ChaptersModel):
+    def set_model(self, model: ChaptersModel, do_initial_select: bool = True):
         self.model = model or ChaptersModel([])
         # left list
         self.list.setModel(self.model)
@@ -979,7 +1381,8 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         self._rebuild_id_map()
         # wire exapand-on-select logic
         self._hook_list_selection()
-        self._select_initial_row() 
+        if do_initial_select:
+            self._select_initial_row() 
 
     # --- mapping helpers ---
     def _rebuild_id_map(self):
@@ -990,6 +1393,10 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
             cid = getattr(ch, "id", None)
             if cid is not None:
                 self._id_to_row[cid] = r
+
+    def cid_for_editor(self, ed):
+        # fast path through page map
+        return self.page.undoController._cid_for_editor(ed)
 
     def row_for_chapter_id(self, chap_id: int) -> int:
         return self._id_to_row.get(chap_id, -1)
@@ -1049,35 +1456,3 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
             want_open = (i in (current_row - 1, current_row, current_row + 1))
             if getattr(p, "btnCollapse", None):
                 p.btnCollapse.setChecked(not want_open)
-
-    def load_from_db(self, db, project_id: int, book_id: int):
-        """
-        Eagerly load chapters + versioned outlines from db.ui_prefs
-        Keys used:
-          outline_versions:{chap_id}  -> '["v1","v2",...]'
-          outline:{chap_id}:{vname}   -> '["line1","line2",...]'
-        """
-        # parse ordered chapter ids + titles
-        chapters: list[Chapter] = []
-        for ch in db.chapter_list(project_id, book_id):
-            chap_id, title = ch["id"], ch["title"]
-            # version names
-            js_names = db.ui_pref_get(project_id, f"outline_versions:{chap_id}") or "[]"
-            names = json.loads(js_names) or ["v1"]
-            versions: list[ChapterVersion] = []
-            for name in names:
-                js_lines = db.ui_pref_get(project_id, f"outline:{chap_id}:{name}") or "[]"
-                try:
-                    lines = json.loads(js_lines) if js_lines else []
-                except Exception:
-                    lines = []
-                versions.append(ChapterVersion(name=name, lines=lines))
-            # ensure at least one version
-            if not versions:
-                versions = [ChapterVersion(name="v1", lines=[])]
-            chapters.append(Chapter(title=title, versions=versions, id=chap_id))
-
-        # 3) swap model in
-        model = ChaptersModel(chapters)
-        self.set_model(model)
-        self._rebuild_id_map()     # keep id→row mapping fresh

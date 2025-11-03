@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem, 
     QInputDialog, QMenu, QFormLayout, QHBoxLayout,
 )
-from ui.widgets.helpers import PlainNoTab
+from ui.widgets.helpers import PlainNoTab, chapter_display_label
 
 class ProjectManagerDialog(QDialog):
     def __init__(self, app, parent=None):
@@ -335,7 +335,7 @@ class BulkChapterImportDialog(QDialog):
             self.placeBox.addItem("As last chapter", ("last", None))
             self.placeBox.insertSeparator(self.placeBox.count())
             for cid, title, pos in rows:
-                label = f"After {pos+1}. {title}"
+                label = f"After {chapter_display_label(pos, title)}"
                 self.placeBox.addItem(label, ("after", int(cid)))
 
     def chosen(self):

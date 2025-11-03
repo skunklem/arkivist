@@ -11,6 +11,12 @@ if TYPE_CHECKING:
     from .pane import ChapterPane
     from .page import ChaptersPage
 
+def _cid_for_editor(page, ed):
+    # fast path if you already track it:
+    return page.workspace.cid_for_editor(ed)
+
+def _caret(ed):
+    return ed.get_line_col()
 
 class _Sel:
     __slots__ = ("i0","i1","caret_line","caret_col")
@@ -89,10 +95,11 @@ class IndentCommand(QtGui.QUndoCommand):
 
     def _after_structural_apply(self):
         # keep snapshots aligned for next text step
-        self.ed._last_text_snapshot_text   = self.ed.toPlainText()
-        self.ed._last_text_snapshot_cursor = self.ed.get_line_col()
+        uc=self.page.undoController
+        uc._snap_text[(uc._cid(self.ed))]   = self.ed.toPlainText()
+        uc._snap_pos[(uc._cid(self.ed))] = self.ed.get_line_col()
         # mirror mini now that apply is done
-        cb = getattr(self.page.undoController, "after_apply_cb", None)
+        cb = getattr(uc, "after_apply_cb", None)
         if callable(cb):
             cb(self.ed)
 
@@ -198,9 +205,10 @@ class MoveWithinCommand(QtGui.QUndoCommand):
 
     def _after_structural_apply(self):
         # --- snapshot setting for coalesced text steps after this structural op ---
-        self.ed._last_text_snapshot_text   = self.ed.toPlainText()
-        self.ed._last_text_snapshot_cursor = self.ed.get_line_col()
-        cb = getattr(self.page.undoController, "after_apply_cb", None)
+        uc=self.page.undoController
+        uc._snap_text[(uc._cid(self.ed))]   = self.ed.toPlainText()
+        uc._snap_pos[(uc._cid(self.ed))] = self.ed.get_line_col()
+        cb = getattr(uc, "after_apply_cb", None)
         if callable(cb):
             cb(self.ed)
 
@@ -272,10 +280,11 @@ class MoveAcrossChaptersCommand(QtGui.QUndoCommand):
         return block
 
     def _after_structural_apply(self):
+        uc=self.page.undoController
         for ed in (self.ed_src, self.ed_dst):
-            ed._last_text_snapshot_text   = ed.toPlainText()
-            ed._last_text_snapshot_cursor = ed.get_line_col()
-        cb = getattr(self.page.undoController, "after_apply_cb", None)
+            uc._snap_text[(uc._cid(ed))]   = ed.toPlainText()
+            uc._snap_pos[(uc._cid(ed))] = ed.get_line_col()
+        cb = getattr(uc, "after_apply_cb", None)
         if callable(cb):
             # mirror both; callback guards mini chapter id anyway
             cb(self.ed_src); cb(self.ed_dst)

@@ -62,11 +62,11 @@ class StoryArkivist(QMainWindow):
         QApplication.instance().installEventFilter(self)
         # self.outlineWorkspace.install_global_shortcuts(self)  # pass main window as host
 
-        self._build_ui()
-        self._wire_actions()
-
         # Pick or create a project immediately
         self._ensure_project_exists_or_prompt()
+
+        self._build_ui()
+        self._wire_actions()
         # self.setWindowTitle("StoryArkivist")
         self.setWindowTitle(f"StoryArkivist — {self.db.project_name(self._current_project_id)} [*]")
 
@@ -92,13 +92,13 @@ class StoryArkivist(QMainWindow):
 
         self._actUndo = QAction("Undo Outline", self)
         self._actUndo.setShortcuts([QKeySequence.Undo])  # Ctrl+Z
-        self._actUndo.setShortcutContext(Qt.ApplicationShortcut)
+        self._actUndo.setShortcutContext(Qt.WidgetWithChildrenShortcut)
         self._actUndo.triggered.connect(ctrl.undo)
         self.addAction(self._actUndo)
 
         self._actRedo = QAction("Redo Outline", self)
         self._actRedo.setShortcuts([QKeySequence.Redo, QKeySequence("Ctrl+Shift+Z")])
-        self._actRedo.setShortcutContext(Qt.ApplicationShortcut)
+        self._actRedo.setShortcutContext(Qt.WidgetWithChildrenShortcut)
         self._actRedo.triggered.connect(ctrl.redo)
         self.addAction(self._actRedo)
 
@@ -274,13 +274,13 @@ class StoryArkivist(QMainWindow):
         self.populate_chapters_tree()
         self.populate_world_tree()
         self.load_chapter(c1)
+        self.rebuild_search_indexes()
 
+    def populate_outline_workspace(self):
         # refresh outline workspace
         self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
         self.tabMiniOutline.set_workspace(self.outlineWorkspace)
         self.tabMiniOutline.set_chapter(self._current_chapter_id)
-
-        self.rebuild_search_indexes()
 
     def _select_startup_chapter(self):
         pid, bid = self._current_project_id, self._current_book_id
@@ -319,11 +319,11 @@ class StoryArkivist(QMainWindow):
 
     def refresh_project_header(self):
         pid = getattr(self, "_current_project_id", None)
-        if not pid:
-            self.projectBtn.setText("(No project)")
-            return
+        # if not pid:
+        #     self.projectBtn.setText("(No project)")
+        #     return
         name = self.db.project_name(pid) or "(Unknown)"
-        self.projectBtn.setText(name)
+        # self.projectBtn.setText(name)
         self.setWindowTitle(f"StoryArkivist - {name} [*]")
 
     def _ensure_project_exists_or_prompt(self):
@@ -594,17 +594,23 @@ class StoryArkivist(QMainWindow):
         title = self.db.chapter(chap_id)
         new, ok = QInputDialog.getText(self, "Rename Chapter", "New title:", text=title or "")
         if not ok or not new.strip(): return
+        if title == new.strip(): return
         self.db.chapter_update(chap_id, title=new.strip())
         self.populate_chapters_tree()
         self.focus_chapter_in_tree(chap_id)
+        self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
 
-    def _soft_delete_chapter(self, chap_id: int):
-        # mark deleted
-        self.db.chapter_soft_delete(chap_id)
-        # renumber remaining in that book
-        bid = self.db.chapter_meta(chap_id)["book_id"]
-        if bid is not None:
-            self._compact_positions_after_insert(bid)
+    def _soft_delete_chapter(self, chap_id: int, origin: str = "tree"):
+        if origin == "outline":
+            # mark deleted (undoable via outline undo action)
+            self.outlineWorkspace.page.undoController.record_delete_chapter(chap_id, self.db)
+        else:
+            # immediate delete (not recorded on outline stack)
+            self.outlineWorkspace.page.undoController._apply_delete_step(
+                chap_id, payload=None, undo=False, db=self.db
+            )
+
+        # 2) Refresh the tree UI
         self.populate_chapters_tree()
         # clear editor if we just hid the active chapter
         if getattr(self, "_current_chapter_id", None) == chap_id:
@@ -613,20 +619,6 @@ class StoryArkivist(QMainWindow):
             self.centerEdit.setPlainText("")
             self.centerView.setHtml("")
             self.populate_refs_tree(None)
-
-    def _compact_positions_after_insert(self, book_id: int):
-        """Rewrite chapter positions for this book to 0..N-1, skipping soft-deleted chapters."""
-        pid = self._current_project_id
-        cur = self.db.conn.cursor()
-        cur.execute("""
-            SELECT id
-            FROM chapters
-            WHERE project_id=? AND book_id=? AND COALESCE(deleted,0)=0
-            ORDER BY position, id
-        """, (pid, book_id))
-        rows = cur.fetchall()
-        for new_pos, (cid,) in enumerate(rows):
-            cur.execute("UPDATE chapters SET position=? WHERE id=?", (new_pos, cid))
 
     def import_chapters_from_paths(self, paths: list[str]):
         if not paths:
@@ -663,6 +655,7 @@ class StoryArkivist(QMainWindow):
                 self.db.conn.commit()
                 self.recompute_chapter_references(new_id, md)
                 self.populate_chapters_tree()
+                self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
                 self.load_chapter(new_id)
                 return
 
@@ -724,10 +717,11 @@ class StoryArkivist(QMainWindow):
                 self.recompute_chapter_references(new_id, md)
 
             # === normalize positions to 0..M-1 (optional but nice) ===
-            self._compact_positions_after_insert(bid)
+            self.db.chapter_compact_positions(pid, bid)
 
             self.db.conn.commit()
             self.populate_chapters_tree()
+            self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
             if new_ids:
                 self.load_chapter(new_ids[0])
 
@@ -859,7 +853,7 @@ class StoryArkivist(QMainWindow):
         projBtn = QToolButton()
         projBtn.setAutoRaise(True)
         projBtn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        projBtn.setText("(No project)")
+        projBtn.setText("Project Manager")
         # Open-book icon (theme → common fallbacks → drawn fallback)
         book_icon = (QIcon.fromTheme("book-open")
                     or QIcon.fromTheme("document-open")
@@ -987,9 +981,45 @@ class StoryArkivist(QMainWindow):
                 self.cmbChapterVersion.setCurrentText(name)
             self.tabMiniOutline.refresh_from_workspace()
 
+    def _refresh_outline_and_tree(self, book_id: int, focus_cid: int | None = None):
+        pid = self._current_project_id
+        self.populate_chapters_tree()          # tree refresh (no center focus changes)
+        self.outlineWorkspace.load_from_db(self.db, pid, book_id)
+        if focus_cid:
+            self.outlineWorkspace.focus_chapter_id(focus_cid)
+
+    def _on_outline_insert_requested(self, book_id: int, insert_at: int, title: str):
+        pid = self._current_project_id
+        new_cid = self.db.chapter_insert(pid, book_id, insert_at, title, content_md="")
+        self.db.chapter_compact_positions(pid, book_id)
+        self.db.conn.commit()
+        self._refresh_outline_and_tree(book_id, focus_cid=new_cid)
+
+    def _on_outline_rename_requested(self, chap_id: int, new_title: str):
+        self.db.chapter_update(chap_id, title=new_title)
+        meta = self.db.chapter_meta(chap_id)
+        self.db.conn.commit()
+        self._refresh_outline_and_tree(meta["book_id"], focus_cid=chap_id)
+
+    def _on_outline_move_requested(self, chap_id: int, to_book_id: int, to_index: int):
+        meta = self.db.chapter_meta(chap_id)
+        pid, from_book = meta["project_id"], meta["book_id"]
+        # Move to target index (your API):
+        self.db.chapter_move_to_index(chap_id, to_index, to_book_id)
+        # Compact both books (source & dest) in case of inter-book move
+        self.db.chapter_compact_positions(pid, from_book)
+        if to_book_id != from_book:
+            self.db.chapter_compact_positions(pid, to_book_id)
+        self.db.conn.commit()
+        self._refresh_outline_and_tree(to_book_id, focus_cid=chap_id)
+
+    def _on_outline_delete_requested(self, chap_id: int):
+        # keep your existing delete logic; this shows how to notify workspace afterwards
+        self._soft_delete_chapter(chap_id)   # you already have this
+
     def _on_outline_delete_chapter(self, chap_id: int):
         # Your existing soft-delete (keeps outline in ui_prefs for potential restore)
-        self._soft_delete_chapter(chap_id)
+        self._soft_delete_chapter(chap_id, "outline")
 
         # Remove from the outline model
         row = self.outlineWorkspace.row_for_chapter_id(chap_id)
@@ -1241,7 +1271,11 @@ class StoryArkivist(QMainWindow):
         self.charactersPage.characterOpenRequested.connect(self.open_character_dialog)
 
         # Outline workspace signals
+        self.outlineWorkspace.adopt_db_and_scope(self.db, self._current_project_id, self._current_book_id)
         self.outlineWorkspace.versionChanged.connect(self._on_workspace_version_changed)
+        self.outlineWorkspace.chapterInsertRequested.connect(self._on_outline_insert_requested)
+        self.outlineWorkspace.chapterRenameRequested.connect(self._on_outline_rename_requested)
+        self.outlineWorkspace.chapterMoveRequested.connect(self._on_outline_move_requested)
         self.outlineWorkspace.chapterDeleteRequested.connect(self._on_outline_delete_chapter)
         self.chaptersOrderChanged.connect(self.outlineWorkspace.apply_order_by_ids)
 
@@ -1249,18 +1283,20 @@ class StoryArkivist(QMainWindow):
         return self.outlineWorkspace.page.undoController
 
     def _is_outline_surface_active(self) -> bool:
-        w = QApplication.focusWidget()
-        if not w:
+        uc   = self._outline_controller()
+        if not uc or uc.active_surface() == "none":
+            return False
+        fw = QApplication.focusWidget()
+        if not fw:
             return False
         ws = getattr(self, "outlineWorkspace", None)
         if not ws or not getattr(ws, "page", None):
             return False
-        page = ws.page
-        # any pane editor/tree OR the mini itself
-        in_pane = any(p.editor.isAncestorOf(w) or p.isAncestorOf(w) for p in page.panes)
-        mini = getattr(page, "single_mini", None)
-        in_mini = bool(mini and (mini.editor.isAncestorOf(w) or mini.isAncestorOf(w)))
-        return in_pane or in_mini
+        # focus must be inside any pane editor or the mini editor
+        if any(p.editor.isAncestorOf(fw) for p in ws.page.panes):
+            return True
+        mini = getattr(ws.page, "single_mini", None)
+        return bool(mini and mini.editor.isAncestorOf(fw))
 
     def eventFilter(self, obj, ev):
         if ev.type() == QEvent.KeyPress and self._is_outline_surface_active():
@@ -1398,22 +1434,14 @@ class StoryArkivist(QMainWindow):
             book_id = int(row[0])
 
         # find last position
-        # cur.execute("SELECT COALESCE(MAX(position), -1) FROM chapters WHERE book_id=? AND COALESCE(deleted,0)=0", (book_id,))
-        # last = cur.fetchone()[0] or -1
-        # insert_pos = last + 1
-        # print("insert pos", insert_pos)
         last_pos_idx = self.db.chapter_last_position_index(self._current_project_id, self._current_book_id)
         insert_pos = last_pos_idx + 1
         new_id = self.db.chapter_insert(self._current_project_id, self._current_book_id, insert_pos, "New Chapter", "")
 
-        # cur.execute("""
-        #     INSERT INTO chapters (project_id, book_id, title, content, position)
-        #     VALUES (?, ?, ?, ?, ?)
-        # """, (self._current_project_id, book_id, "Untitled Chapter", "", insert_pos))
-        # new_id = cur.lastrowid
         self.db.conn.commit()
 
         self.populate_chapters_tree()
+        self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
         if hasattr(self, "focus_chapter_in_tree"):
             self.focus_chapter_in_tree(new_id)
         if hasattr(self, "load_chapter"):
@@ -1524,10 +1552,10 @@ class StoryArkivist(QMainWindow):
                 self.recompute_chapter_references(new_id, md)
 
             # === Normalize 0..M-1 positions (deleted rows ignored) ===
-            self._compact_positions_after_insert(bid)
+            self.db.chapter_compact_positions(pid, bid)
 
-            self.db.conn.commit()
             self.populate_chapters_tree()
+            self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
             if new_ids:
                 self.load_chapter(new_ids[0])
         finally:
@@ -1539,6 +1567,7 @@ class StoryArkivist(QMainWindow):
         self.populate_chapters_tree()
         self.populate_world_tree()
         self.populate_refs_tree(None)
+        self.populate_outline_workspace()
 
     def populate_chapters_tree(self):
         self.chaptersTree.clear()
@@ -1647,80 +1676,112 @@ class StoryArkivist(QMainWindow):
                 gnode.addChild(inode)
         t.expandAll()
 
-    def compact_and_renumber_after_tree_move(self, src_parent, dest_parent):
-        """
-        After a Qt reorder/move, persist 0..N-1 positions for the affected book(s)
-        based on the current *visible* order in the tree (which already excludes
-        soft-deleted chapters). Then relabel the on-screen items without a full reload.
-        """
+    # def compact_and_renumber_after_tree_move(self, src_parent, dest_parent):
+    #     """
+    #     After a Qt reorder/move, persist 0..N-1 positions for the affected book(s)
+    #     based on the current *visible* order in the tree (which already excludes
+    #     soft-deleted chapters). Then relabel the on-screen items without a full reload.
+    #     """
 
-        def climb_to_book(node):
-            """If node is a chapter, climb to its book; if already a book, return it; else None."""
-            if not node:
-                return None
-            d = node.data(0, Qt.UserRole) or ()
-            if d and d[0] == "book":
-                return node
-            # climb
-            p = node
-            while p and p.parent():
-                p = p.parent()
-                dd = p.data(0, Qt.UserRole) or ()
-                if dd and dd[0] == "book":
-                    return p
-            return None
+    #     def climb_to_book(node):
+    #         """If node is a chapter, climb to its book; if already a book, return it; else None."""
+    #         if not node:
+    #             return None
+    #         d = node.data(0, Qt.UserRole) or ()
+    #         if d and d[0] == "book":
+    #             return node
+    #         # climb
+    #         p = node
+    #         while p and p.parent():
+    #             p = p.parent()
+    #             dd = p.data(0, Qt.UserRole) or ()
+    #             if dd and dd[0] == "book":
+    #                 return p
+    #         return None
 
-        handled = set()
-        for raw in (src_parent, dest_parent):
-            book_node = climb_to_book(raw)
-            if not book_node or book_node in handled:
-                continue
-            handled.add(book_node)
+    #     handled = set()
+    #     for raw in (src_parent, dest_parent):
+    #         book_node = climb_to_book(raw)
+    #         if not book_node or book_node in handled:
+    #             continue
+    #         handled.add(book_node)
 
-            bdata = book_node.data(0, Qt.UserRole) or ()
+    #         bdata = book_node.data(0, Qt.UserRole) or ()
+    #         if not (bdata and bdata[0] == "book"):
+    #             continue
+    #         book_id = int(bdata[1])
+
+    #         # 1) Read the visual order (chapters only, i.e., non-deleted)
+    #         ordered_ids = []
+    #         for i in range(book_node.childCount()):
+    #             ch = book_node.child(i)
+    #             cd = ch.data(0, Qt.UserRole) or ()
+    #             if cd and cd[0] == "chapter":
+    #                 ordered_ids.append(int(cd[1]))
+
+    #         # Nothing to persist
+    #         if not ordered_ids:
+    #             continue
+
+    #         # 2) Persist compact positions 0..N-1 into DB for these chapters
+    #         cur = self.db.conn.cursor()
+    #         for pos, cid in enumerate(ordered_ids):
+    #             cur.execute("UPDATE chapters SET book_id=?, position=? WHERE id=?",
+    #                         (book_id, pos, cid))
+    #         self.db.conn.commit()
+
+    #         # 3) Relabel visible nodes to "n. title" using fresh titles from DB (no full reload)
+    #         qmarks = ",".join("?" for _ in ordered_ids)
+    #         cur.execute(f"SELECT id, title FROM chapters WHERE id IN ({qmarks})", ordered_ids)
+    #         id_to_title = {int(r[0]): (r[1] if not isinstance(r, sqlite3.Row) else r["title"])
+    #                     for r in cur.fetchall()}
+
+    #         # Keep numbering contiguous (1-based in labels)
+    #         for i in range(book_node.childCount()):
+    #             ch = book_node.child(i)
+    #             cd = ch.data(0, Qt.UserRole) or ()
+    #             if cd and cd[0] == "chapter":
+    #                 cid = int(cd[1])
+    #                 # Find its new 0-based pos as index in ordered_ids
+    #                 try:
+    #                     pos0 = ordered_ids.index(cid)
+    #                 except ValueError:
+    #                     # Not in ordered_ids → likely a non-chapter or deleted (shouldn't happen here)
+    #                     continue
+    #                 base_title = id_to_title.get(cid, ch.text(0))
+    #                 ch.setText(0, chapter_display_label(pos0, base_title))
+
+    def compact_and_renumber_after_tree_move(self, src_book_item, dest_book_item):
+        pid = self._current_project_id
+
+        def ordered_chapter_ids(book_item):
+            out = []
+            for i in range(book_item.childCount()):
+                d = book_item.child(i).data(0, Qt.UserRole)
+                if d and d[0] == "chapter":
+                    out.append(int(d[1]))
+            return out
+
+        touched = [x for x in {src_book_item, dest_book_item} if x]
+
+        for book_item in touched:
+            bdata = book_item.data(0, Qt.UserRole)
             if not (bdata and bdata[0] == "book"):
                 continue
-            book_id = int(bdata[1])
+            bid = int(bdata[1])
 
-            # 1) Read the visual order (chapters only, i.e., non-deleted)
-            ordered_ids = []
-            for i in range(book_node.childCount()):
-                ch = book_node.child(i)
-                cd = ch.data(0, Qt.UserRole) or ()
-                if cd and cd[0] == "chapter":
-                    ordered_ids.append(int(cd[1]))
+            ids = ordered_chapter_ids(book_item)
+            # persist the visual order via db helpers
+            for pos, cid in enumerate(ids):
+                self.db.chapter_move_to_index(pid, bid, cid, pos)
 
-            # Nothing to persist
-            if not ordered_ids:
-                continue
+            # normalize positions to 0..N-1, skipping deleted
+            self.db.chapter_compact_positions(pid, bid)
 
-            # 2) Persist compact positions 0..N-1 into DB for these chapters
-            cur = self.db.conn.cursor()
-            for pos, cid in enumerate(ordered_ids):
-                cur.execute("UPDATE chapters SET book_id=?, position=? WHERE id=?",
-                            (book_id, pos, cid))
-            self.db.conn.commit()
-
-            # 3) Relabel visible nodes to "n. title" using fresh titles from DB (no full reload)
-            qmarks = ",".join("?" for _ in ordered_ids)
-            cur.execute(f"SELECT id, title FROM chapters WHERE id IN ({qmarks})", ordered_ids)
-            id_to_title = {int(r[0]): (r[1] if not isinstance(r, sqlite3.Row) else r["title"])
-                        for r in cur.fetchall()}
-
-            # Keep numbering contiguous (1-based in labels)
-            for i in range(book_node.childCount()):
-                ch = book_node.child(i)
-                cd = ch.data(0, Qt.UserRole) or ()
-                if cd and cd[0] == "chapter":
-                    cid = int(cd[1])
-                    # Find its new 0-based pos as index in ordered_ids
-                    try:
-                        pos0 = ordered_ids.index(cid)
-                    except ValueError:
-                        # Not in ordered_ids → likely a non-chapter or deleted (shouldn't happen here)
-                        continue
-                    base_title = id_to_title.get(cid, ch.text(0))
-                    ch.setText(0, f"{pos0 + 1}. {base_title}")
+        # refresh both UIs
+        self.populate_chapters_tree()
+        if hasattr(self, "outlineWorkspace"):
+            self.outlineWorkspace.load_from_db(self.db, pid, self._current_book_id)
 
     def _relabel_book_node(self, book_node, ordered_ids, id_to_title):
         """Update tree item texts for a book node to reflect current numbering."""
@@ -1738,7 +1799,7 @@ class StoryArkivist(QMainWindow):
                 if not id_to_title:
                     import re
                     base = re.sub(r"^\s*\d+\.\s+", "", ch.text(0)).strip()
-                ch.setText(0, f"{pos+1}. {base}")
+                ch.setText(0, chapter_display_label(pos, base))
                 pos += 1
 
 
@@ -1874,13 +1935,16 @@ class StoryArkivist(QMainWindow):
 
     def autosave_chapter_title(self):
         if self._current_chapter_id is None: return
+        old_title = self.db.chapter(self._current_chapter_id)
         title = self.titleEdit.text().strip()
         cur = self.db.conn.cursor()
         cur.execute("UPDATE chapters SET title=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (title, self._current_chapter_id))
         self.db.conn.commit()
         # update FTS row via trigger; refresh tree label
-        self.populate_chapters_tree()
+        if not old_title == title:
+            self.populate_chapters_tree()
+            self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
 
     def save_current_if_dirty(self):
         """Single place to persist all 'dirty' state for the current chapter + panels."""
@@ -2235,6 +2299,7 @@ class StoryArkivist(QMainWindow):
             self._outlineWin = OutlineWindow(None)
             self._outlineWin.setAttribute(Qt.WA_QuitOnClose, False)
             # Adopt the *same* OutlineWorkspace instance you already use in main:
+            print("adopting outline workspace from main window")
             self._outlineWin.adopt_workspace(self.outlineWorkspace)
 
         self._outlineWin.show()

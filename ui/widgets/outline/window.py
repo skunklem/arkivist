@@ -23,17 +23,14 @@ class OutlineWindow(QtWidgets.QMainWindow):
     def load_project(self, db, project_id: int, book_id: int):
         # only if you *didn't* adopt; when shared, main already loaded it:
         if not self.workspace:
+            print("OutlineWindow: loading workspace")
             self.adopt_workspace(OutlineWorkspace())
         self.workspace.load_from_db(db, project_id, book_id)
 
     def focus_chapter_id(self, chap_id: int):
-        # Resolve row from id (don’t rely on previous selection)
-        r = self.workspace.row_for_chapter_id(chap_id)
-        if r < 0:
-            return
         # Defer until layout is ready
         QtCore.QTimer.singleShot(0, lambda: (
-            self.workspace.focus_chapter_row(r, give_focus=True),
+            self.workspace.focus_chapter(chap_id, caret=(0,0), give_focus=True),
             self.raise_(), self.activateWindow()
         ))
 

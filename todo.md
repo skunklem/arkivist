@@ -1,20 +1,43 @@
 TO-Dos
 ## New
-* character summary: show aliases as list (aka: john, jacob,...)
+* zoom needs to be universal for all (or most) text items in app. They each check zoom when painting and respond to changes
+* book (project, too?) needs to have its own todo/note/outline
+* outline window had option for simplified view (just each chapter's panes stacked directly in line almost like a full editor, chapter names appear to the left and scroll along with panes or appear on hover)
+* saving sanity and consistency (should everything small autosave but all large textboxes show unsaved and require user action and ask user to save when moving away from something but also save a copy in db of what's being worked on in case of crash).
+* should chapters have tabs at the top that each store the active version of the chapter (saved or not) with easy flipping to different chapters without having to save right away
+* Oultine editor could have tabs for each pane to show to-dos/notes (only do this when willing to commit time to making sure the main-window version and outline version mirror perfectly)
+* character editor needs to be its own window (not modal)
+* character summary: show aliases as list like "aka: john, jacob, teddy bear"
 * add links to other characters/belongings/ into character dialog/summary
   * for characters, track relationship name(sibling, friend, enemy, etc), thoughts about people
 * Input hygiene: trim user strings, cap absurd length (e.g., 512 chars) before insert
 * Figure out logging of user actions
 * How to ensure center/right align persists through markdown conversion (or switch to better editor)
-  * We'd also want to preserve comments and allow merging in external edits
+  * We'd also want to preserve comments (especially if users export as docx, get comments from friends, reimport) and allow merging in external edits
 * Edit in word should bring up word in front of app, not behind
 * When creating blank chapter, start in edit mode with "New Chapter" title highlighted and ready to edit (or as the recommended text)
-* to-dos/notes are great, but I'd love a more intuitive and comprehensive outlining feature. Perhaps it needs to be a sidebar or another panel that can sit next to the chapter or in a second window while the user writes. Ideally, there would be one major outline with lots of bullets that can be pieced together chronologically, but each character (or location or major plotline) might have its own arc or personal outline that you want to look at individually without the noise of everything else. Each chapter would only include certain plot points, so it would be great if there could be a sliding sidebar next to the bullets for the user to specify where one chapter begins or ends. It could look like bars that lengthen up or down depending on whether the top is being slid, and that would snap to points above or below any given bullet point. Then, when you're in a chapter, the chapter outline would auto-populate to display oly the relevant section or clicking "outline" within a chapter could open the major outline overview with the relevant section already scrolled into view. The bullets also need to be able to move very easily among each other (perhaps a little grabber for obvious sliding but maybe not necessary). It could be kind of like a table format with new cells each time user clicks enter and each cell is draggable, but it needs to feel less clunky than using a table and clicking into each cell. The indentation of nested items needs to be preserved, so it could be like a tree, only with everything easier to edit at any time. It could be more like visual studio's alt+up or alt+down to move any lines that are fully or partially highlighted up or down.
-* Make status line more subtle (no need to span the whole width with the box - only as wide as text)
+* outlining plot arcs:
+  * world items (notably characters) can have outlines or plot arcs, and user can create named plot arcs (like "infiltrating the castle") that span multiple chapters. 
+  * Each arc has bullet points (either like in outline editor or like a tree)
+  * lines from outline that mention a world item automatically show up as options to add to that world item's plot arc. X-ing out prevents it from asking again about the same bullet/line
+  * could every line/bullet be its own editor, always ready to accept a cursor, dragging across multiple highlights like you're in a single editor, checkboxes or draggers for reordering?
+  * or, could there be a typing mode where it's the current chapter panes and a viewing mode where things are draggable (tree items)?
+  * Chapter assignment view/mode:
+    * side-by-side view of overall outline and selected plot arc. Left panel could be tree view with chapters listed and arcs listed (or that goes in right panel). Main (central) area is divided into simple view of outline on left, selected plot arc on right.
+    * useful for for planning purposes if user wants to draft out arcs individually and then interleave them visually before writing the chapter
+    * drag and drop plot points from an arc onto a chapter (name or outline pane) to assign them to that chapter.
+    * plot point remains in its arc but now it also shows up in that chapter's outline.
+    * plot arc's bullets rearrange depending on the order of the chapters they're dropped into, and they're flagged with chapter number once assigned.
+    * Unassigned plot points are free to move anywhere between points that are locked onto a chapter. (may be tricky to position, especially if the plot point moves in the outline. How can we track that line if it's moved, especially if copy and paste is used. Can each line carry an ID and copy/paste respect/recall it? Can we easily transition to a tree style editor so things are more draggable? Can tree leaves be cut/pasteable?)
+* status line
+  * make it more subtle (no need to span the whole width with the box - only as wide as text)
   * change positioning to look better
-* world panel header and label don't need to be redundant - make header row only specify what type of world item overview we're getting (character summary, item details, setting details, or similar)
+  * can be a simple mark in chapter tabs, if we use those
+  * in character editor, shouldn't show unsaved changes once table has been edited (it's already saved to db and table by then)
+* project manager button should be labeled like "Project Manager" or "**<current_project>**<Br>Manage Projects"
+* world panel header and label don't need to be redundant - make header label "Side Notes". Then label what type of world item overview we're getting (character summary, world item details, setting details, etc) - this will prevent the side panel from resizing every time a name changes
 * stop word sync closes the word doc but leaves Word open if there weren't already any other documents open. It should close the whole application (but not any other documents). If other docs are open, it works fine, currently, leaving them up.
-* In the Outline window, attach a proxy like `QSortFilterProxyModel` to match chapter list to chapter tree from main app with separate `QItemSelectionModel`s
+* (probably not necessary) In the Outline window, attach a proxy like `QSortFilterProxyModel` to match chapter list to chapter tree from main app with separate `QItemSelectionModel`s
 * allow multiple books in Outline: add a book selector above the Outline list and call workspace.load_from_db(db, project_id, chosen_book_id) on change; the same reorder signal will keep ordering consistent per book.
 ### Small fixes
 * center mode button needs to be off when no character id selected
@@ -22,60 +45,59 @@ TO-Dos
 * shouldn't need to hit enter twice to save/defocus from trait tables
 ## Old
 * Edit button in right panel needs to open character dialog if current world item is type character
-* switch to guids rather than ints as PK if recommended
-* add right click options for chapters in world tree: insert blank chapter before/after | insert chapter from file before/after
-* add chapter reorganization lock to select whether DnD functions for chapter rearrangement (icons with closed or open lock symbols) (goes in line with label over chapter tree)
+* (not unless necessary later) switch to guids rather than ints as PK if recommended
+* add right click options for chapters in world tree: insert blank chapter before/after | insert chapter from file before/after (and rename isn't working)
 * add arrow symbol like "-->|" for skipping to last world item instead of only going step by step (also ctrl+alt+right arrow for last item and ctrl+alt+left arrow for first)
 * place in character dialog to mark character as a main character via facets
+  * create a character list (tree, draggable) where user can move character position and place them into different categories (main, secondary, minor, ...)
 * Project manager dialog updates
   * Clicking save in project manager should close manager and open selected project
   * Clicking enter from renaming box removes cursor from box.
   * If nothing selected, enter clicks save
   * Project names should be in a column of buttons rather than a tree/list/box thing
-  * Instead of starting in project manager, instantiate NewProject and let user click on name to update things themselves
+  * Instead of starting in project manager, instantiate New Project and let user click on project manager to update things themselves (or at least show the main window behind project manager from startup since it's currently icon-less in start)
 * bulk import dialog: Insert line should have button(first), dropdown(select location), button(last) (or use radiobuttons with dropdown in the selection option); Split on first --> Number detection, radiobuttons for "N. ", "N - ", "N " (needs to be clear where the spaces are)
 * Export individual chapters or whole book as docx, ideally in project directory (use project default or select outdir). Add export option to right click for given chapter.
 * Right click book in chapter tree: Export book (writes .docx), New book (adds new book and has user name it in chapter tree), Import book (select file -> attempt to separate into multiple chapters else one)
-* mass rename capabilities (of something like a character name) across all chapters/world items. Add old name to aliases with marking indicating that it's not used anymore. Defunct aliases will bring up a warning if found in text prior to export. NOTE: probably need to call pane.refresh_from_model() after changes implement
+* mass rename capabilities (of something like a character name) across all chapters/world items/outlines/to-dos/notes. Add old name to aliases with marking indicating that it's not used anymore. Defunct aliases will bring up a warning if found in text prior to export. NOTE: probably need to call pane.refresh_from_model() after changes implement
 * recompute_chapter_references needs to account for the potential of some aliases and names spanning multiple words like "Lake Watery" or "the high prince"
-* Add new chapter icon on tree next to "Chapters"
 * How to deal with interludes or Part/Act numbers that should sit between chapters but not imopact the chapter numbering
-  * potential fix: order by setting pointer to chapter/writing that comes before it; add field `is_numbered` where only the true ones get auto-incremented chapter numbers; then `position` can auto-increment (or not if explicit numbering desired); and if all versions of a chapter are marked inactive, numbering will exclude that chapter despite it still being linked between two others by pointer
-  * This will work well by updating chapter_display_label and its inputs and possibly setting a numbering policy (we can offer a few defaults (purely numerical, don't number parts, user-explicit numbering,...))
-* Add facet templates (defaults) per project (“Characters usually have: Eye color, Hair, Height, …”) so the “Add Trait” dialog can present a dropdown of common labels.
-* Add top-level world item defaults based on selected project type (novel:characters,locations,events; memoir:people,locations,events). Certain categories allow nesting (like locations which can have morespecific locations inside them, but characters probably shouldn't allow nesting)
-* Inline linking in goals/notes via your wikilink syntax ([[Some Item]]), reuse your render pipeline.
+  * potential fix: add field `is_numbered` where only the true ones get auto-incremented chapter numbers (and add a checkbox or right click chapter settings section in chapter to update this); then `position` can auto-increment; another field can either hold explicit number overrides, if desired; and if all versions of a chapter are marked inactive, numbering will exclude that chapter despite it still being linked between two others by pointer (it gets greyed out)
+  * Optionally have a numbering policy for a given book (we can offer a few defaults (normal where you have to opt out of numbering for a chapter, user-explicit numbering where you can edit the number in a little textbox beside title,...))
+* Add top-level world item defaults based on selected project type (fantasy novel:characters,locations,events,magic system; memoir:people,locations,events). Certain categories allow nesting (like locations which can have more specific locations inside them, but characters probably shouldn't allow nesting)
+* Inline linking in goals/notes via wikilink syntax ([[Some Item]]), reuse current render pipeline.
 * Timeline: add since_chapter_id/until_chapter_id to facets to show how traits/goals evolve.
   * some way of tracking when chapters start and end, character appearances, character/item lifespan
   * allow for the creation of calendars to fit novel worlds?
+  * graphics (x-axis can be time, if applicable, or chapter)
 * update character dialog to have more useful defaults set up rather than just a traits table. I'm imagining this should be fairly similar to a D&D character sheet but we won't go that complex yet. (update character summary in right panel to match)
-* Characters Page:
-  better version of character dialog that overviews lots of characters, have view modes (grid: character cards with the basics; list: character names organized by filters)
-* (asked already - see chatgpt "Characters Page") Characters as a text item feels inadequate. Characters need several linked items (belongings, physical attributes, goals, desires, etc.) and those items should each have an optional short note linked in to add context like where they were acquired or why they're important. As for displaying these things, something more form-like may be better with items able to be added/sorted similar to in the To-Dos section. For items with notes, those could be hover text or the items could be in a table with their extra info in the next cell. Display may vary by the item type, and as this gets more complex, I wonder if it would be best to have a simple version in the right panel for quick viewing but a more complex, better-laid-out version in a dialog box and also anly allow editing in there. Possibly the best option for DB is to keep character as text item but add a features table (or some better name) that can contain name,type,description where the item type can be something like eye color or other physical traits but also a personal goal or belonging. These items can be linked to any or multiple characters by way of possibly the relationships table or some new table. Or do these items fit best in the world_items table? I think belongings could go there, but physical attributes and goals probably can't. What do you suggest? Let me know if I'm missing any alternative ways of looking at this.
-* If world item has aliases, those should be displayed in separate box under text item box
+* Characters Page (asked already - see chatgpt original app chat, search for "Characters Page"):
+  better version of character dialog that overviews lots of characters, have view modes (grid: character cards with the basics; list: character names organized by filters/labels)
+* common character relationships to add: from <setting>, visits <settings>, part of <organization>, interests <org, setting, character, other world items>, knows/hates/loves <character>, belongings <world-items>
 * Is it possible to add a slider between To-dos and Notes?
-* Is it possible to allow single newline from markdown text to display on a new line rather than requiring 2?
 * swap to a web editor (B2) for full rich editing + spellcheck + future autocomplete
     * Sub in a nicer text editor for chapters that includes basic formatting and spellcheck with suggestions
     * Possibly add in autocomplete (at least of names from world)
     * Add in right-click for synonym replacement
-* allow world items to be sorted by selectable categories. Maybe user wants to sort people by organizations they're a part of (if member of multiple, name can appear under each supercategory). Maybe there's a high level category with characters, but if you look through locations it could have a subcategory with citizens that lets you find some of the same people there, too.
-* add the same wikilinks to referenced items in chapter markdown (or fancier editor?) as in world items
-* Auto-parse new chapters and look for proper nouns to suggest as characters/locations/items to add to the world
+    * can you do automatic wikilinks in something like this?
+* separate world-item window
+  * allow world items to be sorted by selectable categories (possibly different tabs for major categories).
+  * Maybe user wants to sort people by organizations they're a part of (if member of multiple, name can appear under each supercategory). Maybe there's a high level category with characters, but if you look through locations it could have a subcategory with citizens that lets you find some of the same people there, too.
+* Auto-parse new chapters and look for proper nouns to suggest as characters/locations/items to add to the world (possibly in bottom panel tab with a number tag that indicates how many potential characters have been found in chapter)
   * (Already have some code for similar appliications that I can offer up)
 * import world items picker: need to be able to add category options if you don't have a relevant one to drop your item in
 * drag-reordering of items within a category, we can add a position column to world_items
-* ability to pop out any given section of app into its own window (with seamless reordering so it doesn't look too ugly afterward)
 * Add access to soft-deleted books/chapters/world-items
 * Create visual web of character relationships
 * View > Focus: Add toggle for focus mode? Include save_all_dirty() beforehand. Hide outer panels. Or add icon buttons to close/open each panel
-* Allow exportation of project db
+* Allow export of project db
 * Allow merging of multiple projects
-* Auto-detect proper nouns and ask if they need to be incorporated as characters or world items (possibly in bottom panel tab with a number tag that indicates how many potential characters have been found in chapter)
-* on close, save last state so it reopens where user left off
-* Add selector to show bottom panel stuff either by active chapter or all chapters (which would mean figuring out how to display the project to-dos nicely but chapter notes wouldn't appear if showing project details)
-* Add created_by and modified_by fields for most columns
+* save last state so startup reopens where user left off
+* Add created_by and modified_by fields for most tables
 * Enable AI world-item generation based on knowledge of the world/cultures/locations/queries via API
 * Enable AI parsing of chapters to add in world items (ask user to verify before addition to db)
-* Enable AI to create its own stories/videos based on world/situation knowledge
+* Enable AI to create its own stories/videos based on world/situation knowledge to interact with the world or project potential scenarios to determine how characters/factions would react
 * Enable gamification (Choose-your-own-adventure style interaction where user is character in project world and interacts with things. AI uses world knowledge to respond appropriately. Creates background images or videos of events. Good way of playtesting world and getting alternate perspective of what NPCs would do based on the details about them present in Arkivist)
+* Use AI to detect plot holes or inconsitencies in how characters/locations/etc are discussed (especially if the same character refers to things in vastly different ways)
+* Use AI to aggregate all details about a given world item or plot arc and either summarize or list out direct quotes (with links to view them in context) for easy checking
+* Easily flip through every place a character/item is mentioned (including aliases or not), choose to go through chapters, outlines, notes, to-dos, world items. Do we need a separate search panel, or do we add a search bar to each of these things or do we want a modal (or panel or tab in the left panel) that lets us do the selecting/filtering and clicking in there brings up (and highlights) the relevant chapter/content?

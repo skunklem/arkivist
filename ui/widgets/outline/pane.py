@@ -325,13 +325,13 @@ class ChapterPane(QtWidgets.QWidget):
         self.date.setText(v.date or "")
         self._load_char_list(v.characters)
         ed.set_lines(v.lines)
-        self._prime_undo_snapshot()
-        ed._last_text_snapshot_text = ed.toPlainText()
-        ed._last_text_snapshot_cursor = ed.get_line_col()
+        # ed._last_text_snapshot_text = ed.toPlainText()
+        # ed._last_text_snapshot_cursor = ed.get_line_col()
 
     def _on_version_switched(self, idx: int):
         if idx < 0 or idx >= len(self.chapter.versions):
             return
+        vname = self.verCombo.currentText()
         # 1) save current UI into the currently active version
         self._save_ui_to_version()
         # 2) switch active index
@@ -339,7 +339,9 @@ class ChapterPane(QtWidgets.QWidget):
         # 3) load the chosen version into UI
         self._load_version_to_ui()
         # 4) notify the outside world
-        self.versionChanged.emit(self.verCombo.currentText())
+        self.versionChanged.emit(vname)
+        # 5) set current outline version
+        self.set_current_outline_version_name_for(self.chapter.id, vname)
 
     def _add_version_named(self, name: str, clone_from_current=True):
         # the same logic you use in your "Add version…" action:
@@ -378,11 +380,6 @@ class ChapterPane(QtWidgets.QWidget):
         if not ok:
             return
         self._on_add_version_with_name(name, clone_from_current=True)
-
-    def _prime_undo_snapshot(self):
-        ed = self.editor
-        ed._last_text_snapshot_text = ed.toPlainText()
-        ed._last_text_snapshot_cursor = ed.get_line_col()
 
     def _load_char_list(self, names: list[str]):
         self.charList.clear()

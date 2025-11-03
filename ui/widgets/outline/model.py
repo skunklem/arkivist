@@ -84,3 +84,27 @@ class ChaptersModel(QtCore.QAbstractListModel):
 
     def chapter(self, row: int) -> Chapter:
         return self._chapters[row]
+
+    def row_for_chapter_id(self, chap_id: int) -> int:
+        items = self._chapters
+        for i, ch in enumerate(items):
+            if (hasattr(ch, "id") and ch.id == chap_id) \
+               or (isinstance(ch, dict) and ch.get("id") == chap_id) \
+               or (isinstance(ch, (list, tuple)) and ch and ch[0] == chap_id):
+                return i
+        return -1
+    
+    def chapter_id_for_row(self, row: int) -> int:
+        items = getattr(self, "_chapters", None) or []
+        if row < 0 or row >= len(items):
+            return -1
+        ch = items[row]
+        return getattr(ch, "id", -1)
+
+    def chapter_id_for_index(self, idx) -> int:
+        # Accept QModelIndex OR int for extra robustness
+        if isinstance(idx, int):
+            return self.chapter_id_for_row(idx)
+        if not isinstance(idx, QtCore.QModelIndex) or not idx.isValid():
+            return -1
+        return self.chapter_id_for_row(idx.row())

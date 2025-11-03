@@ -237,37 +237,37 @@ class MiniOutlineTab(QtWidgets.QWidget):
                 return False
         return super().eventFilter(obj, ev)
 
-    def _on_editor_text_changed(self):
-        uc = self._workspace.page.undoController
-        if uc.is_applying() or self._mirroring_from_pane:
-            return
+    # def _on_editor_text_changed(self):
+    #     uc = self._workspace.page.undoController
+    #     if uc.is_applying() or self._mirroring_from_pane:
+    #         return
 
-        p = self._current_pane()
-        if not p: return
-        ed = p.editor
+    #     p = self._current_pane()
+    #     if not p: return
+    #     ed = p.editor
 
-        print("MINI before pane snapshot", id(ed),
-            getattr(ed, "_last_text_snapshot_cursor", None),
-            "pending", getattr(ed, "_pending_nav_before", None))
+    #     print("MINI before pane snapshot", id(ed),
+    #         getattr(ed, "_last_text_snapshot_cursor", None),
+    #         "pending", getattr(ed, "_pending_nav_before", None))
 
-        new_text = self.editor.toPlainText()
-        cur_line, cur_col = self.editor.get_line_col()
+    #     new_text = self.editor.toPlainText()
+    #     cur_line, cur_col = self.editor.get_line_col()
 
-        ed._suppress_text_undo_event = True
-        ed.blockSignals(True)
-        try:
-            ed.set_text_and_cursor(new_text, cur_line, cur_col)
-        finally:
-            ed.blockSignals(False)
-            ed._suppress_text_undo_event = False
+    #     ed._suppress_text_undo_event = True
+    #     ed.blockSignals(True)
+    #     try:
+    #         ed.set_text_and_cursor(new_text, cur_line, cur_col)
+    #     finally:
+    #         ed.blockSignals(False)
+    #         ed._suppress_text_undo_event = False
 
-        uc.register_text(ed)  # controller will consume _pending_nav_before if present
+    #     uc.register_text(ed)  # controller will consume _pending_nav_before if present
 
-        # refresh AFTER snapshots for the next keystroke
-        ed._last_text_snapshot_text   = ed.toPlainText()
-        ed._last_text_snapshot_cursor = ed.get_line_col()
+    #     # refresh AFTER snapshots for the next keystroke
+    #     ed._last_text_snapshot_text   = ed.toPlainText()
+    #     ed._last_text_snapshot_cursor = ed.get_line_col()
 
-        p.sync_into_model()
+    #     p.sync_into_model()
 
     def _forward_indent(self, delta: int):
         print("forward_indent", delta)
