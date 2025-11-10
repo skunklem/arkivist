@@ -1,5 +1,10 @@
 TO-Dos
 ## New
+* add a make-active checkbox for chapters that uses `self.db.set_active_chapter_version(chapter_id, selected_version_id)`
+* allow user to choose which alias is the main one (which gets displayed in any headings/wikilinks)
+* Create fancy hover content that proviews most wikilinks without actually having to click on them.
+* chapter is selected on startup until I choose it in the project manager, then no chapter selected.
+* world tree shows Characters twice, once empty, once containing characters. Make sure not to add any items where they already exist with the same parent.
 * zoom needs to be universal for all (or most) text items in app. They each check zoom when painting and respond to changes
 * book (project, too?) needs to have its own todo/note/outline
 * outline window had option for simplified view (just each chapter's panes stacked directly in line almost like a full editor, chapter names appear to the left and scroll along with panes or appear on hover)

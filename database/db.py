@@ -1,5 +1,6 @@
 from __future__ import annotations
 import sqlite3
+import hashlib
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -19,6 +20,12 @@ def _normalize_alias(s: str) -> str:
     # collapse multiple spaces
     s = " ".join(s.split())
     return s
+
+def _norm_for_hash(text: str) -> str:
+    return (text or "").replace("\r\n","\n").strip()
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()
 
 class Database:
     def __init__(self, path: Path):
@@ -115,10 +122,37 @@ class Database:
         return r["title"] if r else None
     
     def chapter_meta(self, chapter_id: int) -> dict:
+        """
+        Returns chapters meta plus active version id/hash/length (no text).
+        """
         c = self.conn.cursor()
-        c.execute("""SELECT id, title, content, position, book_id, project_id
+        c.execute("""SELECT id, title, position, book_id, project_id, active_version_id
                     FROM chapters WHERE id=?""", (chapter_id,))
-        return c.fetchone()
+        ch = c.fetchone()
+        if not ch:
+            return {}
+
+        ver = None
+        text_hash = None
+        text_len = None
+        if ch["active_version_id"]:
+            c.execute("SELECT id, text_hash, LENGTH(text) AS text_len FROM chapter_versions WHERE id=?",
+                    (ch["active_version_id"],))
+            ver = c.fetchone()
+            if ver:
+                text_hash = ver["text_hash"]
+                text_len  = ver["text_len"]
+
+        return {
+            "id": ch["id"],
+            "title": ch["title"],
+            "position": ch["position"],
+            "book_id": ch["book_id"],
+            "project_id": ch["project_id"],
+            "active_version_id": ch["active_version_id"],
+            "text_hash": text_hash,
+            "text_len": text_len,
+        }
 
     def chapter_last_position_index(self, project_id: int, book_id: int) -> int:
         c = self.conn.cursor()
@@ -127,41 +161,84 @@ class Database:
         if last_pos_idx is None or last_pos_idx < 0:
             return -1
         return last_pos_idx
-    
-    def chapter_content(self, chapter_id: int) -> Optional[sqlite3.Row]:
-        c = self.conn.cursor()
-        c.execute("SELECT content FROM chapters WHERE id=?", (chapter_id,))
-        r = c.fetchone()["content"]
-        return r if r else None
 
-    def chapter_list(self, project_id: int, book_id: int, fetchone=False) -> list[sqlite3.Row]:
-        c = self.conn.cursor()
-        c.execute("""SELECT id, title, content, position
-                     FROM chapters
-                     WHERE project_id=? AND book_id=? AND COALESCE(deleted,0)=0
-                     ORDER BY position, id""", (project_id, book_id))
-        if fetchone:
-            return c.fetchone()
+    def chapter_content(self, chapter_id: int, version_id: int | None = None) -> str | None:
+        if version_id is None:
+            row = self.chapter_active_version_row(chapter_id)
+            return row["text"] if row else None
         else:
-            return c.fetchall()
+            return self.chapter_content_by_version(version_id)
+
+    def chapter_content_by_version(self, version_id: int) -> str | None:
+        c = self.conn.cursor()
+        c.execute("SELECT text FROM chapter_versions WHERE id=?", (version_id,))
+        row = c.fetchone()
+        return row["text"] if row else None
+
+    def chapter_version_hash(self, version_id: int) -> str | None:
+        c = self.conn.cursor()
+        c.execute("SELECT text_hash FROM chapter_versions WHERE id=?", (version_id,))
+        r = c.fetchone()
+        return r["text_hash"] if r else None
+
+    def chapter_list(self, project_id: int, book_id: int, fetchone: bool=False) -> list[sqlite3.Row] | sqlite3.Row | None:
+        c = self.conn.cursor()
+        c.execute("""SELECT id, title, position, active_version_id
+                    FROM chapters
+                    WHERE project_id=? AND book_id=? AND COALESCE(deleted,0)=0
+                    ORDER BY position, id""", (project_id, book_id))
+        return c.fetchone() if fetchone else c.fetchall()
+
+    def chapter_list_with_vermeta(self, project_id: int, book_id: int):
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT ch.id, ch.title, ch.position, ch.active_version_id,
+                cv.text_hash, LENGTH(cv.text) AS text_len
+            FROM chapters ch
+            LEFT JOIN chapter_versions cv ON cv.id = ch.active_version_id
+            WHERE ch.project_id=? AND ch.book_id=? AND COALESCE(ch.deleted,0)=0
+            ORDER BY ch.position, ch.id
+        """, (project_id, book_id))
+        return c.fetchall()
 
     def chapter_insert(self, project_id: int, book_id: int, position: int,
-                       title: str, content_md: str) -> int:
+                    title: str, content_md: str) -> int:
+        """
+        Creates a chapter and immediately creates an active chapter_version carrying `content_md`.
+        """
         c = self.conn.cursor()
-        c.execute("""INSERT INTO chapters(project_id, book_id, title, content, position)
-                     VALUES (?,?,?,?,?)""",
-                  (project_id, book_id, title, content_md, position))
+        print("Insert chapter:", project_id, book_id, position, title)
+        # Note: no 'content' here anymore; keep title/position on chapters
+        c.execute("""
+            INSERT INTO chapters(project_id, book_id, title, position, updated_at)
+            VALUES (?,?,?,?,CURRENT_TIMESTAMP)
+        """, (project_id, book_id, title, position))
+        chap_id = int(c.lastrowid)
+
+        # Seed first version and mark active
+        print("insert content:", content_md)
+        ver_id = self.create_chapter_version(chap_id, content_md or "", make_active=None)
+        # seed FTS if present
+        self.chapters_fts_upsert(chap_id, title, content_md or "")
+
         self.conn.commit()
-        return int(c.lastrowid)
+        return chap_id
 
     def chapter_update(self, chapter_id: int, *, title: Optional[str]=None,
-                       content_md: Optional[str]=None) -> None:
-        self.conn.execute("""UPDATE chapters
-                             SET title=COALESCE(?, title),
-                                 content=COALESCE(?, content),
-                                 updated_at=CURRENT_TIMESTAMP
-                             WHERE id=?""", (title, content_md, chapter_id))
-        self.conn.commit()
+                    content_md: Optional[str]=None) -> None:
+        """
+        Back-compat updater. Title is stored on chapters; text on active chapter_version.
+        Uses only DB helpers (no raw SQL here).
+        """
+        # title
+        if title is not None:
+            self.set_chapter_title(chapter_id, title)
+
+        # text (to active version)
+        if content_md is not None:
+            ver_id = self.ensure_active_version(chapter_id)
+            _, changed = self.set_chapter_version_text(ver_id, content_md)
+            # nothing else to do here; caller can decide whether to recompute refs/metrics
 
     def chapter_soft_delete(self, chapter_id: int) -> None:
         self.conn.execute("UPDATE chapters SET deleted=1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -215,6 +292,166 @@ class Database:
         self.conn.commit()
 
     # ---- Chapter versions / outline ----
+    # --- Active version accessors ----------------------------------------------
+
+    def _next_version_number(self, chapter_id: int) -> int:
+        c = self.conn.cursor()
+        c.execute("SELECT COALESCE(MAX(version_number), -1) AS mx FROM chapter_versions WHERE chapter_id=?",
+                (chapter_id,))
+        mx = c.fetchone()["mx"]
+        return int(mx) + 1
+
+    def create_chapter_version(self, chapter_id: int, text: str,
+                            make_active: bool | None = None) -> int:
+        # make_active: True = force; False = never; None = only if no active yet
+        if make_active is None and not self.get_active_version_id(chapter_id):
+            make_active = True
+        vn = self._next_version_number(chapter_id)
+        norm = _norm_for_hash(text); h = _sha1(norm)
+        c = self.conn.cursor()
+        c.execute("""
+            INSERT INTO chapter_versions
+            (chapter_id, version_number, text, text_hash, text_updated_at, format_updated_at)
+            VALUES (?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+        """, (chapter_id, vn, text, h))
+        ver_id = int(c.lastrowid)
+        if make_active:
+            c.execute("UPDATE chapters SET active_version_id=? WHERE id=?", (ver_id, chapter_id))
+        self.conn.commit()
+        return ver_id
+
+    def chapter_version_create_and_activate(self, chapter_id: int, seed_from_version_id: int | None = None) -> int:
+        if seed_from_version_id:
+            row = self.chapter_version_row(seed_from_version_id)
+            seed = row["text"] if row else ""
+        else:
+            # default seed from active version
+            row = self.chapter_active_version_row(chapter_id)
+            seed = row["text"] if row else ""
+        return self.create_chapter_version(chapter_id, seed, make_active=True)
+
+    def list_chapter_versions(self, chapter_id: int):
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT cv.id, cv.version_number, cv.text_hash, cv.text_updated_at, cv.format_updated_at,
+                CASE WHEN ch.active_version_id=cv.id THEN 1 ELSE 0 END AS is_active
+            FROM chapter_versions cv
+            JOIN chapters ch ON ch.id=cv.chapter_id
+            WHERE cv.chapter_id=?
+            ORDER BY cv.version_number ASC
+        """, (chapter_id,))
+        return c.fetchall()
+
+    def set_chapter_version_world_refs(self, chapter_version_id: int, world_ids: list[int]) -> None:
+        c = self.conn.cursor()
+        c.execute("DELETE FROM chapter_version_world_refs WHERE chapter_version_id=?", (chapter_version_id,))
+        uniq = sorted(set(int(w) for w in world_ids))
+        c.executemany("""INSERT OR IGNORE INTO chapter_version_world_refs(chapter_version_id, world_item_id)
+                        VALUES (?,?)""", [(chapter_version_id, wid) for wid in uniq])
+        self.conn.commit()
+
+    def copy_version_refs_to_chapter(self, chapter_id: int, chapter_version_id: int) -> None:
+        c = self.conn.cursor()
+        c.execute("""SELECT world_item_id FROM chapter_version_world_refs
+                    WHERE chapter_version_id=?""", (chapter_version_id,))
+        ids = [r["world_item_id"] for r in c.fetchall()]
+        self.set_chapter_world_refs(chapter_id, ids)
+
+    def ensure_active_version(self, chapter_id: int) -> int:
+        ver_id = self.get_active_version_id(chapter_id)
+        if ver_id:
+            return ver_id
+        # seed from legacy chapters.content if present
+        c = self.conn.cursor()
+        c.execute("PRAGMA table_info(chapters)")
+        has_content = any(col["name"] == "content" for col in c.fetchall())
+        seed = ""
+        if has_content:
+            c.execute("SELECT content FROM chapters WHERE id=?", (chapter_id,))
+            row = c.fetchone()
+            seed = row["content"] if row and row["content"] else ""
+        return self.create_chapter_version(chapter_id, seed, make_active=True)
+
+    def set_chapter_version_text(self, chapter_version_id: int, text: str) -> tuple[str, bool]:
+        """Returns (new_hash, changed:bool)."""
+        norm = _norm_for_hash(text); h = _sha1(norm)
+        c = self.conn.cursor()
+
+        # early-out if unchanged
+        c.execute("SELECT text_hash, chapter_id FROM chapter_versions WHERE id=?", (chapter_version_id,))
+        row = c.fetchone()
+        if not row:
+            return h, False
+        if row["text_hash"] == h:
+            return h, False
+
+        # update version text/hash
+        c.execute("""UPDATE chapter_versions
+                    SET text=?, text_hash=?, text_updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?""", (text, h, chapter_version_id))
+        self.conn.commit()
+
+        # if this version is active, refresh FTS
+        chap_id = row["chapter_id"]
+        c.execute("SELECT title, active_version_id FROM chapters WHERE id=?", (chap_id,))
+        crow = c.fetchone()
+        if crow and int(crow["active_version_id"] or 0) == int(chapter_version_id):
+            self.chapters_fts_upsert(chap_id, crow["title"], text)
+
+        return h, True
+
+    def touch_chapter_version_format(self, chapter_version_id: int):
+        c = self.conn.cursor()
+        c.execute("""UPDATE chapter_versions
+                    SET format_updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?""", (chapter_version_id,))
+        self.conn.commit()
+
+    def set_active_chapter_version(self, chapter_id: int, version_id: int) -> None:
+        c = self.conn.cursor()
+        c.execute("UPDATE chapters SET active_version_id=? WHERE id=?", (version_id, chapter_id))
+        self.conn.commit()
+        # keep chapter-level refs in sync with the chosen active
+        self.copy_version_refs_to_chapter(chapter_id, version_id)
+
+    def get_active_version_id(self, chapter_id: int) -> int | None:
+        c = self.conn.cursor()
+        c.execute("SELECT active_version_id FROM chapters WHERE id=?", (chapter_id,))
+        row = c.fetchone()
+        return int(row["active_version_id"]) if row and row["active_version_id"] else None
+
+    def chapter_version_row(self, version_id: int):
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM chapter_versions WHERE id=?", (version_id,))
+        return c.fetchone()
+
+    def chapter_active_version_row(self, chapter_id: int):
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT cv.*
+            FROM chapter_versions cv
+            JOIN chapters ch ON ch.id=cv.chapter_id
+            WHERE cv.chapter_id=? AND cv.id = ch.active_version_id
+            LIMIT 1
+        """, (chapter_id,))
+        return c.fetchone()
+
+
+    def set_chapter_title(self, chapter_id: int, title: str):
+        c = self.conn.cursor()
+        c.execute("""UPDATE chapters SET title=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (title, chapter_id))
+        self.conn.commit()
+
+    def chapter_active_text_and_hash(self, chapter_id: int) -> tuple[str, str | None, int | None]:
+        row = self.chapter_active_version_row(chapter_id)
+        if not row:
+            return "", None, None
+        text      = row["text"] if "text" in row.keys() else ""
+        text_hash = row["text_hash"] if "text_hash" in row.keys() else None
+        ver_id    = row["id"] if "id" in row.keys() else None
+        return (text or "", text_hash, ver_id)
+
     def chapter_active_version_id(self, chapter_id: int) -> int:
         c = self.conn.cursor()
         c.execute("""SELECT id FROM chapter_versions
@@ -432,7 +669,16 @@ class Database:
                      WHERE project_id=? AND category_id=? AND COALESCE(deleted,0)=0
                      ORDER BY position, id""", (project_id, category_id))
         return c.fetchall()
-    
+
+    def world_items_grouped(self):
+        q = """
+        SELECT id, title, COALESCE(kind,'') AS kind
+        FROM world_items
+        WHERE COALESCE(deleted,0)=0
+        ORDER BY LOWER(title)
+        """
+        return self.conn.execute(q).fetchall()
+
     def world_item_is_character(self, world_item_id: int) -> bool:
         c = self.conn.cursor()
         c.execute("SELECT type FROM world_items WHERE id=?", (world_item_id,))
@@ -516,6 +762,156 @@ class Database:
     def world_item_soft_delete(self, world_item_id: int) -> None:
         self.conn.execute("UPDATE world_items SET deleted=1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                           (world_item_id,))
+        self.conn.commit()
+
+    # --- World aliases/titles (phrases to world IDs)
+
+    def world_phrases_for_project(self, project_id: int) -> list[tuple[int, str]]:
+        """
+        Returns [(world_item_id, phrase), ...] across titles + aliases (non-deleted), trimmed & lowercased.
+        """
+        c = self.conn.cursor()
+        rows = []
+
+        c.execute("""
+            SELECT id AS world_item_id, title AS phrase
+            FROM world_items
+            WHERE project_id=? AND COALESCE(deleted,0)=0 AND title IS NOT NULL AND TRIM(title)!=''
+        """, (project_id,))
+        rows += [(r["world_item_id"], r["phrase"]) for r in c.fetchall()]
+
+        c.execute("""
+            SELECT wa.world_item_id, wa.alias AS phrase
+            FROM world_aliases wa
+            JOIN world_items wi ON wi.id=wa.world_item_id
+            WHERE wi.project_id=? AND COALESCE(wa.deleted,0)=0
+                AND wa.alias IS NOT NULL AND TRIM(wa.alias)!=''
+        """, (project_id,))
+        rows += [(r["world_item_id"], r["phrase"]) for r in c.fetchall()]
+
+        # normalize: collapse spaces and lowercase
+        out = []
+        for wid, phrase in rows:
+            p = " ".join(phrase.strip().split()).lower()
+            if p:
+                out.append((wid, p))
+        return out
+
+
+    def set_chapter_world_refs(self, chapter_id: int, world_ids: Sequence[int]) -> None:
+        """
+        Replaces all refs for `chapter_id` with the provided `world_ids` (deduped).
+        """
+        c = self.conn.cursor()
+        c.execute("DELETE FROM chapter_world_refs WHERE chapter_id=?", (chapter_id,))
+        uniq = sorted(set(int(w) for w in world_ids))
+        c.executemany("""INSERT OR IGNORE INTO chapter_world_refs(chapter_id, world_item_id)
+                        VALUES (?,?)""", [(chapter_id, wid) for wid in uniq])
+        self.conn.commit()
+
+
+    # --- Ingest candidates (basic helpers)
+
+    def ingest_candidates_by_chapter(self, chapter_id: int, version_id: int | None = None,
+                                    statuses: tuple[str,...] = ("pending",)):
+        q, args = ["chapter_id=?"], [chapter_id]
+        if version_id is None:
+            av = self.get_active_version_id(chapter_id)
+            if av:
+                q.append("chapter_version_id=?"); args.append(av)
+        else:
+            q.append("chapter_version_id=?"); args.append(int(version_id))
+        if statuses:
+            q.append("status IN ({})".format(",".join("?"*len(statuses))))
+            args.extend(statuses)
+        sql = f"SELECT * FROM ingest_candidates WHERE {' AND '.join(q)} ORDER BY id DESC"
+        print("ingest_candidates_by_chapter query:", sql, args)
+        return self.conn.execute(sql, args).fetchall()
+
+    def ingest_candidate_upsert(self, project_id: int, chapter_id: int, chapter_version_id: int | None,
+                                surface: str, kind_guess: str | None, context: str | None,
+                                start_off: int | None, end_off: int | None, confidence: float | None,
+                                status: str = "pending") -> int:
+        """
+        Upserts by (project_id, chapter_id, lower(surface), start_off, end_off) so we don't spam dupes.
+        If a previously rejected exists, keep it rejected unless explicitly changed.
+        """
+        c = self.conn.cursor()
+
+        srf = (surface or "").strip()            # exact, no .lower()
+        vkey = int(chapter_version_id) if chapter_version_id is not None else -1
+        so   = int(start_off) if start_off is not None else -1
+        eo   = int(end_off) if end_off is not None else -1
+
+        c.execute("""
+            SELECT id, status FROM ingest_candidates
+            WHERE project_id=? AND chapter_id=? AND IFNULL(chapter_version_id,-1)=?
+            AND surface=? AND IFNULL(start_off,-1)=? AND IFNULL(end_off,-1)=?
+            LIMIT 1
+        """, (project_id, chapter_id, vkey, srf, so, eo))
+        row = c.fetchone()
+
+        if row:
+            # Do not revive accepted/rejected/linked
+            if row["status"] in ("accepted", "rejected", "linked"):
+                return int(row["id"])
+            # Update pending with any improvements
+            c.execute("""UPDATE ingest_candidates
+                        SET kind_guess=COALESCE(?, kind_guess),
+                            context=COALESCE(?, context),
+                            confidence=COALESCE(?, confidence)
+                        WHERE id=?""",
+                    (kind_guess, context, confidence, row["id"]))
+            self.conn.commit()
+            return int(row["id"])
+
+        c.execute("""INSERT INTO ingest_candidates
+                    (project_id, chapter_id, chapter_version_id, surface, kind_guess, context,
+                    start_off, end_off, confidence, status)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (project_id, chapter_id, vkey, srf, kind_guess, context, so, eo, confidence, status))
+        self.conn.commit()
+        return int(c.lastrowid)
+
+    def ingest_candidate_set_status(self, candidate_id: int, status: str):
+        self.conn.execute("UPDATE ingest_candidates SET status=? WHERE id=?", (status, candidate_id))
+        self.conn.commit()
+
+    def ingest_candidate_link_world(self, candidate_id: int, world_item_id: int):
+        self.conn.execute("UPDATE ingest_candidates SET link_world_id=? WHERE id=?",
+                (world_item_id, candidate_id))
+        self.conn.commit()
+
+    # --- Metrics cache ----------------------------------------------------------
+
+    def metrics_get(self, chapter_id: int, chapter_version_id: int, source_hash: str):
+        c = self.conn.cursor()
+        c.execute("""SELECT * FROM chapter_metrics
+                    WHERE chapter_id=? AND chapter_version_id=? AND source_hash=? LIMIT 1""",
+                (chapter_id, chapter_version_id, source_hash))
+        return c.fetchone()
+
+    def metrics_upsert(self, chapter_id: int, chapter_version_id: int, source_hash: str, m: dict):
+        c = self.conn.cursor()
+        # try update
+        c.execute("""UPDATE chapter_metrics
+                    SET word_count=?, char_count=?, paragraph_count=?, sentence_count=?,
+                        avg_sentence_len=?, type_token_ratio=?, dialogue_words=?, dialogue_ratio=?,
+                        reading_secs=?, est_pages=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE chapter_id=? AND chapter_version_id=? AND source_hash=?""",
+                (m["word_count"], m["char_count"], m["paragraph_count"], m["sentence_count"],
+                m["avg_sentence_len"], m["type_token_ratio"], m["dialogue_words"], m["dialogue_ratio"],
+                m["reading_secs"], m["est_pages"], chapter_id, chapter_version_id, source_hash))
+        if c.rowcount == 0:
+            c.execute("""INSERT INTO chapter_metrics
+                        (chapter_id, chapter_version_id, source_hash, word_count, char_count,
+                        paragraph_count, sentence_count, avg_sentence_len, type_token_ratio,
+                        dialogue_words, dialogue_ratio, reading_secs, est_pages)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (chapter_id, chapter_version_id, source_hash, m["word_count"], m["char_count"],
+                    m["paragraph_count"], m["sentence_count"], m["avg_sentence_len"],
+                    m["type_token_ratio"], m["dialogue_words"], m["dialogue_ratio"],
+                    m["reading_secs"], m["est_pages"]))
         self.conn.commit()
 
     # --- Characters ---
@@ -639,16 +1035,28 @@ class Database:
 
     # ---- FTS (chapter & world)
     def fts_rebuild(self) -> None:
-        self.conn.execute("INSERT INTO chapters_fts(chapters_fts) VALUES('rebuild')")
-        self.conn.execute("INSERT INTO world_items_fts(world_items_fts) VALUES('rebuild')")
-        self.conn.commit()
+        """Rebuild FTS tables if they exist."""
+        if self._has_table("fts_chapters"):
+            self.conn.execute("INSERT INTO chapters_fts(chapters_fts) VALUES('rebuild')")
+            self.conn.execute("INSERT INTO world_items_fts(world_items_fts) VALUES('rebuild')")
+            self.conn.commit()
 
-    # ---- References (chapter ↔ world)
-    def set_chapter_world_refs(self, chapter_id: int, world_ids: Sequence[int]) -> None:
+    def chapters_fts_upsert(self, chapter_id: int, title: str, text: str) -> None:
+        """Refresh FTS row for a chapter. No-op if FTS table doesn't exist."""
+        if not self._has_table("chapters_fts"):
+            return
         c = self.conn.cursor()
-        c.execute("DELETE FROM chapter_world_refs WHERE chapter_id=?", (chapter_id,))
-        c.executemany("""INSERT OR IGNORE INTO chapter_world_refs(chapter_id, world_item_id)
-                         VALUES (?,?)""", [(chapter_id, wid) for wid in world_ids])
+        # delete old FTS row then insert fresh
+        c.execute("INSERT INTO chapters_fts(chapters_fts, rowid, title, content_md) VALUES('delete', ?, ?, ?)",
+                (chapter_id, title or "", text or ""))
+        c.execute("INSERT INTO chapters_fts(rowid, title, content_md) VALUES(?, ?, ?)",
+                (chapter_id, title or "", text or ""))
+
+    # ---- Helpers
+    def _has_table(self, name: str) -> bool:
+        c = self.conn.cursor()
+        c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,))
+        return c.fetchone() is not None
         self.conn.commit()
 
     # ---- Transactions (optional helpers)

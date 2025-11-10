@@ -38,7 +38,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         project_id INTEGER NOT NULL,
         book_id INTEGER,
         title TEXT NOT NULL,
-        content TEXT,
+        active_version_id INTEGER,
         deleted BOOLEAN DEFAULT 0,
         position INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -46,15 +46,20 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         FOREIGN KEY(project_id) REFERENCES projects(id),
         FOREIGN KEY(book_id) REFERENCES books(id)
     );
+    CREATE INDEX IF NOT EXISTS idx_chapters_active_version ON chapters(active_version_id);
+
     CREATE TABLE IF NOT EXISTS chapter_versions (
         id INTEGER PRIMARY KEY,
         chapter_id INTEGER NOT NULL,
         version_number INTEGER NOT NULL,
-        content TEXT,
+        text TEXT,
+        text_hash TEXT,
         name TEXT,                     -- optional label like “Draft A”
         is_active INTEGER DEFAULT 1,   -- one active per chapter at a time
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        text_updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        format_updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(chapter_id) REFERENCES chapters(id)
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_chver_active
@@ -90,6 +95,22 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(chapter_id) REFERENCES chapters(id)
     );
+
+    -- Version-keyed metrics cache (fast aggregate views later)
+    CREATE TABLE IF NOT EXISTS chapter_metrics (
+        id INTEGER PRIMARY KEY,
+        chapter_id INTEGER NOT NULL,
+        chapter_version_id INTEGER NOT NULL,
+        source_hash TEXT NOT NULL,       -- the chapter_versions.text_hash used
+        word_count INTEGER, char_count INTEGER,
+        paragraph_count INTEGER, sentence_count INTEGER,
+        avg_sentence_len REAL, type_token_ratio REAL,
+        dialogue_words INTEGER, dialogue_ratio REAL,
+        reading_secs INTEGER, est_pages REAL,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_metrics_source
+        ON chapter_metrics(chapter_id, chapter_version_id, source_hash);
     """)
 
     # --- Worldbuilding ---
@@ -214,9 +235,28 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(chapter_id) REFERENCES chapters(id),
             FOREIGN KEY(world_item_id) REFERENCES world_items(id)
         );
+        -- Versioned facts with quotes & anchors
+        CREATE TABLE IF NOT EXISTS world_facts (
+            id INTEGER PRIMARY KEY,
+            world_item_id INTEGER NOT NULL,
+            chapter_id INTEGER NOT NULL,
+            chapter_version_id INTEGER NOT NULL,
+            start_off INTEGER NOT NULL,
+            end_off INTEGER NOT NULL,
+            quote_text TEXT NOT NULL,
+            label TEXT,                      -- e.g., 'goal', 'appearance', 'membership'
+            value TEXT,                      -- parsed value if structured
+            status TEXT DEFAULT 'fresh',     -- fresh/stale/confirmed
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS chapter_version_world_refs (
+            chapter_version_id INTEGER NOT NULL,
+            world_item_id INTEGER NOT NULL,
+            PRIMARY KEY (chapter_version_id, world_item_id)
+        );
     """)
 
-    # --- Progress & UI Prefs ---
+    # --- Progress & UI Prefs & analaysis ---
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS progress_log (
         id INTEGER PRIMARY KEY,
@@ -242,36 +282,60 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         UNIQUE(project_id, key),
         FOREIGN KEY(project_id) REFERENCES projects(id)
     );
+    -- Suggestions (pending/accepted/rejected) per chapter
+    CREATE TABLE IF NOT EXISTS ingest_candidates (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL,
+        chapter_id INTEGER NOT NULL,
+        chapter_version_id INTEGER NOT NULL,
+        surface TEXT NOT NULL,
+        kind_guess TEXT,                 -- character/place/org/object/concept
+        context TEXT,                    -- nearby text snippet
+        start_off INTEGER NOT NULL, end_off INTEGER NOT NULL,
+        link_world_id INTEGER,           -- if user links it
+        status TEXT DEFAULT 'pending',   -- pending/accepted/rejected
+        confidence REAL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ingest_key
+        ON ingest_candidates(project_id, chapter_id, chapter_version_id, surface, start_off, end_off);
+    CREATE INDEX IF NOT EXISTS idx_ingest_by_chapter_status
+        ON ingest_candidates(chapter_id, status);
+    CREATE INDEX IF NOT EXISTS idx_ingest_by_chap_ver
+        ON ingest_candidates(chapter_id, chapter_version_id, status);
+    CREATE INDEX IF NOT EXISTS idx_ingest_surface
+        ON ingest_candidates(project_id, chapter_id, surface);
     """)
 
-    # --- FTS5 (search) ---
-    try:
-        cur.executescript("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS chapters_fts USING fts5(title, content, content='chapters', content_rowid='id');
-        CREATE TRIGGER IF NOT EXISTS chapters_ai AFTER INSERT ON chapters BEGIN
-            INSERT INTO chapters_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
-        END;
-        CREATE TRIGGER IF NOT EXISTS chapters_au AFTER UPDATE ON chapters BEGIN
-            INSERT INTO chapters_fts(chapters_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
-            INSERT INTO chapters_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
-        END;
-        CREATE TRIGGER IF NOT EXISTS chapters_ad AFTER DELETE ON chapters BEGIN
-            INSERT INTO chapters_fts(chapters_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
-        END;
+    # # --- FTS5 (search) ---
+    # try:
+    #     cur.executescript("""
+    #      -- contentless FTS; we push data from Python
+    #     CREATE VIRTUAL TABLE IF NOT EXISTS chapters_fts USING fts5(title, content_md);
+    #     CREATE VIRTUAL TABLE IF NOT EXISTS world_items_fts USING fts5(title, content_md);
+    #     CREATE TRIGGER IF NOT EXISTS chapters_ai AFTER INSERT ON chapters BEGIN
+    #         INSERT INTO chapters_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+    #     END;
+    #     CREATE TRIGGER IF NOT EXISTS chapters_au AFTER UPDATE ON chapters BEGIN
+    #         INSERT INTO chapters_fts(chapters_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+    #         INSERT INTO chapters_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+    #     END;
+    #     CREATE TRIGGER IF NOT EXISTS chapters_ad AFTER DELETE ON chapters BEGIN
+    #         INSERT INTO chapters_fts(chapters_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+    #     END;
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS world_items_fts USING fts5(title, content_md, content='world_items', content_rowid='id');
-        CREATE TRIGGER IF NOT EXISTS wi_ai AFTER INSERT ON world_items BEGIN
-            INSERT INTO world_items_fts(rowid, title, content_md) VALUES (new.id, new.title, new.content_md);
-        END;
-        CREATE TRIGGER IF NOT EXISTS wi_au AFTER UPDATE ON world_items BEGIN
-            INSERT INTO world_items_fts(world_items_fts, rowid, title, content_md) VALUES('delete', old.id, old.title, old.content_md);
-            INSERT INTO world_items_fts(rowid, title, content_md) VALUES (new.id, new.title, new.content_md);
-        END;
-        CREATE TRIGGER IF NOT EXISTS wi_ad AFTER DELETE ON world_items BEGIN
-            INSERT INTO world_items_fts(world_items_fts, rowid, title, content_md) VALUES('delete', old.id, old.title, old.content_md);
-        END;
-        """)
-    except sqlite3.Error as e:
-        print("[warn] FTS5 unavailable or failed to create:", e)
+    #     CREATE TRIGGER IF NOT EXISTS wi_ai AFTER INSERT ON world_items BEGIN
+    #         INSERT INTO world_items_fts(rowid, title, content_md) VALUES (new.id, new.title, new.content_md);
+    #     END;
+    #     CREATE TRIGGER IF NOT EXISTS wi_au AFTER UPDATE ON world_items BEGIN
+    #         INSERT INTO world_items_fts(world_items_fts, rowid, title, content_md) VALUES('delete', old.id, old.title, old.content_md);
+    #         INSERT INTO world_items_fts(rowid, title, content_md) VALUES (new.id, new.title, new.content_md);
+    #     END;
+    #     CREATE TRIGGER IF NOT EXISTS wi_ad AFTER DELETE ON world_items BEGIN
+    #         INSERT INTO world_items_fts(world_items_fts, rowid, title, content_md) VALUES('delete', old.id, old.title, old.content_md);
+    #     END;
+    #     """)
+    # except sqlite3.Error as e:
+    #     print("[warn] FTS5 unavailable or failed to create:", e)
 
     conn.commit()

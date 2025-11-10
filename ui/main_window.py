@@ -2,7 +2,9 @@ import json
 import re, sqlite3
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QSize, Slot, QEvent, QRectF, QDateTime, QSignalBlocker, Signal, QObject, QSettings
+from PySide6.QtCore import (
+    Qt, QTimer, QSize, Slot, QEvent, QRectF, QDateTime, QSignalBlocker, Signal, QObject, QSettings, QPoint
+)
 from PySide6.QtGui import QAction, QKeySequence, QIcon, QPainter, QPixmap, QPen, QIcon, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
@@ -11,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialog, QSizePolicy, QInputDialog, QMenu, QToolButton, QHBoxLayout,
     QWidgetAction, QAbstractItemDelegate, QStyle, QApplication, QComboBox
 )
+from ui.widgets.extract_pane import ExtractPane
 from ui.widgets.theme_manager import theme_manager
 from ui.widgets.ui_zoom import UiZoom
 from database.db import Database
@@ -31,6 +34,7 @@ from utils.files import parse_chapter_filename
 from ui.widgets.outline import OutlineWorkspace
 from ui.widgets.outline import MiniOutlineTab
 from ui.widgets.outline.window import OutlineWindow
+from ui.widgets.extract import build_candidates, compute_metrics, drop_overlapped_shorter, find_known_spans, heuristic_candidates_spacy, heuristic_new_entity_candidates, spacy_candidates, noun_chunk_candidates, spacy_candidates_strict, spacy_doc
 
 class StoryArkivist(QMainWindow):
     chaptersOrderChanged = Signal(int, int, 'QVariantList')
@@ -284,7 +288,7 @@ class StoryArkivist(QMainWindow):
         base = self.db.chapter_last_position_index(pid, bid) + 1
 
         # C1: 1 mention
-        c1 = self.db.chapter_insert(pid, bid, base+0, "Prologue", "The sun rose over the Temple of Dawn.")
+        c1 = self.db.chapter_insert(pid, bid, base+0, "Prologue", "The sun rose over the Temple of Dawn. John watched it from the Temple of Dusk. The Temple of Dawn was beautiful.")
         # C2: 2 mentions
         c2 = self.db.chapter_insert(pid, bid, base+1, "Meeting", "Markus waited at the Black Gate for Solara's sign.")
         # C3: 3 mentions
@@ -461,6 +465,115 @@ class StoryArkivist(QMainWindow):
         self.centerStatus.set_dirty()
         self.setWindowModified(True)
 
+    def _selected_text_or_word(self) -> str:
+        cur = self.centerEdit.textCursor()
+        text = cur.selectedText()
+        if not text:
+            cur.select(cur.WordUnderCursor)
+            text = cur.selectedText()
+        # QTextEdit uses U+2029 etc. Replace with spaces.
+        return (text or "").replace("\u2029"," ").replace("\u2028"," ").strip()
+
+    def _ctx_add_world_item_create(self, text: str):
+        title = (text or "").strip()
+        if not title:
+            return
+        # Ask for kind if unknown
+        kind = self._prompt_kind_for_new_item()
+        if not kind:
+            return
+        wid = self.find_or_create_world_item(title, kind)
+        # Optional: open detail
+        if wid and hasattr(self, "worldDetail"):
+            self.worldDetail.open_world_item(wid)
+
+    def _ctx_add_world_item_alias(self, text: str):
+        alias = (text or "").strip()
+        if not alias:
+            return
+        # pick target item (prefer characters, but let user choose)
+        wid = None
+        if hasattr(self.tabExtract, "_prompt_pick_world_item"):
+            wid = self.tabExtract._prompt_pick_world_item(prefill=alias)  # can pass restrict_kind="character" if you like
+        if not wid:
+            return
+        # alias type
+        if hasattr(self.tabExtract, "_prompt_alias_type"):
+            alias_type = self.tabExtract._prompt_alias_type()
+        else:
+            alias_type = "alias"
+        if not alias_type:
+            return
+        self.db.alias_add(wid, alias, alias_type)
+
+    def _ctx_link_dialog(self, text: str):
+        """
+        Open a generic link dialog: link selection to owner/setting/etc.
+        If you already have a link UI, call it here.
+        """
+        if hasattr(self, "open_link_dialog"):
+            self.open_link_dialog(initial_text=text)
+
+    def _ctx_search_in_chapter(self, text: str):
+        if not text:
+            return
+        # Reuse your editor's find panel if you have one
+        if hasattr(self, "open_find_panel_in_editor"):
+            self.open_find_panel_in_editor(self.centerEdit, text)
+        else:
+            self.centerEdit.find(text)
+
+    def _ctx_search_all_chapters(self, text: str):
+        if not text:
+            return
+        if hasattr(self, "open_global_search"):
+            self.open_global_search(scope="chapters", query=text)
+
+    def _ctx_search_world(self, text: str):
+        if not text:
+            return
+        if hasattr(self, "open_global_search"):
+            self.open_global_search(scope="world", query=text)
+
+    def _ctx_search_notes(self, text: str):
+        if not text:
+            return
+        if hasattr(self, "open_global_search"):
+            self.open_global_search(scope="notes", query=text)
+
+    def _on_center_context_menu(self, pos: QPoint):
+        sel = self._selected_text_or_word()
+        menu = self.centerEdit.createStandardContextMenu()
+        menu.addSeparator()
+
+        actCreate = menu.addAction(f"Add “{sel or '…'}” as new world item…")
+        actAlias  = menu.addAction(f"Add “{sel or '…'}” as alias to existing…")
+        actLink   = menu.addAction("Link…")  # owner/setting/etc.
+        menu.addSeparator()
+        actFindHere  = menu.addAction(f"Search here for “{sel or '…'}”")
+        actFindAll   = menu.addAction(f"Search all chapters for “{sel or '…'}”")
+        actFindWorld = menu.addAction(f"Search world items for “{sel or '…'}”")
+        actFindNotes = menu.addAction(f"Search notes for “{sel or '…'}”")
+
+        chosen = menu.exec_(self.centerEdit.mapToGlobal(pos))
+        if not chosen:
+            return
+
+        if chosen == actCreate:
+            self._ctx_add_world_item_create(sel)
+        elif chosen == actAlias:
+            self._ctx_add_world_item_alias(sel)
+        elif chosen == actLink:
+            self._ctx_link_dialog(sel)
+        elif chosen == actFindHere:
+            self._ctx_search_in_chapter(sel)
+        elif chosen == actFindAll:
+            self._ctx_search_all_chapters(sel)
+        elif chosen == actFindWorld:
+            self._ctx_search_world(sel)
+        elif chosen == actFindNotes:
+            self._ctx_search_notes(sel)
+
     def _center_toggle_mode(self):
         """Toggle center editor view/edit. Save on leaving Edit."""
         viewing = self.centerView.isVisible()
@@ -472,15 +585,13 @@ class StoryArkivist(QMainWindow):
         # toggle
         self._center_set_mode(view_mode=not viewing)
 
-    def _render_center_preview(self):
+    def _render_center_preview(self, version_id: int | None = None):
         """Render current chapter markdown to HTML in the preview."""
-        chap_id = getattr(self, "_current_chapter_id", None)
+        chap_id = self._current_chapter_id
         if chap_id is None:
             self.centerView.setHtml("<i>No chapter selected</i>")
             return
-        text = self.db.chapter_content(chap_id)
-        md = text if text else ""
-        # Use your existing markdown→html renderer if you have one; fallback simple:
+        md = self.db.chapter_content(chap_id, version_id=version_id) or ""
         html = md_to_html(md)
         self.centerView.setHtml(html)
 
@@ -1103,40 +1214,142 @@ class StoryArkivist(QMainWindow):
     def _row_for_chapter_id(self, chap_id: int) -> int:
         return self.db.chapter_meta(chap_id)["position"]
 
+    def _label_to_version_number(self, label: str) -> int | None:
+        """Parse 'vN' labels to N; returns None if it doesn't match."""
+        m = re.fullmatch(r"v(\d+)(?:\s*\(active\))?", label.strip())
+        return int(m.group(1)) if m else None
+
+    def _resolve_version_id_from_label(self, chap_id: int, label: str) -> int | None:
+        """
+        Try to map a UI label to a DB chapter_versions.id, using (in order):
+        1) outlineWorkspace.version_id_for_label (if present),
+        2) the version_number parsed from 'vN' labels,
+        3) fallback to active_version_id.
+        """
+        # 1) workspace-provided mapping
+        if hasattr(self.outlineWorkspace, "version_id_for_label"):
+            try:
+                vid = self.outlineWorkspace.version_id_for_label(chap_id, label)
+                if vid:
+                    return int(vid)
+            except Exception:
+                pass
+
+        # 2) 'vN' label → look up by version_number
+        vn = self._label_to_version_number(label)
+        if vn is not None:
+            c = self.db.conn.cursor()
+            c.execute("SELECT id FROM chapter_versions WHERE chapter_id=? AND version_number=?", (chap_id, vn))
+            row = c.fetchone()
+            if row:
+                return int(row["id"])
+
+        # 3) fallback: active
+        return self.db.get_active_version_id(chap_id)
+
+    def _create_new_version_from_current_view(self, chap_id: int, ui_label: str) -> int | None:
+        """
+        Clone current *viewed* text into a new DB version (NOT set active).
+        Returns new chapter_version_id. UI naming remains in outlineWorkspace.
+        """
+        seed_ver = self._view_version_id or self.db.get_active_version_id(chap_id)
+        md = self.db.chapter_content(chap_id, version_id=seed_ver) or ""
+        # create DB version (make_active=False so we don't flip the book's active)
+        new_ver_id = self.db.create_chapter_version(chap_id, md, make_active=False)
+        # Optional: if your outlineWorkspace can store the DB id for a label, attach it now:
+        if hasattr(self.outlineWorkspace, "bind_version_id_for_label"):
+            try:
+                self.outlineWorkspace.bind_version_id_for_label(chap_id, ui_label, new_ver_id)
+            except Exception:
+                pass
+        return new_ver_id
+
+    def _apply_view_version(self, chap_id: int, version_id: int | None):
+        """
+        Update editor + preview + Extract to reflect the 'viewed' version (does NOT change active).
+        """
+        self._view_version_id = version_id if version_id is not None else None
+
+        # Editor & preview
+        md = self.db.chapter_content(chap_id, version_id=self._view_version_id) or ""
+        self.centerEdit.blockSignals(True)
+        self.centerEdit.setPlainText(md)
+        self.centerEdit.blockSignals(False)
+        self._render_center_preview(version_id=self._view_version_id)
+
+        # Extract aligns to viewed version (no auto-parse here)
+        if hasattr(self, "tabExtract"):
+            self.tabExtract.set_chapter_version(chap_id, self._view_version_id)
+
+        # Optional: auto-parse the viewed version (toggle-able)
+        if getattr(self, "auto_parse_on_view_change", True):
+            self.cmd_quick_parse_chapter(chap_id, version_id=self._view_version_id)
+
+        # Keep mini outline in sync with workspace
+        if hasattr(self, "tabMiniOutline") and hasattr(self.tabMiniOutline, "refresh_from_workspace"):
+            self.tabMiniOutline.refresh_from_workspace()
+
     def _on_header_version_changed(self, name: str):
         chap_id = getattr(self, "_current_chapter_id", None)
         if not chap_id or not name:
             return
+
         if name == "➕ New version…":
-            # suggest v{n+1}
-            count = len(self.outlineWorkspace.versions_for_chapter_id(chap_id))
+            # suggest v{n+1} based on outlineWorkspace count (kept from your code)
+            try:
+                count = len(self.outlineWorkspace.versions_for_chapter_id(chap_id))
+            except Exception:
+                count = 0
             suggested = f"v{count+1}"
+
+            # prompt
             while True:
                 new_name, ok = QInputDialog.getText(self, "New version", "Version name:", text=suggested)
                 if not ok:
                     # restore selection to current version
-                    cur = self.outlineWorkspace.current_version_for_chapter_id(chap_id)
+                    cur = None
+                    try:
+                        cur = self.outlineWorkspace.current_version_for_chapter_id(chap_id)
+                    except Exception:
+                        pass
                     with QSignalBlocker(self.cmbChapterVersion):
-                        if cur: self.cmbChapterVersion.setCurrentText(cur)
+                        if cur:
+                            self.cmbChapterVersion.setCurrentText(cur)
                     return
                 new_name = new_name.strip()
                 if new_name:
                     break
                 QMessageBox.warning(self, "Name required", "Please provide a version name.")
 
-            self.outlineWorkspace.add_version_for_chapter_id(chap_id, new_name, clone_from_current=True)
-            # repopulate and select
-            self._populate_header_versions(chap_id)
+            # 1) Update outlineWorkspace model (your existing behavior)
+            try:
+                self.outlineWorkspace.add_version_for_chapter_id(chap_id, new_name, clone_from_current=True)
+            except Exception:
+                pass
+
+            # 2) Create a *DB* version cloned from current viewed version (NOT active)
+            new_ver_id = self._create_new_version_from_current_view(chap_id, new_name)
+
+            # 3) Rebuild header list and select the new label
+            if hasattr(self, "_populate_header_versions"):
+                self._populate_header_versions(chap_id)
             with QSignalBlocker(self.cmbChapterVersion):
                 self.cmbChapterVersion.setCurrentText(new_name)
-            return
-        # normal switch
-        self.outlineWorkspace.select_version_for_chapter_id(chap_id, name)
-        self.tabMiniOutline.refresh_from_workspace()
 
-        # row = self._current_outline_row()
-        # if row >= 0 and name:
-        #     self.outlineWorkspace.select_version_for_row(row, name)
+            # 4) Apply viewed version using the new DB id (if we have it)
+            self._apply_view_version(chap_id, new_ver_id)
+            return
+
+        # Normal switch to an existing label
+        # Tell workspace first (your behavior)
+        try:
+            self.outlineWorkspace.select_version_for_chapter_id(chap_id, name)
+        except Exception:
+            pass
+
+        # Resolve DB version id for this label and apply 'view'
+        ver_id = self._resolve_version_id_from_label(chap_id, name)
+        self._apply_view_version(chap_id, ver_id)
 
     def _add_center_editor(self):
         topBar = QWidget()
@@ -1162,7 +1375,10 @@ class StoryArkivist(QMainWindow):
 
         # Version toggle
         self.cmbChapterVersion = QComboBox(topBar)  # wherever your header widgets live
-        self.cmbChapterVersion.setMinimumWidth(140)
+        # self.cmbChapterVersion.setMinimumWidth(140)
+        self.cmbChapterVersion.setObjectName("cmbChapterVersion")
+        self.cmbChapterVersion.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.cmbChapterVersion.setToolTip("View a different version of this chapter")
         self.cmbChapterVersion.currentTextChanged.connect(self._on_header_version_changed)
 
         topLay = QHBoxLayout(topBar); topLay.setContentsMargins(0,0,0,0)
@@ -1223,6 +1439,10 @@ class StoryArkivist(QMainWindow):
 
         self.tabChanges  = PlainNoTab(); self.tabChanges.setPlaceholderText("Changes…")
         self.bottomTabs.addTab(self.tabChanges, "Changes")
+
+        # Extract tab
+        self.tabExtract = ExtractPane(self)
+        self.bottomTabs.addTab(self.tabExtract, "Extract")
 
         # Search results tab
         self.tabSearch   = QTreeWidget();    self.tabSearch.setHeaderLabels(["Result", "Where"])
@@ -1332,8 +1552,10 @@ class StoryArkivist(QMainWindow):
 
         # Center editor dirty tracking
         self.centerEdit.textChanged.connect(self._center_mark_dirty)
-        # Title changes should also mark the chapter dirty (respect Word lock inside _center_mark_dirty)
-        self.titleEdit.textEdited.connect(lambda _=None: self._center_mark_dirty())
+
+        # Center editor context menu
+        self.centerEdit.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.centerEdit.customContextMenuRequested.connect(self._on_center_context_menu)
 
         # Characters page signals
         # self.charactersPage.characterOpenRequested.connect(self.open_character_editor)
@@ -1866,7 +2088,6 @@ class StoryArkivist(QMainWindow):
                 base = title
                 # If the current text has "N. Title", prefer DB title we fetched; otherwise strip prefix from current text.
                 if not id_to_title:
-                    import re
                     base = re.sub(r"^\s*\d+\.\s+", "", ch.text(0)).strip()
                 ch.setText(0, chapter_display_label(pos, base))
                 pos += 1
@@ -1909,92 +2130,136 @@ class StoryArkivist(QMainWindow):
 
     def load_chapter(self, chap_id: int):
         """Load a chapter into the center pane. Saves current edits first."""
+        self._prepare_to_switch_chapter()
+
+        self._current_chapter_id = chap_id
+        self._view_version_id = None  # None => view active version
+
+        self.db.ensure_active_version(chap_id)
+
+        # DEBUG (kept)
+        txt, h, vid = self.db.chapter_active_text_and_hash(chap_id)
+        print("Active ver:", vid, "hash:", h, "len:", len(txt))
+
+        # Fetch title + active-version text
+        title, md = self._load_title_and_text(chap_id, version_id=None)
+
+        # Update center widgets (title + editor) & preview
+        self._apply_title_and_text(title, md)
+        self._show_view_mode()
+
+        # Tabs + trees that depend on current chapter
+        self._bind_bottom_tabs(chap_id)
+        self.populate_refs_tree(chap_id)
+        self.focus_chapter_in_tree(chap_id)
+
+        # Resolve outline row (kept exactly as your logic)
+        outline_row = self._resolve_outline_row(chap_id)
+
+        # Populate the version combo UI
+        self._populate_version_combo(outline_row, chap_id)
+
+        # Persist MRU
+        self._store_recent_chapter(chap_id)
+
+        # Keep mini pinned
+        self.tabMiniOutline.set_workspace(self.outlineWorkspace)
+        self.tabMiniOutline.set_chapter(self._current_chapter_id)
+
+    def _prepare_to_switch_chapter(self):
         # Save current if needed
         self.save_current_if_dirty()
 
-        self._current_chapter_id = chap_id
+    def _load_title_and_text(self, chap_id: int, version_id: int | None):
+        # Title from chapter meta
+        meta = self.db.chapter_meta(chap_id)
+        title = meta.get("title") if isinstance(meta, dict) else meta["title"]
+        # Text for active or a specific version
+        md = self.db.chapter_content(chap_id, version_id=version_id) or ""
+        return title or "", md
 
-        # --- fetch title/content from DB (unchanged) ---
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT title, content FROM chapters WHERE id=?", (chap_id,))
-        row = cur.fetchone()
-        title, md = ((row["title"], row["content"]) if isinstance(row, sqlite3.Row) else row) if row else ("", "")
-
-        # center title/content
+    def _apply_title_and_text(self, title: str, md: str):
         self.titleEdit.blockSignals(True)
-        self.titleEdit.setText(title or "")
+        self.titleEdit.setText(title)
         self.titleEdit.blockSignals(False)
 
         self.centerEdit.blockSignals(True)
-        self.centerEdit.setPlainText(md or "")
+        self.centerEdit.setPlainText(md)
         self.centerEdit.blockSignals(False)
 
         self._chapter_dirty = False
 
+    def _show_view_mode(self):
         if hasattr(self, "centerStatus"):
             self.centerStatus.show_neutral("Viewing")
-
-        # Always show View mode on load (per your preference)
-        self._render_center_preview()
+        self._render_center_preview(version_id=self._view_version_id)  # None => active
         self._center_set_mode(view_mode=True)
         self._update_word_sync_ui()
 
-        # tabs that depend on current chapter
+    def _bind_bottom_tabs(self, chap_id: int):
         self.tabTodos.set_chapter(chap_id)
-        self.populate_refs_tree(chap_id)
-        self.focus_chapter_in_tree(chap_id)
+        # Extract should NOT auto-parse here to avoid double inserts
+        self.tabExtract.set_chapter(chap_id)
+        if not hasattr(self, "extract_panes"):
+            self.extract_panes = {}
+        self.extract_panes[chap_id] = self.tabExtract
 
-        # --- resolve the *outline row* safely ---
-        # 1) try current selection in outline list
+    def _resolve_outline_row(self, chap_id: int) -> int:
         outline_row = self._current_outline_row()   # returns -1 if none
-        # 2) if none, try workspace id→row map
         if outline_row < 0 and hasattr(self.outlineWorkspace, "row_for_chapter_id"):
             outline_row = self.outlineWorkspace.row_for_chapter_id(chap_id)
-        # 3) if still none, default to 0 when the model has rows and select it
         ow_model = getattr(self.outlineWorkspace, "model", None)
         if (outline_row < 0) and ow_model and ow_model.rowCount() > 0:
             outline_row = 0
-            # keep the left list visually in sync (won't steal focus)
             try:
                 idx = ow_model.index(outline_row, 0)
-                # outline list widget may be named `list` in your workspace
                 outline_list = getattr(self.outlineWorkspace, "list", None)
                 if outline_list is not None:
                     outline_list.setCurrentIndex(idx)
             except Exception:
                 pass
+        return outline_row
 
-        # --- populate the center header version combo based on the resolved row ---
+    def _populate_version_combo(self, outline_row: int, chap_id: int):
         with QSignalBlocker(self.cmbChapterVersion):
             self.cmbChapterVersion.clear()
+
+            # Prefer your workspace-provided names if available
             versions = []
             current_name = ""
-
             if outline_row is not None and outline_row >= 0:
                 try:
                     versions = self.outlineWorkspace.versions_for_row(outline_row) or []
                     current_name = self.outlineWorkspace.current_version_for_row(outline_row) or (versions[0] if versions else "")
                 except Exception:
-                    # guard if workspace isn’t fully initialized yet
                     versions = []
                     current_name = ""
 
             if not versions:
-                versions = ["v1"]  # safe default if nothing is loaded yet
+                # Fallback to DB list (vN labels)
+                rows = self.db.list_chapter_versions(chap_id)  # [(id, version_number, ..., is_active)]
+                for r in rows:
+                    label = f"v{r['version_number']}" + ("  (active)" if r["is_active"] else "")
+                    self.cmbChapterVersion.addItem(label, userData=int(r["id"]))
+                # Select active
+                act = self.db.get_active_version_id(chap_id)
+                if act is not None:
+                    for i in range(self.cmbChapterVersion.count()):
+                        if self.cmbChapterVersion.itemData(i) == act:
+                            self.cmbChapterVersion.setCurrentIndex(i)
+                            break
+                return
 
+            # Workspace provided names (string list) path:
             self.cmbChapterVersion.addItems(versions)
             if current_name:
                 self.cmbChapterVersion.setCurrentText(current_name)
             else:
                 self.cmbChapterVersion.setCurrentIndex(0)
 
-        # set most recently viewed chapter (for use on reopen)
+    def _store_recent_chapter(self, chap_id: int):
         self.db.ui_pref_set(self._current_project_id, "outline:last_chapter_id", str(chap_id))
         self.db.ui_pref_set(self._current_project_id, f"chapters:last:{self._current_book_id}", str(chap_id))
-
-        # keep mini pinned
-        self.tabMiniOutline.set_workspace(self.outlineWorkspace)
-        self.tabMiniOutline.set_chapter(self._current_chapter_id)
 
     def mark_chapter_dirty(self):
         self._chapter_dirty = True
@@ -2016,74 +2281,208 @@ class StoryArkivist(QMainWindow):
             self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
 
     def save_current_if_dirty(self):
-        """Single place to persist all 'dirty' state for the current chapter + panels."""
+        """Persist dirty state for the current chapter + panels (no raw SQL here)."""
         chap_id = getattr(self, "_current_chapter_id", None)
         if chap_id is None:
             return
 
-        # 1) Word lock guard: skip editing content/title if this chapter is locked by Word
+        # 0) Word lock guard
         word_locked_id = getattr(self, "_word_lock_chapter_id", None)
         locked = (word_locked_id is not None and word_locked_id == chap_id)
 
+        text_changed = False
+
+        # 1) Chapter text -> active version
         if getattr(self, "_chapter_dirty", False) and not locked:
-            title = self.titleEdit.text().strip()
-            md    = self.centerEdit.toPlainText()
-            cur = self.db.conn.cursor()
-            cur.execute("UPDATE chapters SET title=?, content=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (title, md, chap_id))
-            self.db.conn.commit()
+            md = self.centerEdit.toPlainText()
+            ver_id = self.db.ensure_active_version(chap_id)
+            _, text_changed = self.db.set_chapter_version_text(ver_id, md)
             self._chapter_dirty = False
             if hasattr(self, "centerStatus"):
                 self.centerStatus.set_saved_now()
-            # mark chapter or word-cync dirty
-            self.setWindowModified(bool(self._chapter_dirty or getattr(self.worldDetail, "_dirty", False)))
+            # Update window modified indicator based on other panes
+            self.setWindowModified(bool(getattr(self.worldDetail, "_dirty", False)))
 
-            # Update preview + references (only if this is the active chapter)
-            self._render_center_preview()
-            self.recompute_chapter_references(chap_id, md)
-            self.populate_refs_tree(chap_id)
-            self.populate_chapters_tree()  # renumber labels if title changed
+            if text_changed:
+                # Update preview + references
+                self._render_center_preview()
+                self.recompute_chapter_references(chap_id, md)
+                self.populate_refs_tree(chap_id)
 
-        # 2) Persist To-Dos/Notes if your widgets track their own dirty state
+        # 2) Persist To-Dos/Notes
         if hasattr(self.tabTodos, "save_if_dirty"):
             self.tabTodos.save_if_dirty(chap_id)
 
-        # (Optional) if you add more bottom tabs with dirty state, call their save methods here.
+        # 3) If title autosaves elsewhere, optionally refresh chapter tree if its display depends on title
+        #    (Do not update title here anymore.)
+        self.populate_chapters_tree()  # harmless; keeps labels/ordering fresh
 
 
     # ---------- Reference extraction on save ----------
-    def recompute_chapter_references(self, chapter_id: int, text: str):
-        cur = self.db.conn.cursor()
+    def  recompute_chapter_references(self, chapter_id: int, text: str,
+                                    chapter_version_id: int | None = None) -> None:
+        """
+        Longest-phrase matching across titles + aliases.
+        No raw SQL here; use Database helpers only.
+        """
         pid = self._current_project_id
-        # Build alias map
-        name_map = {}
-        cur.execute("SELECT id, title FROM world_items WHERE project_id=? AND COALESCE(deleted,0)=0", (pid,))
-        for wid, title in cur.fetchall():
-            if title:
-                name_map.setdefault(title.lower(), set()).add(wid)
-        cur.execute("""
-            SELECT wa.world_item_id, wa.alias
-            FROM world_aliases wa
-            JOIN world_items wi ON wi.id=wa.world_item_id
-            WHERE wi.project_id=?
-        """, (pid,))
-        for wid, alias in cur.fetchall():
-            if alias:
-                name_map.setdefault(alias.lower(), set()).add(wid)
+        if chapter_version_id is None:
+            vr = self.db.chapter_active_version_row(chapter_id)
+            if not vr: return
+            chapter_version_id = vr["id"]
 
-        tokens = set(re.findall(r"\b[\w'-]+\b", (text or "").lower()))
-        found = set()
-        for tok in tokens:
-            if tok in name_map:
-                for wid in name_map[tok]:
-                    found.add(wid)
+        pairs = [(p, wid) for (wid, p) in self.db.world_phrases_for_project(pid)]
+        pairs.sort(key=lambda t: len(t[0]), reverse=True)
+        print(f"Recomputing refs for chapter {chapter_id} (ver {chapter_version_id}): {len(pairs)} phrases to match.")
 
-        cur.execute("DELETE FROM chapter_world_refs WHERE chapter_id=?", (chapter_id,))
-        cur.executemany(
-            "INSERT OR IGNORE INTO chapter_world_refs (chapter_id, world_item_id) VALUES (?, ?)",
-            [(chapter_id, wid) for wid in sorted(found)]
-        )
+        # Normalize haystack: lowercase, collapse whitespace
+        hay = re.sub(r"\s+", " ", (text or "").lower()).strip()
+        found_ids, used = set(), []
+        def overlaps(s,e): return any(not (e<=ps or s>=pe) for ps,pe in used)
+        for phrase, wid in pairs:
+            if not phrase: continue
+            for m in re.finditer(r"(?<!\w)"+re.escape(phrase)+r"(?!\w)", hay):
+                s,e = m.span()
+                if overlaps(s,e): continue
+                found_ids.add(int(wid)); used.append((s,e))
+
+        print(f"Found {len(found_ids)} referenced world items in chapter {chapter_id}.")
+        # write per-version
+        self.db.set_chapter_version_world_refs(chapter_version_id, sorted(found_ids))
+        # if this is the active version, mirror to chapter-level for legacy UI
+        av = self.db.get_active_version_id(chapter_id)
+        if av and int(av) == int(chapter_version_id):
+            self.db.set_chapter_world_refs(chapter_id, sorted(found_ids))
+
+    def dedup_candidates(self, candidates: list[dict], known_phrases: set[str]) -> list[dict]:
+        """Deduplicate candidate list by (surface.lower(), start_off, end_off)."""
+        seen = set()
+        uniq = []
+        for c in candidates:
+            key = (c["surface"].strip().lower(), c.get("start_off") or -1, c.get("end_off") or -1)
+            if key in seen:
+                continue
+            seen.add(key)
+            if c["surface"].strip().lower() not in known_phrases:
+                uniq.append(c)
+        return uniq
+
+    def cmd_quick_parse_chapter(self, chapter_id: int, version_id: int | None = None):
+        """
+        1) get active text/hash
+        2) compute metrics (cache keyed by version+hash)
+        3) build ingest candidates (heuristic + optional spaCy)
+        """
+        pid = self._current_project_id
+        if version_id is None:
+            text, text_hash, ver_id = self.db.chapter_active_text_and_hash(chapter_id)
+        else:
+            text = self.db.chapter_content(chapter_id, version_id=version_id) or ""
+            text_hash = self.db.chapter_version_hash(version_id)
+            ver_id = version_id
+        if ver_id is None:
+            return
+
+        # (2) metrics cache
+        mrow = self.db.metrics_get(chapter_id, ver_id, text_hash or "")
+        if not mrow:
+            metrics = compute_metrics(text)
+            self.db.metrics_upsert(chapter_id, ver_id, text_hash or "", metrics)
+
+        # (3) build candidates (Always add spaCy ents)
+        known = {p for _, p in self.db.world_phrases_for_project(pid)}  # lowercased
+        cand = spacy_candidates_strict(text, known_phrases=known) # default: spaCy only
+        # cand = build_candidates(text, known, super_lenient=getattr(self, "extract_lenient", False))
+
+        # Optionally add a stricter heuristic supplement *inside* sentences:
+        if getattr(self, "extract_use_heuristics", False):
+            doc = spacy_doc(text)
+            supplement = heuristic_candidates_spacy(doc, find_known_spans(text, known)) if doc else []
+            cand = drop_overlapped_shorter(cand + supplement)
+
+        print("Quick parse found", len(cand), "candidates.")
+        # persist (upserts; version-aware)
+        for c in cand:
+            self.db.ingest_candidate_upsert(
+                project_id=pid, chapter_id=chapter_id, chapter_version_id=ver_id,
+                surface=c["surface"], kind_guess=c.get("kind_guess"), context=None,
+                start_off=c.get("start_off"), end_off=c.get("end_off"),
+                confidence=c.get("confidence"), status="pending"
+            )
+
+        # recompute refs for the viewed version only
+        self.recompute_chapter_references(chapter_id, text, chapter_version_id=ver_id)
+
+    def on_view_version_changed(self, version_id: int | None):
+        """User changed the viewed version (does NOT change the book's active version)."""
+        chap_id = getattr(self, "_current_chapter_id", None)
+        if chap_id is None: return
+        self._view_version_id = version_id  # remember selection if you like
+
+        # Render preview + refresh Extract against the viewed version
+        self._render_center_preview(version_id=version_id)
+        if hasattr(self, "tabExtract"):
+            self.tabExtract.set_chapter_version(chap_id, version_id)
+
+        # Optional: auto-parse on view change (toggle-able)
+        auto = getattr(self, "auto_parse_on_view_change", True)
+        if auto:
+            self.cmd_quick_parse_chapter(chap_id, version_id=version_id)
+
+    def create_person_from_selection(self, text: str):
+        choice = self.tabExtract._prompt_person_choice(text)
+        if choice == "alias":
+            wid = self.tabExtract._prompt_pick_world_item(prefill=text, restrict_kind="character")
+            if wid:
+                alias_type = self.tabExtract._prompt_alias_type()
+                if alias_type:
+                    self.db.alias_add(wid, text, alias_type)
+        elif choice == "create":
+            self.find_or_create_world_item(text, "character")
+
+    def find_or_create_world_item(self, title_or_alias: str, kind: str) -> int | None:
+        """
+        Try to resolve an existing world item by title or alias (case-insensitive).
+        If none, create a minimal new one and return its id.
+        """
+        c = self.db.conn.cursor()
+        pid = self._current_project_id
+        t = title_or_alias.strip()
+        # resolve by title
+        c.execute("""SELECT id FROM world_items
+                    WHERE project_id=? AND LOWER(title)=LOWER(?) AND COALESCE(deleted,0)=0 LIMIT 1""",
+                (pid, t))
+        r = c.fetchone()
+        if r:
+            return int(r["id"])
+        # resolve by alias
+        c.execute("""SELECT wa.world_item_id AS id
+                    FROM world_aliases wa JOIN world_items wi ON wi.id=wa.world_item_id
+                    WHERE wi.project_id=? AND LOWER(wa.alias)=LOWER(?) AND COALESCE(wa.deleted,0)=0
+                    LIMIT 1""", (pid, t))
+        r = c.fetchone()
+        if r:
+            return int(r["id"])
+        # create minimal
+        c.execute("""INSERT INTO world_items (project_id, type, title)
+                    VALUES (?,?,?)""", (pid, kind, t))
+        wid = int(c.lastrowid)
         self.db.conn.commit()
+        return wid
+
+    def ensure_world_item_from_candidate(self, cand_row) -> int | None:
+        title = (cand_row["surface"] or "").strip()
+        kind = (cand_row["kind_guess"] or "").strip()
+        if not kind:
+            kind = self._prompt_kind_for_new_item()
+            if not kind:
+                return None
+        return self.find_or_create_world_item(title, kind)
+
+    def _prompt_kind_for_new_item(self) -> str | None:
+        kinds = ["character","place","organization","object","concept"]
+        kind, ok = QInputDialog.getItem(self, "Categorize item", "Choose a type:", kinds, 0, False)
+        return kind if ok else None
 
     # ---------- Render world MD with auto-links ----------
     def rebuild_world_item_render(self, world_item_id: int):
@@ -2598,6 +2997,7 @@ class StoryArkivist(QMainWindow):
         """
         # Save chapter-related dirty state
         self.save_current_if_dirty()
+        self.autosave_chapter_title()  # already wired via editingFinished; still nice on Ctrl+S
 
         # Save world item if its widget reports being dirty
         if hasattr(self, "worldDetail") and hasattr(self.worldDetail, "_save_current_if_dirty"):

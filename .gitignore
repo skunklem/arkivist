@@ -187,6 +187,8 @@ app2*.py
 storyarkivist_bad_refactor/
 test.ipynb
 dev*.py
+story_arkivist.db
+story_arkivist.db*
 # DEPRECATED:
 outline_model.py
 outline_panel.py
