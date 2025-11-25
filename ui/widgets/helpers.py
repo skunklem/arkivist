@@ -1,5 +1,6 @@
+import re
 from PySide6.QtWidgets import QWidget, QPlainTextEdit, QSizePolicy, QTableWidget
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QUrl, QUrlQuery
 
 class DropPane(QWidget):
     fileDropped = Signal(list)  # list[str]
@@ -95,3 +96,44 @@ def chapter_display_label(index_zero_based: int, title: str) -> str:
     # tweak to your policy (Prologue, Parts, “Ch. N — Title”, etc.)
     n = index_zero_based + 1
     return f"{n}. {title}" if title else f"Chapter {n}"
+
+def parse_internal_url(qurl: QUrl):
+    s = qurl.scheme()
+    if s == "world":
+        # world://item/123 or world://123
+        m = re.search(r'^world://(?:item/)?(\d+)', qurl.toString())
+        if m: return {"kind":"world","id": int(m.group(1))}
+        return None
+    if s == "suggest":
+        # suggest://quick/123  or suggest://ai/456
+        m = re.search(r'^suggest://([^/]+)/(\d+)', qurl.toString())
+        if m: return {"kind":"suggest","source": m.group(1), "id": int(m.group(2))}
+        return None
+    return None
+
+
+_MD_ESC = re.compile(r"\\([\\`\*\[\]\(\)\{\}\.\!\?\,\;\:\#\+\-\_])")
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_CODEBLOCK = re.compile(r"(?s)```.*?```")
+_MD_INLINECODE = re.compile(r"`[^`]+`")
+_MD_FMT = re.compile(r"(\*{1,3}|_{1,3}|~~|^>+|\#{1,6})")
+
+def scrub_markdown_for_ner(md: str) -> str:
+    t = md or ""
+    t = _MD_CODEBLOCK.sub(" ", t)
+    t = _MD_INLINECODE.sub(" ", t)
+    t = _MD_LINK.sub(r"\1", t)         # keep the link text
+    t = _MD_ESC.sub(r"\1", t)          # unescape \. \! \?
+    t = _MD_FMT.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+_POSSESSIVE = re.compile(r"(?i)\b(.+?)'s\b")
+
+def normalize_possessive(surface: str) -> tuple[str, bool]:
+    m = _POSSESSIVE.fullmatch(surface.strip())
+    if m:
+        print("normalize_possessive:", surface, m, m.group(1), True)
+        return m.group(1), True
+    print("normalize_possessive:", surface, m, "No match", False)
+    return surface, False

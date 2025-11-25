@@ -4,9 +4,13 @@ from pathlib import Path
 
 # md_to_html / html_to_md, pandoc adapters, fallback
 
-def md_to_html(text: str) -> str:
+def md_to_html(md: str, *, css: str | None = None, include_scaffold: bool = True) -> str:
+    """
+    Convert Markdown to HTML.
+    If css is provided, it should be raw CSS (without <style> tags). We'll wrap it here.
+    """
     html_body = markdown.markdown(
-        text or "",
+        md or "",
         extensions=[
             "extra",
             "sane_lists",
@@ -17,8 +21,12 @@ def md_to_html(text: str) -> str:
         ],
         output_format="html5",
     )
-    css = """<style>/* same CSS as above */</style>"""
-    return f"<!doctype html><meta charset='utf-8'><body>{css}{html_body}</body>"
+    head_css = f"<style>{css}</style>" if css else ""
+    if include_scaffold:
+        return f"<!doctype html><meta charset='utf-8'><body>{head_css}{html_body}</body>"
+    else:
+        # return a fragment (e.g., when caching to DB)
+        return f"{head_css}{html_body}" if css else html_body
 
 
 def docx_to_markdown(path: str) -> str:

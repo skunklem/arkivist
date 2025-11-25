@@ -1,9 +1,12 @@
 TO-Dos
 ## New
+* chapter view needs to update with newly ingested links
+* character editor and world panel edit for aliases: right click alias table to change which one is primary (effects label for hover and view of item)
+* link adding: characters should be added to Character tab in world tree, places to Places
 * add a make-active checkbox for chapters that uses `self.db.set_active_chapter_version(chapter_id, selected_version_id)`
-* allow user to choose which alias is the main one (which gets displayed in any headings/wikilinks)
-* Create fancy hover content that proviews most wikilinks without actually having to click on them.
-* chapter is selected on startup until I choose it in the project manager, then no chapter selected.
+* allow user to choose which alias is the main one (which gets displayed in any headings/wikilinks) (gets "*" in character editor/summary or simply becomes main name in header and ony other name goes back in the alias list)
+* alias addition by mistake: potentially allow unlinking as alias from hovercard
+* on startup, a chapter is visually selected, but if I choose one in the project manager, then the manager closes with no chapter selected/displayed.
 * world tree shows Characters twice, once empty, once containing characters. Make sure not to add any items where they already exist with the same parent.
 * zoom needs to be universal for all (or most) text items in app. They each check zoom when painting and respond to changes
 * book (project, too?) needs to have its own todo/note/outline
@@ -106,3 +109,5 @@ TO-Dos
 * Use AI to detect plot holes or inconsitencies in how characters/locations/etc are discussed (especially if the same character refers to things in vastly different ways)
 * Use AI to aggregate all details about a given world item or plot arc and either summarize or list out direct quotes (with links to view them in context) for easy checking
 * Easily flip through every place a character/item is mentioned (including aliases or not), choose to go through chapters, outlines, notes, to-dos, world items. Do we need a separate search panel, or do we add a search bar to each of these things or do we want a modal (or panel or tab in the left panel) that lets us do the selecting/filtering and clicking in there brings up (and highlights) the relevant chapter/content?
+## Completed
+* Create fancy hover content that previews most wikilinks without actually having to click on them.

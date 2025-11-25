@@ -169,6 +169,12 @@ class Database:
         else:
             return self.chapter_content_by_version(version_id)
 
+    def chapter_project_id(self, chapter_id: int) -> Optional[int]:
+        c = self.conn.cursor()
+        c.execute("SELECT project_id FROM chapters WHERE id=?", (chapter_id,))
+        r = c.fetchone()
+        return int(r["project_id"]) if r else None
+
     def chapter_content_by_version(self, version_id: int) -> str | None:
         c = self.conn.cursor()
         c.execute("SELECT text FROM chapter_versions WHERE id=?", (version_id,))
@@ -583,6 +589,17 @@ class Database:
         c.execute("SELECT id, alias, alias_type, alias_norm FROM world_aliases WHERE world_item_id=? AND COALESCE(deleted,0)=0", (world_item_id,))
         return c.fetchall()
 
+    def alias_id_by_alias(self, world_item_id: int, alias: str) -> Optional[int]:
+        norm = _normalize_alias(alias)
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT id FROM world_aliases
+            WHERE world_item_id=? AND alias_norm=? AND COALESCE(deleted,0)=0
+            LIMIT 1
+        """, (world_item_id, norm))
+        r = c.fetchone()
+        return int(r["id"]) if r else None
+
     def alias_exists(self, world_item_id: int, alias: str) -> bool:
         norm = _normalize_alias(alias)
         c = self.conn.cursor()
@@ -595,21 +612,37 @@ class Database:
         print([f'norm={r["alias_norm"]}' for r in self.aliases_for_world_item(world_item_id)])
         return c.fetchone() is not None
 
-    def alias_add(self, world_item_id: int, alias: str, alias_type: str) -> bool:
+    def alias_add(self, world_item_id: int, alias: str, alias_type: str,
+                *, status: str = "active", note: str | None = None, is_primary: int = 0) -> int:
+        """
+        Insert an alias for a world item. Returns alias_id.
+        - alias_type: preserve your semantic type/category (e.g. 'surface', 'epithet', etc.)
+        - status: 'active'|'defunct' (new column you added)
+        - note: optional per-alias persona notes
+        - is_primary: 1/0 (new column you added)
+        """
         alias = (alias or "").strip()
         if not alias:
-            return False
+            return
         norm = _normalize_alias(alias)
         if self.alias_exists(world_item_id, alias):
-            return False  # silently ignore or raise
-
+            alias_id = self.alias_id_by_alias(world_item_id, alias)
+            return alias_id  # silently ignore or raise
         c = self.conn.cursor()
+        # avoid dup (active ones); allow same alias if previous was defunct
+        row = c.execute("""SELECT id FROM world_aliases
+                    WHERE world_item_id=? AND alias_norm=? AND COALESCE(deleted,0)=0 AND status='active'""",
+                (world_item_id, norm)).fetchone()
+        if row:
+            return row["id"]  # silently ignore
+
+        # insert new alias
         c.execute("""
-            INSERT INTO world_aliases (world_item_id, alias, alias_type, alias_norm)
-            VALUES (?, ?, ?, ?)
-        """, (world_item_id, alias, alias_type, norm))
+            INSERT INTO world_aliases (world_item_id, alias, alias_type, alias_norm, status, note, is_primary, deleted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+        """, (world_item_id, alias, alias_type, norm, status, note, int(is_primary)))
         self.conn.commit()
-        return True
+        return int(c.lastrowid)
 
     def alias_add_multiple(self, world_item_id: int, aliases: dict[str, str]) -> None:
         c = self.conn.cursor()
@@ -627,6 +660,16 @@ class Database:
     def alias_update_type(self, alias_id: int, alias_type: str) -> None:
         c = self.conn.cursor()
         c.execute("UPDATE world_aliases SET alias_type=? WHERE id=?", (alias_type, alias_id))
+        self.conn.commit()
+
+    def alias_set_primary(self, world_item_id: int, alias_id: int = None, alias_title: str = None) -> None:
+        if alias_id is None and alias_title is not None:
+            alias_id = self.alias_id_by_alias(world_item_id, alias_title)
+        c = self.conn.cursor()
+        # unset all others
+        c.execute("UPDATE world_aliases SET is_primary=0 WHERE world_item_id=?", (world_item_id,))
+        # set this one
+        c.execute("UPDATE world_aliases SET is_primary=1 WHERE id=?", (alias_id,))
         self.conn.commit()
 
     def alias_update_alias(self, alias_id: int, alias: str) -> bool:
@@ -672,7 +715,7 @@ class Database:
 
     def world_items_grouped(self):
         q = """
-        SELECT id, title, COALESCE(kind,'') AS kind
+        SELECT id, title, COALESCE(type,'') AS kind
         FROM world_items
         WHERE COALESCE(deleted,0)=0
         ORDER BY LOWER(title)
@@ -701,6 +744,13 @@ class Database:
         c.execute("SELECT type FROM world_items WHERE id=?", (world_item_id,))
         r = c.fetchone()
         return r["type"] if r else None
+
+    def world_items_list_for_kind(self, project_id: int, kind: str) -> list[int]:
+        c = self.conn.cursor()
+        c.execute("""SELECT id, title FROM world_items
+                    WHERE project_id=? AND type=? AND COALESCE(deleted,0)=0
+                    ORDER BY position, id""", (project_id, kind))
+        return c.fetchall()
     
     def world_item_list_ids(self, project_id: int, category_id: int) -> list[int]:
         c = self.conn.cursor()
@@ -725,21 +775,28 @@ class Database:
         self.conn.commit()
         return new_id
 
-    def world_item_insert(self, project_id: int, category_id: int, title: str = "", content_md: str = "", item_type: str = "", aliases: dict[str, str] = {}) -> int:
+    # TODO: figure out what to do with category_id when none is given (0 is a placeholder for now)
+    #       maybe `item_type` can determine default category?
+    def world_item_insert(self, project_id: int, category_id: int = 0, title: str = "", content_md: str = "", item_type: str = "", aliases: dict[str, str] = {}) -> int:
         """
         Create a new world item under a category.
         Returns the new world_item id.
         """
-        html = md_to_html(content_md)
+        title = title.strip()
+        html = md_to_html(content_md, css=None, include_scaffold=False)
         c = self.conn.cursor()
         c.execute(
             """INSERT INTO world_items (project_id, category_id, title, type, content_md, content_render)
             VALUES (?, ?, ?, ?, ?, ?)""",
-            (project_id, category_id, title.strip(), item_type.strip(), content_md.strip(), html),
+            (project_id, category_id, title, item_type.strip(), content_md.strip(), html),
         )
         wid = c.lastrowid
         self.conn.commit()
+        # add aliases
+        if not title in aliases:
+            aliases[title] = "alias"
         self.alias_add_multiple(wid, aliases)
+        self.alias_set_primary(wid, alias_title=title)
         return int(wid)
 
     def world_item_update_content(self, world_item_id: int, md: str) -> None:
@@ -765,38 +822,33 @@ class Database:
         self.conn.commit()
 
     # --- World aliases/titles (phrases to world IDs)
-
-    def world_phrases_for_project(self, project_id: int) -> list[tuple[int, str]]:
+    def world_phrases_for_project_detailed(self, project_id: int, ids: list[int] | None = None):
         """
-        Returns [(world_item_id, phrase), ...] across titles + aliases (non-deleted), trimmed & lowercased.
+        Return [(phrase_norm, world_item_id, alias_id)] for ACTIVE aliases in this project.
+        If ids is provided, limit to those world_item ids.
+        If ids is an empty list, returns no results.
         """
         c = self.conn.cursor()
-        rows = []
-
-        c.execute("""
-            SELECT id AS world_item_id, title AS phrase
-            FROM world_items
-            WHERE project_id=? AND COALESCE(deleted,0)=0 AND title IS NOT NULL AND TRIM(title)!=''
-        """, (project_id,))
-        rows += [(r["world_item_id"], r["phrase"]) for r in c.fetchall()]
-
-        c.execute("""
-            SELECT wa.world_item_id, wa.alias AS phrase
+        sql = """
+            SELECT LOWER(TRIM(REPLACE(wa.alias, '  ', ' '))) AS phrase_norm,
+                wa.world_item_id AS world_item_id,
+                wa.id AS alias_id
             FROM world_aliases wa
             JOIN world_items wi ON wi.id=wa.world_item_id
-            WHERE wi.project_id=? AND COALESCE(wa.deleted,0)=0
-                AND wa.alias IS NOT NULL AND TRIM(wa.alias)!=''
-        """, (project_id,))
-        rows += [(r["world_item_id"], r["phrase"]) for r in c.fetchall()]
-
-        # normalize: collapse spaces and lowercase
-        out = []
-        for wid, phrase in rows:
-            p = " ".join(phrase.strip().split()).lower()
-            if p:
-                out.append((wid, p))
-        return out
-
+            WHERE wi.project_id=? AND COALESCE(wi.deleted,0)=0
+            AND COALESCE(wa.deleted,0)=0
+            AND COALESCE(wa.status,'active')='active'
+        """
+        params = [project_id]
+        if ids is not None:
+            if ids == []:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            sql += f" AND wa.world_item_id IN ({placeholders})"
+            params.extend(int(x) for x in ids)
+        sql += " ORDER BY LENGTH(wa.alias) DESC, wa.world_item_id"
+        c.execute(sql, params)
+        return [(r["phrase_norm"], int(r["world_item_id"]), int(r["alias_id"])) for r in c.fetchall()]
 
     def set_chapter_world_refs(self, chapter_id: int, world_ids: Sequence[int]) -> None:
         """
@@ -814,72 +866,254 @@ class Database:
 
     def ingest_candidates_by_chapter(self, chapter_id: int, version_id: int | None = None,
                                     statuses: tuple[str,...] = ("pending",)):
-        q, args = ["chapter_id=?"], [chapter_id]
+        """Fetch all ingest candidates for a chapter (specify version or use active version)."""
+        if isinstance(statuses, str):
+            statuses = (statuses,)
         if version_id is None:
-            av = self.get_active_version_id(chapter_id)
-            if av:
-                q.append("chapter_version_id=?"); args.append(av)
-        else:
-            q.append("chapter_version_id=?"); args.append(int(version_id))
-        if statuses:
-            q.append("status IN ({})".format(",".join("?"*len(statuses))))
-            args.extend(statuses)
-        sql = f"SELECT * FROM ingest_candidates WHERE {' AND '.join(q)} ORDER BY id DESC"
-        print("ingest_candidates_by_chapter query:", sql, args)
-        return self.conn.execute(sql, args).fetchall()
+            version_id = self.get_active_version_id(chapter_id)
+        project_id = self.chapter_project_id(chapter_id)
+        candidates = self.candidates_for_scope(project_id=project_id, scope_type="chapter", scope_id=chapter_id,
+                                        version_id=version_id, statuses=statuses, columns="*")
+        print(f"ingest_candidates_by_chapter: found {len(candidates)} candidates for chapter_id={chapter_id}, version_id={version_id}")
+        # print db's candidates
+        print([f'id={r["id"]} cand="{r["candidate"]}"' for r in candidates])
+        return candidates
 
-    def ingest_candidate_upsert(self, project_id: int, chapter_id: int, chapter_version_id: int | None,
-                                surface: str, kind_guess: str | None, context: str | None,
-                                start_off: int | None, end_off: int | None, confidence: float | None,
-                                status: str = "pending") -> int:
+    def ingest_candidate_upsert(self, *, project_id: int, scope_type: str, scope_id: int,
+                                version_id: int | None, candidate: str,
+                                kind_guess: str | None = None, source: str | None = None,
+                                confidence: float | None = None, status: str = "pending",
+                                start_off: int | None = None, end_off: int | None = None,
+                                context: str | None = None) -> int:
         """
-        Upserts by (project_id, chapter_id, lower(surface), start_off, end_off) so we don't spam dupes.
-        If a previously rejected exists, keep it rejected unless explicitly changed.
+        Upsert by (project_id, scope_type, scope_id, version_id, candidate).
+        Returns the candidate id. Adds debug prints so we can see what's happening.
         """
+        cand = (candidate or "").strip()
+        if not cand:
+            return 0
+
         c = self.conn.cursor()
 
-        srf = (surface or "").strip()            # exact, no .lower()
-        vkey = int(chapter_version_id) if chapter_version_id is not None else -1
-        so   = int(start_off) if start_off is not None else -1
-        eo   = int(end_off) if end_off is not None else -1
-
-        c.execute("""
-            SELECT id, status FROM ingest_candidates
-            WHERE project_id=? AND chapter_id=? AND IFNULL(chapter_version_id,-1)=?
-            AND surface=? AND IFNULL(start_off,-1)=? AND IFNULL(end_off,-1)=?
-            LIMIT 1
-        """, (project_id, chapter_id, vkey, srf, so, eo))
-        row = c.fetchone()
+        # 1) Try find existing
+        row = c.execute("""
+            SELECT id, kind_guess, source, confidence, status
+            FROM ingest_candidates
+            WHERE project_id=? AND scope_type=? AND scope_id=? AND COALESCE(version_id,-1)=COALESCE(?, -1)
+            AND candidate=?
+        """, (project_id, scope_type, scope_id, version_id, cand)).fetchone()
 
         if row:
-            # Do not revive accepted/rejected/linked
-            if row["status"] in ("accepted", "rejected", "linked"):
-                return int(row["id"])
-            # Update pending with any improvements
-            c.execute("""UPDATE ingest_candidates
-                        SET kind_guess=COALESCE(?, kind_guess),
-                            context=COALESCE(?, context),
-                            confidence=COALESCE(?, confidence)
-                        WHERE id=?""",
-                    (kind_guess, context, confidence, row["id"]))
+            cid = int(row[0])
+            # 2) UPDATE only the fields we allow to evolve (no schema tokens here to avoid SQL errors)
+            c.execute("""
+                UPDATE ingest_candidates
+                SET kind_guess=COALESCE(?, kind_guess),
+                    source=COALESCE(?, source),
+                    confidence=COALESCE(?, confidence),
+                    status=COALESCE(?, status),
+                    start_off=COALESCE(?, start_off),
+                    end_off=COALESCE(?, end_off),
+                    context=COALESCE(?, context),
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+            """, (kind_guess, source, confidence, status, start_off, end_off, context, cid))
             self.conn.commit()
-            return int(row["id"])
+            print(f"[ingest_candidate_upsert] UPDATE cid={cid} candidate='{cand}' "
+                f"scope=({scope_type},{scope_id},{version_id}) src={source} conf={confidence} status={status}")
+            return cid
 
-        c.execute("""INSERT INTO ingest_candidates
-                    (project_id, chapter_id, chapter_version_id, surface, kind_guess, context,
-                    start_off, end_off, confidence, status)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (project_id, chapter_id, vkey, srf, kind_guess, context, so, eo, confidence, status))
+        # 3) INSERT new
+        c.execute("""
+            INSERT INTO ingest_candidates
+                (project_id, scope_type, scope_id, version_id,
+                candidate, kind_guess, source, confidence, status,
+                start_off, end_off, context,
+                target_world_item_id, created_at, updated_at)
+            VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """, (project_id, scope_type, scope_id, version_id,
+            cand, kind_guess, source, confidence, status,
+            start_off, end_off, context))
+        cid = int(c.lastrowid)
         self.conn.commit()
-        return int(c.lastrowid)
+        print(f"[ingest_candidate_upsert] INSERT cid={cid} candidate='{cand}' "
+            f"scope=({scope_type},{scope_id},{version_id}) src={source} conf={confidence} status={status} start_off={start_off} end_off={end_off} context={context}")
+        return cid
 
-    def ingest_candidate_set_status(self, candidate_id: int, status: str):
-        self.conn.execute("UPDATE ingest_candidates SET status=? WHERE id=?", (status, candidate_id))
+    def ingest_candidate_mark_resolved(self, cand_id: int, *, target_world_item_id: int, status: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute("""
+            UPDATE ingest_candidates
+            SET target_world_item_id=?, status=?
+            WHERE id=?""", (target_world_item_id, status, cand_id))
+        self.conn.commit()
+
+    def ingest_candidate_mark_dismissed(self, cand_id: int) -> None:
+        c = self.conn.cursor()
+        c.execute("""
+            UPDATE ingest_candidates
+            SET status='dismissed', target_world_item_id=NULL, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, (cand_id,))
         self.conn.commit()
 
     def ingest_candidate_link_world(self, candidate_id: int, world_item_id: int):
         self.conn.execute("UPDATE ingest_candidates SET link_world_id=? WHERE id=?",
                 (world_item_id, candidate_id))
+        self.conn.commit()
+
+    # --- Linker support ----------------------------------------------------
+    def known_world_phrases(self, project_id):
+        """
+        Return [(wid, alias_id_or_None, phrase_lower)] for titles + ACTIVE aliases.
+        """
+        cur = self.conn.cursor()
+        out = []
+        # Titles
+        cur.execute("SELECT id, title FROM world_items WHERE project_id=? AND COALESCE(deleted,0)=0", (project_id,))
+        for wid, title in cur.fetchall():
+            if title:
+                out.append((int(wid), None, title.strip().lower()))
+        # Active aliases
+        cur.execute("""
+            SELECT wa.world_item_id, wa.id, wa.alias
+            FROM world_aliases wa
+            JOIN world_items wi ON wi.id=wa.world_item_id
+            WHERE wi.project_id=? AND COALESCE(wi.deleted,0)=0
+            AND COALESCE(wa.deleted,0)=0
+            AND COALESCE(wa.status,'active')='active'
+            AND wa.alias IS NOT NULL AND TRIM(wa.alias)!=''
+        """, (project_id,))
+        for wid, alias_id, alias in cur.fetchall():
+            out.append((int(wid), int(alias_id), alias.strip().lower()))
+        return out
+
+    def candidates_for_scope(self, *, project_id: int,
+                            scope_type: str, scope_id: int,
+                            version_id: int | None = None,
+                            statuses: Sequence[str]=("pending",),
+                            columns: str = "*") -> list[sqlite3.Row]:
+        """
+        columns: SQL SELECT list. Always alias computed fields, e.g. COALESCE(source,'') AS source
+        """
+        # allow string
+        if isinstance(statuses, str):
+            statuses = (statuses,)
+        c = self.conn.cursor()
+        ph = ",".join("?" * len(statuses))
+        if version_id is None:
+            sql = f"""
+                SELECT {columns}
+                FROM ingest_candidates
+                WHERE project_id=? AND scope_type=? AND scope_id=?
+                AND COALESCE(status,'pending') IN ({ph})
+            """
+            params = (project_id, scope_type, scope_id, *statuses)
+        else:
+            sql = f"""
+                SELECT {columns}
+                FROM ingest_candidates
+                WHERE project_id=? AND scope_type=? AND scope_id=? AND version_id=?
+                AND COALESCE(status,'pending') IN ({ph})
+            """
+            params = (project_id, scope_type, scope_id, version_id, *statuses)
+        print(f"[candidates_for_scope] {sql.strip()}  params={params}")
+        rows = c.execute(sql, params).fetchall()
+        print(f"[candidates_for_scope] returned {len(rows)} rows")
+        return rows
+
+    def chapter_candidates_basic(self, scope_id, statuses=("pending","linked")):
+        """
+        Return [(id, label, source)] for chapter-scoped ingest candidates in the given statuses.
+        """
+        cur = self.conn.cursor()
+        placeholders = ",".join("?" for _ in statuses)
+        cur.execute(f"""
+            SELECT id, label, source
+            FROM ingest_candidates
+            WHERE scope_type='chapter' AND scope_id=? AND COALESCE(status,'pending') IN ({placeholders})
+        """, (scope_id, *statuses))
+        return [(int(cid), (label or "").strip(), (source or "").lower()) for cid, label, source in cur.fetchall()]
+
+    def ingest_candidate_row(self, cand_id):
+        """
+        Return a tuple with (project_id, scope_type, scope_id, version_id, candidate,
+                kind_guess, COALESCE(source,''), confidence, status, target_world_item_id).
+        """
+        cur = self.conn.cursor()
+        row = cur.execute("""
+            SELECT project_id, scope_type, scope_id, version_id, candidate,
+                kind_guess, COALESCE(source,''), confidence, status, target_world_item_id
+            FROM ingest_candidates
+            WHERE id=?""", (cand_id,)).fetchone()
+        return row  # tuple
+
+    def alias_note(self, alias_id):
+        cur = self.conn.cursor()
+        row = cur.execute("SELECT note FROM world_aliases WHERE id=?", (alias_id,)).fetchone()
+        return row[0] if row else None
+
+    def world_item_md(self, world_item_id):
+        cur = self.conn.cursor()
+        row = cur.execute("SELECT content_md FROM world_items WHERE id=?", (world_item_id,)).fetchone()
+        return row[0] if row else ""
+
+    def fetch_text_for_doc(self, *, doc_type, doc_id, version_id=None):
+        """
+        doc_type: 'chapter', 'world_item', 'note', 'outline' (extend as you add)
+        """
+        if doc_type == "chapter":
+            return self.chapter_content(doc_id, version_id=version_id)
+        if doc_type == "world_item":
+            return self.world_item_md(doc_id)
+        # TODO: implement when notes/outlines have tables
+        return ""
+
+    def set_world_item_refs(self, world_item_id: int, world_ids: list[int]):
+        """
+        Cache 'which world items are referenced by this world_item's text' (ID list).
+        Create the table on the fly (in-memory DB makes this painless).
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS world_item_refs (
+                world_item_id INTEGER PRIMARY KEY,
+                ids_csv TEXT
+            )
+        """)
+        csv = ",".join(str(int(w)) for w in sorted(set(world_ids or [])))
+        cur.execute("""
+            INSERT INTO world_item_refs(world_item_id, ids_csv)
+            VALUES(?, ?)
+            ON CONFLICT(world_item_id) DO UPDATE SET ids_csv=excluded.ids_csv
+        """, (world_item_id, csv))
+        self.conn.commit()
+
+    def set_doc_refs(self, *, doc_type, doc_id, version_id=None, world_ids: list[int]):
+        if doc_type == "chapter":
+            # assumes you already have these methods
+            self.set_chapter_version_world_refs(version_id, sorted(set(world_ids or [])))
+            av = self.get_active_version_id(doc_id)
+            if av and int(av) == int(version_id):
+                self.set_chapter_world_refs(doc_id, sorted(set(world_ids or [])))
+        elif doc_type == "world_item":
+            self.set_world_item_refs(doc_id, world_ids or [])
+        else:
+            # TODO: extend when notes/outlines have a cache table
+            pass
+
+    def world_item_render_update(self, world_item_id, html_content):
+        cur = self.conn.cursor()
+        cur.execute("UPDATE world_items SET content_render=? WHERE id=?", (html_content, world_item_id))
+        self.conn.commit()
+
+    def chapter_version_render_update(self, version_id, html_content):
+        cur = self.conn.cursor()
+        cur.execute("""
+            UPDATE chapter_versions
+            SET content_render=?, format_updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, (html_content, version_id))
         self.conn.commit()
 
     # --- Metrics cache ----------------------------------------------------------

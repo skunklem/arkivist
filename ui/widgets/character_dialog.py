@@ -362,11 +362,11 @@ class CharacterDialog(QDialog):
         if not alias:
             return
         self.db.alias_type_upsert(self.app._current_project_id, alias_type)
-        ok = self.db.alias_add(self.character_id, alias, alias_type)
-        if not ok:
+        if self.db.alias_exists(self.character_id, alias):
             QMessageBox.information(self, "Duplicate alias",
                                     f"“{alias}” already exists for this character.")
             return
+        self.db.alias_add(self.character_id, alias, alias_type)
         self._reload_alias_table()
         # rows = self.db.aliases_for_world_item(self.character_id)
         # self.aliasTable.set_rows(rows)

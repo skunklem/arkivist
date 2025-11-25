@@ -1,8 +1,15 @@
 # ui/widgets/common.py
 from __future__ import annotations
-from PySide6.QtCore import Qt, QTimer, QObject, Signal
-from PySide6.QtGui import QPalette, QColor
-from PySide6.QtWidgets import QLabel, QFrame, QSizePolicy
+import re, weakref
+from PySide6.QtCore import Qt, QTimer, QObject, Signal, QEvent, QUrl, QPoint, QRect, QMargins, QSize, QDateTime
+from PySide6.QtGui import QPalette, QColor, QCursor, QPainter
+from PySide6.QtWidgets import (
+    QLabel, QFrame, QSizePolicy, QToolTip, QDialog, QTextBrowser,
+    QVBoxLayout, QHBoxLayout, QLineEdit, QListWidget, QPushButton,
+    QApplication, QGraphicsDropShadowEffect, QWidget
+)
+
+from ui.widgets.helpers import parse_internal_url
 
 def _blend(a: QColor, b: QColor, t: float) -> QColor:
     """Linear blend between two colors: 0 -> a, 1 -> b."""
@@ -194,3 +201,353 @@ class EditStateController(QObject):
         if self._state != val:
             self._state = val
             self.stateChanged.emit(val)
+
+
+class AliasPicker(QDialog):
+    def __init__(self, conn, project_id, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose item to alias to")
+        self.conn = conn
+        self.pid = project_id
+        self.sel_wid = None
+        v = QVBoxLayout(self)
+        self.edit = QLineEdit(self); self.edit.setPlaceholderText("Type to filter…")
+        self.list = QListWidget(self)
+        btns = QHBoxLayout()
+        ok = QPushButton("OK"); cancel = QPushButton("Cancel")
+        btns.addWidget(ok); btns.addWidget(cancel)
+        v.addWidget(self.edit); v.addWidget(self.list); v.addLayout(btns)
+        ok.clicked.connect(self.accept); cancel.clicked.connect(self.reject)
+        self.edit.textChanged.connect(self._refilter)
+        self._load_all()
+
+    def _load_all(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, title, kind FROM world_items WHERE project_id=? AND COALESCE(deleted,0)=0 ORDER BY title", (self.pid,))
+        self._rows = cur.fetchall()
+        self._refilter()
+
+    def _refilter(self):
+        q = (self.edit.text() or "").strip().lower()
+        self.list.clear()
+        for wid, title, kind in self._rows:
+            t = (title or "")
+            if q and q not in t.lower():
+                continue
+            self.list.addItem(f"{t}  —  {kind}  (#{wid})")
+
+    def accept(self):
+        item = self.list.currentItem()
+        if item:
+            txt = item.text()
+            m = re.search(r"#(\d+)\)$", txt)
+            if m:
+                self.sel_wid = int(m.group(1))
+        super().accept()
+
+
+class _OneShotClickEater(QObject):
+    def eventFilter(self, obj, ev):
+        if ev.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+            QApplication.instance().removeEventFilter(self)
+            return True
+        return False
+
+
+class _HoverCardPopup(QFrame):
+    def __init__(self, mw):
+        super().__init__(mw)
+        self.setWindowFlags(Qt.ToolTip)  # hoverable & doesn't steal focus
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setMouseTracking(True)
+        # single thin edge, no shadow, tight padding
+        self.setStyleSheet("QFrame { background: palette(Base); border: 1px solid palette(Mid); border-radius: 6px; }")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)   # was 8
+        self.setGraphicsEffect(None)
+        self.view = QTextBrowser(self)
+        self.view.setOpenExternalLinks(False)
+        self.view.setOpenLinks(False)
+        self.view.setFrameShape(QFrame.NoFrame)
+        self.view.setStyleSheet("QTextBrowser { background: transparent; }")
+        lay.addWidget(self.view)
+        mw._apply_doc_styles(self.view)
+        self.view.anchorClicked.connect(self._on_popup_anchor_clicked)
+        self._inside = False
+        self.view.viewport().installEventFilter(self)
+        # theme-aware link css
+        mw._apply_doc_styles(self.view)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Enter:
+            self._inside = True
+        elif ev.type() == QEvent.Leave:
+            self._inside = False
+        return False
+
+    def show_card(self, html: str, at_global: QPoint):
+        # inject link CSS into the popup too
+        self.view.setHtml(html)
+        self.adjustSize()
+        # self.move(at_global + QPoint(12, 12))
+        self.move(at_global + QPoint(6, 6))
+        self.show()
+
+    def _on_popup_anchor_clicked(self, qurl: QUrl):
+        # squelch anchor routing
+        try:
+            self.parent()._squelch_anchor_until_ms = QDateTime.currentMSecsSinceEpoch() + 450
+        except Exception:
+            pass
+
+        # eat the very next click so underlying view never sees it
+        eater = _OneShotClickEater(self)
+        QApplication.instance().installEventFilter(eater)
+
+        # Hide card first so it doesn't cover dialogs/panels
+        self.hide()
+        # Route click through the app
+        self.parent().route_anchor_click(qurl)
+
+    def enterEvent(self, e):
+        self._inside = True
+        super().enterEvent(e)
+    def leaveEvent(self, e):
+        self._inside = False
+        super().leaveEvent(e)
+
+def _anchor_left_global(vp: QWidget, tb: QTextBrowser,
+                        href: str, pos_vp: QPoint) -> QPoint:
+    """
+    pos_vp is viewport-relative. We scan left on the same y to find the first pixel
+    that still returns this href, then return that point in GLOBAL coords.
+    """
+    y = pos_vp.y()
+    x = pos_vp.x()
+    # scan left (cap at 300 px to keep it cheap)
+    min_x = max(0, x - 300)
+    left_x = x
+    while left_x > min_x:
+        probe = QPoint(left_x - 1, y)
+        if tb.anchorAt(probe) != href:
+            break
+        left_x -= 1
+    # map the found viewport point to global
+    return vp.mapToGlobal(QPoint(left_x, y))
+
+# helper (place above the class)
+def _scan_anchor_bounds_global(vp: QWidget, tb: QTextBrowser,
+                               href: str, pos_vp: QPoint) -> QRect:
+    """Find horizontal bounds of hovered anchor on this line; return GLOBAL rect."""
+    y = pos_vp.y()
+    # LEFT scan
+    left = pos_vp.x()
+    while left > 0 and tb.anchorAt(QPoint(left - 1, y)) == href:
+        left -= 1
+    # RIGHT scan
+    right = pos_vp.x()
+    vpw = vp.width()
+    while right < vpw - 1 and tb.anchorAt(QPoint(right + 1, y)) == href:
+        right += 1
+    # Get line height from the exact cursor line under pos_vp (viewport coords)
+    cur = tb.cursorForPosition(pos_vp)
+    line_rect_vp = tb.cursorRect(cur)
+    rect_vp = QRect(QPoint(left, line_rect_vp.top()),
+                           QSize(max(1, right - left + 1), line_rect_vp.height()))
+    return QRect(vp.mapToGlobal(rect_vp.topLeft()), rect_vp.size())
+
+
+
+class _WikiHoverFilter(QObject):
+    def __init__(self, mw, text_browser: QTextBrowser):
+        super().__init__(mw)
+        self.mw = mw
+        self._hover_debug = True
+
+        # weakrefs to avoid touching deleted C++ objects
+        self._tb_ref = weakref.ref(text_browser)
+        vp = text_browser.viewport()
+        self._vp_ref = weakref.ref(vp) if vp else (lambda: None)
+
+        self.card = _HoverCardPopup(mw)
+        self._current_href = None
+
+        # timers
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._hide_if_outside)
+
+        # install filters on objects that actually emit events
+        text_browser.installEventFilter(self)      # focus/hide/mouse press on TB
+        vp.installEventFilter(self)                # mouse move/hover on viewport
+
+        # hide if TB destroyed
+        text_browser.destroyed.connect(self.card.hide)
+
+        # hide on app deactivation (Alt+Tab)
+        QApplication.instance().applicationStateChanged.connect(
+            lambda st: self.card.hide() if st != Qt.ApplicationActive else None
+        )
+
+        # global mouse move fallback (so we can hide even if TB stops sending events)
+        QApplication.instance().installEventFilter(self)
+
+    # --------- small helpers ----------
+
+    def _tb_alive(self):
+        tb = self._tb_ref() if self._tb_ref else None
+        if tb is None:
+            return None
+        # Touch metaObject to see if C++ is gone
+        try:
+            _ = tb.metaObject()
+        except RuntimeError:
+            return None
+        return tb
+
+    def _vp_alive(self):
+        vp = self._vp_ref() if self._vp_ref else None
+        if vp is None:
+            return None
+        try:
+            _ = vp.metaObject()
+        except RuntimeError:
+            return None
+        return vp
+
+    def _anchor_under_cursor(self) -> str:
+        vp = self._vp_alive()
+        tb = self._tb_alive()
+        if not vp or not tb:
+            self._dbg("tb/vp dead in _anchor_under_cursor; hiding")
+            self.card.hide()
+            return ""
+        try:
+            pt = vp.mapFromGlobal(QCursor.pos())
+            return tb.anchorAt(pt)
+        except RuntimeError:
+            self._dbg("anchorAt runtime error; hiding")
+            self.card.hide()
+            return ""
+
+    def _over_anchor(self) -> bool:
+        return bool(self._anchor_under_cursor())
+
+    def _dbg(self, *a):
+        if self._hover_debug:
+            print("[hover]", *a)
+
+    # --------- hide/show policy ----------
+
+    def _hide_if_outside(self):
+        if not self.card.isVisible():
+            return
+
+        cursor = QCursor.pos()
+        cg = self.card.geometry()
+
+        if cg.contains(cursor):
+            return
+        if self._over_anchor():
+            return
+
+        ar = getattr(self, "_anchor_rect_global", None)
+        if ar and not ar.isNull():
+            # column width = overlap of x-intervals, bounded below
+            left_x  = max(ar.left(),  cg.left())
+            right_x = min(ar.right(), cg.right())
+            col_w   = max(10, right_x - left_x)   # at least 10 px
+            if col_w > 0:
+                # column from just below anchor to just above card
+                col_top = ar.bottom() - 1
+                col_h   = max(1, cg.top() - col_top + 2)
+                column  = QRect(QPoint(left_x, col_top), QSize(col_w, col_h))
+                if column.contains(cursor):
+                    return
+
+        self.card.hide()
+
+    # --------- main event filter ----------
+
+    def eventFilter(self, obj, ev):
+        et = ev.type()
+
+        # If the TB has been deleted, bail early
+        tb = self._tb_alive()
+        vp = self._vp_alive()
+
+        # Global mouse move: if card visible and we’re over *any* anchor, refresh even if the event didn’t come from the viewport yet
+        if ev.type() == QEvent.MouseMove and self.card.isVisible():
+            href_now = self._anchor_under_cursor()
+            if href_now:
+                if href_now != self._current_href:
+                    self._current_href = href_now
+                    qurl = QUrl(href_now)
+                    info = parse_internal_url(qurl)
+                    if info:
+                        html = self.mw._hover_card_html_for(qurl)
+                        tb = self._tb_alive(); vp = self._vp_alive()
+                        if html and tb and vp:
+                            # recompute anchor rect and re-place the card right away
+                            pos_vp = vp.mapFromGlobal(QCursor.pos())
+                            ar = _scan_anchor_bounds_global(vp, tb, href_now, pos_vp)
+                            self._anchor_rect_global = ar
+                            self.card.show_card(html, QPoint(ar.left(), ar.bottom() - 5))
+                # don’t hide; we’re over an anchor
+                return False
+    
+        # Global mouse move: if card visible and we're not over card or anchor, hide.
+        if et == QEvent.MouseMove and self.card.isVisible():
+            if not self.card.geometry().contains(QCursor.pos()) and not self._over_anchor():
+                self._dbg("global mouse -> hide (not over card/anchor)")
+                self.card.hide()
+            return False
+
+        # TB-level events
+        if tb and obj is tb:
+            if et in (QEvent.FocusOut, QEvent.Hide, QEvent.Leave):
+                self._dbg("tb focus/hide/leave -> arm hide")
+                self._hide_timer.start(180)
+            elif et == QEvent.MouseButtonPress:
+                self._dbg("tb mouse press -> hide immediately")
+                self.card.hide()
+            return False
+
+        # Viewport mouse/hover move
+        if vp and obj is vp and et in (QEvent.MouseMove, QEvent.HoverMove):
+            try:
+                # use viewport-relative position for anchorAt
+                pos = ev.position().toPoint() if hasattr(ev, "position") else ev.pos()
+                href = tb.anchorAt(pos) if tb else ""
+            except RuntimeError:
+                self._dbg("vp move but tb dead -> hide")
+                self.card.hide()
+                return False
+
+            if href:
+                self._hide_timer.stop()
+                if href != self._current_href or not self.card.isVisible():
+                    print("href changed or card hidden:", href, self._current_href, self.card.isVisible())
+                    self._current_href = href
+                    qurl = QUrl(href)
+                    info = parse_internal_url(qurl)
+                    if info:
+                        html = self.mw._hover_card_html_for(qurl)
+                        if html:
+                            # 1) get exact anchor rect in GLOBAL coords
+                            ar = _scan_anchor_bounds_global(vp, tb, href, pos)
+                            self._anchor_rect_global = ar
+
+                            # 2) place the card at anchor.bottomLeft, with -2px vertical overlap (closer!)
+                            card_at = QPoint(ar.left(), ar.bottom() - 5)
+                            self.card.show_card(html, card_at)
+                            self._dbg("show_card at", card_at, "anchorRect", self._anchor_rect_global)
+                            self._dbg(f"show_card href={href}")
+                return False
+
+            # left anchor: grace hide (even if still inside pane)
+            self._dbg("left anchor -> start hide timer")
+            self._hide_timer.start(180)
+            return False
+
+        return False

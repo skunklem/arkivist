@@ -229,6 +229,51 @@ def _score_spacy_entity(surface: str, start_char: int, doc, label: str) -> float
     # cap & floor
     return max(0.35, min(0.95, score))
 
+_POS_SUFFIXES = ("'s", "’s")
+
+def _is_surface_possessive(s: str) -> bool:
+    s = (s or "").strip()
+    return any(s.lower().endswith(suf) for suf in _POS_SUFFIXES)
+
+def _base_from_surface(s: str) -> str:
+    s = (s or "").strip()
+    for suf in _POS_SUFFIXES:
+        if s.lower().endswith(suf):
+            return s[:-len(suf)].strip()
+    return s
+
+def dedupe_possessives(cands: list[dict]) -> list[dict]:
+    """
+    Keep one candidate per base form (case-insensitive).
+    If both base and possessive exist, prefer the *base* (non-possessive) form;
+    if only possessive exists, keep it.
+    Tie-break by earliest start.
+    """
+    by_base = {}
+    for c in cands:
+        surf = c.get("surface", "")
+        base = _base_from_surface(surf).lower()
+        prev = by_base.get(base)
+        if not prev:
+            by_base[base] = c
+        else:
+            # prefer non-possessive over possessive
+            if prev.get("is_possessive", 0) and not c.get("is_possessive", 0):
+                by_base[base] = c
+            # if both same possessive state, prefer earliest start
+            elif c.get("start_off", 1e12) < prev.get("start_off", 1e12):
+                by_base[base] = c
+    return list(by_base.values())
+
+def _compute_is_possessive_with_spacy(doc, ent) -> bool:
+    """True if a POS ('s/’s) token immediately follows the entity span."""
+    if ent.end < len(doc):
+        t = doc[ent.end]
+        if t.tag_ == "POS" and t.text in _POS_SUFFIXES:
+            return True
+    # fallback on surface (covers owner-splits or altered spans)
+    return _is_surface_possessive(ent.text)
+
 def spacy_candidates_strict(text: str, known_phrases: set[str]) -> list[dict]:
     """
     spaCy-only candidates with:
@@ -236,48 +281,55 @@ def spacy_candidates_strict(text: str, known_phrases: set[str]) -> list[dict]:
       - DB skip via det-less tail
       - '&' bonus
       - owner split: 'for' always; 'of' only if right is possessive (Y’s/'s)
+      - possessive detection via spaCy t.tag_ == 'POS' or surface fallback
+      - possessive de-duplication (prefer base when both present)
     """
     doc = spacy_doc(text)
     if not doc:
         return []
     raw = []
 
-    # collect raw + det-less variants
     for ent in doc.ents:
         if ent.label_ in NER_DROP or ent.label_ not in NER_KEEP:
             continue
+
         start, end = ent.start_char, ent.end_char
         surface = ent.text
         first_tok = doc[ent.start]
         has_lower_det = (first_tok.text.lower() in DET_WORDS and first_tok.text.islower())
 
-        # Try to split owner relation BEFORE anything else
+        # Try owner split first (‘for’ always; ‘of’ only if right is possessive)
         splits = maybe_split_owner_relation(text, start, end)
         if splits:
             for surf, s, e, _why in splits:
                 tail = _norm_tail(surf)
                 if tail in known_phrases:
                     continue
-                raw.append(dict(surface=surf, start_off=s, end_off=e, label=ent.label_, doc=doc))
-            # swallow the long ent; we emitted its parts
-            continue
+                raw.append(dict(surface=surf, start_off=s, end_off=e, label=ent.label_,
+                                doc=doc, is_possessive=1 if _is_surface_possessive(surf) else 0))
+            continue  # swallow the long ent
 
-        # otherwise push det-less variant (if lowercase det) + original
+        # Optional det-less variant (if lowercase det)
         if has_lower_det:
             s2 = first_tok.idx + len(first_tok.text)
             while s2 < end and text[s2].isspace():
                 s2 += 1
             if s2 < end:
                 surf2 = text[s2:end]
-                tail = _norm_tail(surf2)
-                if tail not in known_phrases:
-                    raw.append(dict(surface=surf2, start_off=s2, end_off=end, label=ent.label_, doc=doc))
-        # original (skip if known)
+                tail2 = _norm_tail(surf2)
+                if tail2 not in known_phrases:
+                    raw.append(dict(surface=surf2, start_off=s2, end_off=end, label=ent.label_,
+                                    doc=doc, is_possessive=1 if _is_surface_possessive(surf2) else 0))
+
+        # Original (skip if known)
         tail0 = _norm_tail(surface)
         if tail0 not in known_phrases:
-            raw.append(dict(surface=surface, start_off=start, end_off=end, label=ent.label_, doc=doc))
+            # detect possessive using spaCy POS on the following token
+            is_pos = 1 if _compute_is_possessive_with_spacy(doc, ent) else 0
+            raw.append(dict(surface=surface, start_off=start, end_off=end, label=ent.label_,
+                            doc=doc, is_possessive=is_pos))
 
-    # group by det-less tail to canonicalize within this doc
+    # Group by det-less tail to canonicalize
     groups = defaultdict(list)
     for r in raw:
         groups[_norm_tail(r["surface"])].append(r)
@@ -287,24 +339,14 @@ def spacy_candidates_strict(text: str, known_phrases: set[str]) -> list[dict]:
         if not tail:
             continue
 
-        # prefer det-less canonical if:
-        #  - any lowercase leading 'the/a/an' variants exist in this group, OR
-        #  - any item already appears det-less (exact tail)
         def _is_lower_det(s: str) -> bool:
             head = s.strip().split(" ", 1)[0]
             return head.lower() in DET_WORDS and head.islower()
 
         has_lower_det = any(_is_lower_det(i["surface"]) for i in items)
         detless_items = [i for i in items if i["surface"].strip().lower() == tail]
-        has_detless   = bool(detless_items)
-
-        if has_lower_det or has_detless:
-            # pick earliest det-less span if present; otherwise earliest overall
-            rep_src = detless_items if detless_items else items
-            rep = min(rep_src, key=lambda x: x["start_off"])
-        else:
-            # keep the capitalized 'The …' form when that's the only form seen
-            rep = min(items, key=lambda x: x["start_off"])
+        rep_src = detless_items if (has_lower_det or detless_items) else items
+        rep = min(rep_src, key=lambda x: x["start_off"])
 
         surface = text[rep["start_off"]:rep["end_off"]]
         label = rep["label"]; doc = rep["doc"]
@@ -312,22 +354,27 @@ def spacy_candidates_strict(text: str, known_phrases: set[str]) -> list[dict]:
         conf = _score_spacy_entity(surface, rep["start_off"], doc, label)
 
         if "&" in surface and re.search(r"\w\s*&\s*\w", surface):
-            conf = min(0.95, conf + 0.08)
+            conf = min(0.95, (conf or 0.0) + 0.08)
             if not kind:
                 kind = "organization"
 
         out.append(dict(surface=surface,
                         start_off=rep["start_off"], end_off=rep["end_off"],
-                        kind_guess=kind, context=None, confidence=conf))
+                        kind_guess=kind, context=None,
+                        confidence=conf,
+                        is_possessive=int(rep.get("is_possessive", 0))))
 
-    # dedup exact surface+span
+    # dedup exact surface+span first
     seen, uniq = set(), []
     for c in out:
         k = (c["surface"].strip(), c["start_off"], c["end_off"])
-        if k in seen: 
+        if k in seen:
             continue
-        seen.add(k); uniq.append(c)
-    return uniq
+        seen.add(k)
+        uniq.append(c)
+
+    # finally, collapse possessive vs base
+    return dedupe_possessives(uniq)
 
 def noun_chunk_candidates(text: str) -> list[dict]:
     doc = spacy_doc(text)
@@ -414,12 +461,25 @@ def _inside_any(span: tuple[int,int], spans: list[tuple[int,int]]) -> bool:
     s,e = span
     return any(s>=ps and e<=pe for ps,pe in spans)
 
+def _compute_is_possessive_following_span(doc, start_char: int, end_char: int) -> bool:
+    """True if a POS ('s/’s) token immediately follows [start_char:end_char]."""
+    sp = doc.char_span(start_char, end_char, alignment_mode="contract")
+    if sp is None:
+        # fallback: surface suffix check
+        return _is_surface_possessive(doc.text[start_char:end_char])
+    if sp.end < len(doc):
+        t = doc[sp.end]
+        return (t.tag_ == "POS" and t.text in ("'s", "’s"))
+    return False
+
 def heuristic_candidates_spacy(doc, known_spans) -> list[dict]:
     out = []
     def add(surface, s, e, bonus=0.0):
         if _inside_any((s,e), known_spans): return
+        is_possessive = 1 if _compute_is_possessive_following_span(doc, s, e) else 0
         out.append(dict(surface=surface, start_off=s, end_off=e,
-                        kind_guess=None, context=None, confidence=0.5+bonus))
+                        kind_guess=None, context=None, confidence=0.5+bonus,
+                        is_possessive=is_possessive))
     for sent in doc.sents:
         # contiguous non-punct tokens only
         toks = [t for t in sent if not t.is_punct and not t.is_space]
@@ -437,7 +497,7 @@ def heuristic_candidates_spacy(doc, known_spans) -> list[dict]:
             if i+2<n:
                 s = toks[i].idx; e = toks[i+2].idx+len(toks[i+2].text)
                 add(doc.text[s:e], s, e, bonus=0.15)
-    return out
+    return dedupe_possessives(out)
 
 def drop_overlapped_shorter(cands: list[dict]) -> list[dict]:
     """Keep the longest when two candidates overlap in the same region"""

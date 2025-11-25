@@ -164,6 +164,7 @@ class ThemeManager:
         self._idx = 0
         self._base_pt = 10.0
         self._scale = 1.0  # 1.0 = 100%
+        self._extra_qss = ""
 
     @property
     def current(self) -> Theme:
@@ -190,6 +191,9 @@ class ThemeManager:
 
     def zoom_reset(self) -> None:
         self._scale = 1.0
+
+    def append_global_qss(self, qss: str):
+        self._extra_qss += (qss or "")
 
     def apply(self, app: QApplication, *, font_family: str = "Inter", base_pt: float | None = None) -> None:
         theme = self.current
@@ -250,6 +254,8 @@ class ThemeManager:
             accent_ok=theme.accent_ok, accent_warn=theme.accent_warn, accent_err=theme.accent_err,
             **nums
         )
+        # self.append_global_qss(WIKILINK_QSS)
+        # app.setStyleSheet(qss + self._extra_qss)
         app.setStyleSheet(qss)
 
 # Singleton-ish helper

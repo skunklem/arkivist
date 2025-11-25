@@ -33,10 +33,11 @@ class _DocWatchHandler(FileSystemEventHandler):
 class DocxRoundTrip(QObject):
     synced = Signal(str)  # emits md text after sync
 
-    def __init__(self, app, chap_id):
+    def __init__(self, app, chap_id, version_id):
         super().__init__()
         self.app = app
         self.chap_id = chap_id
+        self.chapter_version_id = version_id
         self.tmp = None
         self.observer = None
         # COM/Word handles
@@ -61,10 +62,8 @@ class DocxRoundTrip(QObject):
 
     def start(self):
         # --- write MD -> DOCX with Pandoc (as we discussed) ---
-        cur = self.app.db.conn.cursor()
-        cur.execute("SELECT title, content FROM chapters WHERE id=?", (self.chap_id,))
-        row = cur.fetchone()
-        title, md = (row["title"], row["content"] or "")
+        title = self.app.db.chapter_meta(self.chap_id)["title"]
+        md = self.app.db.chapter_content(self.chap_id, version_id=self.chapter_version_id)
         tmpdir = tempfile.mkdtemp(prefix="arkivist_")
         self.tmp = os.path.join(tmpdir, f"{(title or 'chapter').strip()}.docx")
 

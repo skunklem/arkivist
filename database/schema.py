@@ -53,6 +53,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         chapter_id INTEGER NOT NULL,
         version_number INTEGER NOT NULL,
         text TEXT,
+        content_render TEXT,
         text_hash TEXT,
         name TEXT,                     -- optional label like “Draft A”
         is_active INTEGER DEFAULT 1,   -- one active per chapter at a time
@@ -65,6 +66,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     CREATE UNIQUE INDEX IF NOT EXISTS idx_chver_active
         ON chapter_versions(chapter_id)
         WHERE is_active=1;
+    CREATE INDEX IF NOT EXISTS idx_chapters_render ON chapter_versions(id);
 
     -- Outline items for a specific chapter version
     CREATE TABLE IF NOT EXISTS outline_items (
@@ -149,9 +151,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         alias TEXT NOT NULL,
         alias_type TEXT DEFAULT 'alias',
         alias_norm TEXT,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','defunct')),
+        note TEXT,              -- optional per-alias note (persona, differences, etc.)
+        is_primary INTEGER NOT NULL DEFAULT 0,
         deleted BOOLEAN DEFAULT 0,
         FOREIGN KEY(world_item_id) REFERENCES world_items(id)
     );
+    CREATE INDEX IF NOT EXISTS idx_world_aliases_norm_status ON world_aliases(alias_norm, status);
+    CREATE INDEX IF NOT EXISTS idx_world_aliases_item_status ON world_aliases(world_item_id, status);
     CREATE TABLE IF NOT EXISTS alias_types (
         id INTEGER PRIMARY KEY,
         project_id INTEGER NOT NULL,
@@ -165,7 +172,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         relationship TEXT NOT NULL,
         FOREIGN KEY(source_id) REFERENCES world_items(id),
         FOREIGN KEY(target_id) REFERENCES world_items(id)
-    );
+    );        
     """)
 
     # --- Character information ---
@@ -286,25 +293,31 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     CREATE TABLE IF NOT EXISTS ingest_candidates (
         id INTEGER PRIMARY KEY,
         project_id INTEGER NOT NULL,
-        chapter_id INTEGER NOT NULL,
-        chapter_version_id INTEGER NOT NULL,
-        surface TEXT NOT NULL,
+        scope_type TEXT,        -- 'chapter' | 'world_item' | 'note' | 'outline' | ...
+        scope_id INTEGER,       -- the id in that scope (e.g., chapter_id or world_item_id)
+        version_id INTEGER,     --chapters use it - others can leave NULL
+        source TEXT,            -- 'quick' | 'ai' | 'model:name' | etc.
+        candidate TEXT NOT NULL,
+        surface_display TEXT,
+        is_possessive INTEGER DEFAULT 0,
         kind_guess TEXT,                 -- character/place/org/object/concept
         context TEXT,                    -- nearby text snippet
         start_off INTEGER NOT NULL, end_off INTEGER NOT NULL,
         link_world_id INTEGER,           -- if user links it
         status TEXT DEFAULT 'pending',   -- pending/accepted/rejected
+        target_world_item_id INTEGER,    -- if linked to an existing item
         confidence REAL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     CREATE UNIQUE INDEX IF NOT EXISTS uq_ingest_key
-        ON ingest_candidates(project_id, chapter_id, chapter_version_id, surface, start_off, end_off);
+        ON ingest_candidates(project_id, scope_type, scope_id, version_id, candidate, start_off, end_off);
     CREATE INDEX IF NOT EXISTS idx_ingest_by_chapter_status
-        ON ingest_candidates(chapter_id, status);
+        ON ingest_candidates(scope_type, scope_id, status);
     CREATE INDEX IF NOT EXISTS idx_ingest_by_chap_ver
-        ON ingest_candidates(chapter_id, chapter_version_id, status);
-    CREATE INDEX IF NOT EXISTS idx_ingest_surface
-        ON ingest_candidates(project_id, chapter_id, surface);
+        ON ingest_candidates(scope_type, scope_id, version_id, status);
+    CREATE INDEX IF NOT EXISTS idx_ingest_candidate
+        ON ingest_candidates(project_id, scope_type, scope_id, candidate);
     """)
 
     # # --- FTS5 (search) ---

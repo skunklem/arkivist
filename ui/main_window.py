@@ -1,22 +1,28 @@
-import json
-import re, sqlite3
+import re, sqlite3, json, html as html_mod
 from pathlib import Path
 
 from PySide6.QtCore import (
-    Qt, QTimer, QSize, Slot, QEvent, QRectF, QDateTime, QSignalBlocker, Signal, QObject, QSettings, QPoint
+    Qt, QTimer, QSize, Slot, QEvent, QRectF, QDateTime, QSignalBlocker,
+    Signal, QObject, QSettings, QPoint, QUrl, QUrlQuery
 )
-from PySide6.QtGui import QAction, QKeySequence, QIcon, QPainter, QPixmap, QPen, QIcon, QShortcut
+from PySide6.QtGui import (
+    QAction, QKeySequence, QIcon, QPainter, QPixmap, QPen, QIcon,
+    QShortcut, QDesktopServices, QCursor, QPalette, QTextCursor
+)
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QPlainTextEdit, QTextBrowser, QMessageBox,
     QLineEdit, QLabel, QPushButton, QTabWidget, QFileDialog, QToolBar,
-    QDialog, QSizePolicy, QInputDialog, QMenu, QToolButton, QHBoxLayout,
+    QDialog, QSizePolicy, QInputDialog, QMenu, QToolButton, QToolTip,
     QWidgetAction, QAbstractItemDelegate, QStyle, QApplication, QComboBox
 )
+from ui.widgets.outline import OutlineWorkspace
+from ui.widgets.outline import MiniOutlineTab
+from ui.widgets.outline.window import OutlineWindow
+from ui.widgets.extract import compute_metrics, drop_overlapped_shorter, find_known_spans, heuristic_candidates_spacy, spacy_candidates_strict, spacy_doc
 from ui.widgets.extract_pane import ExtractPane
 from ui.widgets.theme_manager import theme_manager
 from ui.widgets.ui_zoom import UiZoom
-from database.db import Database
 from ui.widgets.dialogs import BulkChapterImportDialog, ProjectManagerDialog, WorldImportDialog
 from ui.widgets.world_detail import WorldDetailWidget
 from ui.widgets.world_tree import WorldTree
@@ -25,16 +31,13 @@ from ui.widgets.character_editor import CharacterEditorDialog
 from ui.widgets.character_dialog import CharacterDialog
 from ui.widgets.chapter_todos import ChapterTodosWidget
 from ui.widgets.chapters_tree import ChaptersTree
-from ui.widgets.helpers import DropPane, PlainNoTab, chapter_display_label
-from ui.widgets.common import StatusLine
+from ui.widgets.helpers import DropPane, PlainNoTab, chapter_display_label, normalize_possessive, parse_internal_url, scrub_markdown_for_ner
+from ui.widgets.common import StatusLine, _WikiHoverFilter, AliasPicker
+from database.db import Database
 from utils.icons import make_lock_icon
 from utils.word_integration import DocxRoundTrip
 from utils.md import docx_to_markdown, md_to_html, read_file_as_markdown
 from utils.files import parse_chapter_filename
-from ui.widgets.outline import OutlineWorkspace
-from ui.widgets.outline import MiniOutlineTab
-from ui.widgets.outline.window import OutlineWindow
-from ui.widgets.extract import build_candidates, compute_metrics, drop_overlapped_shorter, find_known_spans, heuristic_candidates_spacy, heuristic_new_entity_candidates, spacy_candidates, noun_chunk_candidates, spacy_candidates_strict, spacy_doc
 
 class StoryArkivist(QMainWindow):
     chaptersOrderChanged = Signal(int, int, 'QVariantList')
@@ -57,6 +60,7 @@ class StoryArkivist(QMainWindow):
 
         self.dev_mode = dev_mode
         self.resize(1200, 700)
+        self._squelch_anchor_until_ms = 0
 
         self.db = Database(db_path)
         self.charactersPage = CharactersPage(self, self.db)
@@ -77,6 +81,7 @@ class StoryArkivist(QMainWindow):
         self.setWindowTitle(f"StoryArkivist — {self.db.project_name(self._current_project_id)} [*]")
 
         # current state
+        self._current_chapter_id = None
         self._current_chapter_id = None
         self._chapter_dirty = False
 
@@ -585,16 +590,548 @@ class StoryArkivist(QMainWindow):
         # toggle
         self._center_set_mode(view_mode=not viewing)
 
+    def _theme_link_colors(self):
+        pal = QApplication.palette(self)
+        link = pal.color(QPalette.Link)        # theme link color
+        hi   = pal.color(QPalette.Highlight)   # good accent in both themes
+        txt  = pal.color(QPalette.Text)        # fallback
+        # Ensure contrast by nudging toward text color if too close to base
+        def hex_(q): return q.name()
+        return {
+            "known": hex_(link),         # known world items
+            "cand_qp": hex_(txt),        # quick-parse candidates (visible in both themes)
+            "cand_ai": hex_(hi),         # AI candidates
+        }
+
+    def _doc_css(self) -> str:
+        c = self._theme_link_colors()
+        return f"""
+    a.wlKnown {{ color:{c['known']};    text-decoration: underline; }}
+    a.wlCandQP{{ color:{c['cand_qp']}; text-decoration: underline; }}
+    a.wlCandAI{{ color:{c['cand_ai']}; text-decoration: underline; }}
+    """.strip()
+
+    def _apply_doc_styles(self, tb: QTextBrowser):
+        tb.document().setDefaultStyleSheet(self._doc_css())
+
     def _render_center_preview(self, version_id: int | None = None):
-        """Render current chapter markdown to HTML in the preview."""
+        """Render current chapter markdown to HTML with wikilinks in the preview."""
         chap_id = self._current_chapter_id
         if chap_id is None:
             self.centerView.setHtml("<i>No chapter selected</i>")
             return
-        md = self.db.chapter_content(chap_id, version_id=version_id) or ""
-        html = md_to_html(md)
-        self.centerView.setHtml(html)
 
+        # 1) Resolve which version we're viewing
+        ver_id = int(version_id) if version_id is not None else (self.db.get_active_version_id(chap_id) or 0)
+
+        # 2) Source text for that version
+        md = self.db.chapter_content(chap_id, version_id=ver_id) or ""
+
+        # 3) Linkify in Markdown space, then render
+        html_content = self._render_html_from_md(md, known_only=False, scope=("chapter", chap_id, ver_id))
+
+        # 4) Persist to chapter_versions.content_render (cache)
+        print("Caching rendered HTML for chapter", chap_id, "version", ver_id)
+        print(html_content[:100])
+        self.db.chapter_version_render_update(ver_id, html_content)
+
+        # 5) Show it
+        self.centerView.document().setDefaultStyleSheet(self._doc_css())
+        self.centerView.setHtml(html_content)
+
+    # --- Wikilink helpers -------------------------------------------------
+    def route_anchor_click(self, qurl):
+        """Central handler for all app-specific anchors."""
+        now = QDateTime.currentMSecsSinceEpoch()
+        last = getattr(self, "_last_anchor_route_ms", 0)
+        if now - last < 300:                 # debounce
+            return
+        self._last_anchor_route_ms = now
+        
+        info = parse_internal_url(qurl)
+        if not info:
+            try: QDesktopServices.openUrl(qurl)
+            except Exception: pass
+            return
+
+        if info["kind"]=="world":
+            edit = QUrlQuery(qurl).queryItemValue("edit")
+            print("load_world_item from route_anchor_click", info["id"], "edit:", edit)
+            self.load_world_item(info["id"], edit_mode=(edit=="1"))
+            return
+
+        if info["kind"] == "suggest":
+            self.show_extract_tab_and_focus(info["id"])
+            # self._open_candidate_editor(info["id"], edit_mode=True)
+            return
+
+    def _on_anchor_hovered(self, href: str):
+        """Connected to QTextBrowser.anchorHovered; href=='' means leaving."""
+        w = self.sender()
+        if not href:
+            QToolTip.hideText()
+            return
+        qurl = QUrl(href)
+        info = parse_internal_url(qurl)
+        if not info:
+            print("No hover card info for", href)
+            QToolTip.hideText()
+            return
+        html_content = self._hover_card_html_for(qurl)
+        print(f"html_content for hover card:\n{html_content}")
+        if not html_content:
+            print("No hover card content for", href)
+            QToolTip.hideText()
+            return
+        QToolTip.showText(QCursor.pos(), html_content, w)
+
+    def _on_popup_anchor_clicked(self, qurl):
+        # prevent underlying view from reacting to the same physical click
+        try:
+            self.parent()._squelch_anchor_until_ms = QDateTime.currentMSecsSinceEpoch() + 400
+        except Exception:
+            pass
+        self.hide()
+        self.parent().route_anchor_click(qurl)
+
+    def _attach_link_handlers(self, tb: QTextBrowser):
+        if not tb:
+            return
+        tb.setOpenExternalLinks(False)
+        tb.setOpenLinks(False)
+        # Ensure any existing hover card hides when a link is followed from the main view
+        tb.anchorClicked.connect(lambda qurl: getattr(self, "_wl_hover", None) and self._wl_hover.card.hide())
+        def _route_if_not_squelched(qurl):
+            now = QDateTime.currentMSecsSinceEpoch()
+            if now < getattr(self, "_squelch_anchor_until_ms", 0):
+                return
+            self.route_anchor_click(qurl)
+        tb.anchorClicked.connect(_route_if_not_squelched)
+        vp = tb.viewport()
+        vp.setMouseTracking(True)
+        if not getattr(vp, "_wl_hover_installed", False):
+            vf = _WikiHoverFilter(self, tb)
+            vp.installEventFilter(vf)
+            vp._wl_hover_installed = True
+            # Keep a ref so the lambda above can find it
+            self._wl_hover = vf
+
+    def show_extract_tab(self):
+        idx = self.bottomTabs.indexOf(self.tabExtract)
+        if idx != -1:
+            self.bottomTabs.setCurrentIndex(idx)
+
+    def show_extract_tab_and_focus(self, cand_id: int):
+        # Ensure Extract tab is visible/active, then delegate:
+        self.show_extract_tab()
+        self.tabExtract.focus_candidate(cand_id)
+
+    def _build_link_index(self) -> dict[str, int]:
+        """lowercased phrase -> world_item_id across titles+aliases (active only)."""
+        pid = getattr(self, "_current_project_id", None)
+        if not pid:
+            return {}
+        # # returns [(wid, phrase_lower), ...]
+        # pairs = self.db.world_phrases_for_project(pid)  # titles + aliases
+        # idx = {}
+        # for wid, phrase in pairs:
+        #     p = (phrase or "").strip().lower()
+        #     if p:
+        #         idx[p] = int(wid)
+        idx = {phrase_norm: wid for (phrase_norm, wid, alias_id) in self.db.world_phrases_for_project_detailed(pid)}
+        return idx
+
+    def _compile_phrase_regex(self, phrases: list[str]):
+        """Build one big alternation regex of phrases, longest-first, case-insensitive."""
+        if not phrases:
+            return None
+        # Sort longest-first to prefer longest multi-word matches
+        phrases_sorted = sorted({p for p in phrases if p}, key=len, reverse=True)
+        # Escape for regex; use word boundary semantics (no letter/number on either side)
+        escaped = [re.escape(p) for p in phrases_sorted]
+        pat = r"(?i)(?<!\w)(" + "|".join(escaped) + r")(?!\w)"
+        return re.compile(pat)
+
+    def _linkify_candidates(self, md: str, chapter_id: int) -> str:
+        cur = self.db.conn.cursor()
+        cands = cur.execute("""
+            SELECT id, candidate, status
+            FROM ingest_candidates
+            WHERE chapter_id=? AND COALESCE(status,'pending') IN ('pending','linked')
+        """, (chapter_id,)).fetchall()
+        if not cands: return md
+
+        # Longest-first phrase match
+        phrases = sorted({(cid, (lbl or "").strip()) for cid,lbl,_ in cands if lbl}, key=lambda x: len(x[1]), reverse=True)
+
+        parts = []
+        for cid, phrase in phrases:
+            parts.append(re.escape(phrase))
+        rx = re.compile(r"(?i)(?<!\w)(" + "|".join(parts) + r")(?!\w)")
+
+        def sub(m):
+            text = m.group(0)
+            # you can also encode the source type in the URL if you track it
+            return f'<a href="suggest://quick/{cid}" class="wl wl-suggest">{text}</a>'
+
+        return rx.sub(sub, md)
+
+    # def _linkify_md(self, md: str, *, exclude_world_id: int | None = None, link_candidates: bool = True) -> str:
+    #     """Insert <a href='world://item/<id>' ...> into Markdown prior to md_to_html()."""
+    #     idx = self._build_link_index()
+    #     if not idx or not md:
+    #         return md
+    #     if exclude_world_id is not None:
+    #         idx = {k: v for k, v in idx.items() if v != exclude_world_id}
+    #     rx = self._compile_phrase_regex(list(idx.keys()))
+    #     if not rx:
+    #         return md
+
+    #     def _sub(m: re.Match):
+    #         candidate = m.group(0)
+    #         wid = idx.get(candidate.lower())
+    #         if not wid:
+    #             return candidate
+    #         return f'<a href="world://item/{wid}" data-wid="{wid}" class="wl wl-known">{candidate}</a>'
+
+    #     md_linked = rx.sub(_sub, md)
+    #     if link_candidates:
+    #         md_linked = self._linkify_candidates(md_linked, self._current_chapter_id)
+    #     return md_linked
+
+    def _linkify_md(self, md: str, *,
+                    known_only: bool = True,
+                    scope: tuple[str, int, int | None] | None = None,  # ('chapter'|'world_item'|..., id, version_id?)
+                    exclude_world_id: int | None = None) -> str:
+        """
+        known_only=True: only titles/active aliases.
+        known_only=False: include candidates for the given scope (must pass scope).
+        scope expands beyond chapters now: ('chapter', chap_id, ver_id), ('world_item', wid, None), etc.
+        """
+        if known_only:
+            return self._linkify_md_known_only(md, exclude_world_id=exclude_world_id)
+        print(f"Linkifying MD with candidates for scope {scope}")
+        return self._linkify_md_including_candidates(md, scope=scope, exclude_world_id=exclude_world_id)
+
+    def _linkify_md_including_candidates(self, md: str, *,
+                                        scope: tuple[str, int, int | None] | None,
+                                        exclude_world_id: int | None = None,
+                                        prefilter_with_refs: bool = True) -> str:
+        """
+        scope = (scope_type, scope_id, version_id_or_None)
+        Pull candidates only for that scope (fast) and never override a known match.
+        """
+        if not md:
+            print("No MD to linkify")
+            return md
+        pid = self._current_project_id
+
+        # scope → (doc_type, doc_id, version_id)
+        doc_type, doc_id, version_id = (scope or (None, None, None))
+
+        # 1) Optional prefilter: which WIDs are actually present in this text?
+        ids_subset = None
+        if prefilter_with_refs and doc_type and doc_id:
+            ids_subset = list(self.seek_references(md))  # in-memory WID set for this text
+            print(f"Prefiltering known phrases to WIDs present in text: {ids_subset}")
+
+        # 2) known map (phrase_norm -> (wid, alias_id)) (possibly limited)
+        known_pairs = self.db.world_phrases_for_project_detailed(pid, ids_subset)
+        known = {}
+        for phrase, wid, alias_id in known_pairs:
+            if exclude_world_id is not None and int(wid) == int(exclude_world_id):
+                continue
+            known[phrase] = (wid, alias_id)
+
+        # 3) candidates for this exact scope+version (only wrap phrases not already ‘known’)
+        cand = {}
+        if scope:
+            print(f"Fetching candidates for scope {scope}")
+            rows = self.db.candidates_for_scope(
+                project_id=pid, scope_type=doc_type, scope_id=doc_id,
+                version_id=version_id, statuses=("pending",), columns="id, candidate, COALESCE(source,'') AS source"
+                )
+            print(f"[linkify] scope={scope} rows={[(r['id'], r['candidate'], r['source']) for r in rows]}")
+            for cid, txt, src in rows:
+                key = (txt or "").strip().lower()
+                if key and key not in known:
+                    cand[key] = (cid, "ai" if src == "ai" else "quick")
+
+        # 4) compile union (longest-first)
+        print(f"[linkify] scope={scope} prefilter={'yes' if prefilter_with_refs else 'no'}")
+        print(f"[linkify] known={len(known)} keys, cand={len(cand)} keys")
+        print(f"[Linkify] {set(cand.keys())}")
+        print(f"[Linkify] Known phrases: {known}")
+        keys = sorted(set(known.keys()) | set(cand.keys()), key=len, reverse=True)
+        if not keys:
+            return md
+
+        rx = re.compile(r"(?i)(?<![\w'-])(" + "|".join(re.escape(k) for k in keys) + r")(?![\w'-])")
+
+        def sub(m):
+            surf = m.group(0)
+            key = surf.strip().lower()
+            if key in known:
+                wid, alias_id = known[key]
+                href = f"world://item/{wid}"
+                if alias_id is not None:
+                    href += f"?alias={alias_id}"
+                return f'<a class="wlKnown" href="{href}">{surf}</a>'
+            if key in cand:
+                cid, src = cand[key]
+                cls = "wlCandAI" if src == "ai" else "wlCandQP"
+                return f'<a class="{cls}" href="suggest://{src}/{cid}">{surf}</a>'
+            return surf
+
+        return rx.sub(sub, md)
+
+    def _linkify_md_known_only(self, md: str, *, exclude_world_id: int | None = None,
+                                prefilter_with_refs: bool = True, doc_type: str | None = None,
+                                doc_id: int | None = None) -> str:
+        if not md:
+            return md
+        pid = self._current_project_id
+
+        # 1) Optional prefilter: which WIDs are actually present in this text?
+        ids_subset = None
+        if prefilter_with_refs and doc_type and doc_id:
+             ids_subset = list(self.seek_references(md))  # fast in-memory; no persistence
+
+        # 2) Build known phrases (optionally limited to subset of WIDs)
+        known_pairs = self.db.world_phrases_for_project_detailed(pid, ids_subset)
+        known = {}
+        for phrase, wid, alias_id in known_pairs:
+            if exclude_world_id is not None and int(wid) == int(exclude_world_id):
+                continue
+            known[phrase] = (wid, alias_id)
+
+        if not known:
+            return md
+
+        keys = sorted(known.keys(), key=len, reverse=True)
+        rx = re.compile(r"(?i)(?<![\w'-])(" + "|".join(re.escape(k) for k in keys) + r")(?![\w'-])")
+
+        def sub(m):
+            surf = m.group(0)
+            wid, alias_id = known[surf.strip().lower()]
+            href = f"world://item/{wid}"
+            if alias_id is not None:
+                href += f"?alias={alias_id}"
+            return f'<a class="wlKnown" href="{href}">{surf}</a>'
+
+        return rx.sub(sub, md)
+
+    def _open_candidate_editor(self, candidate_id: int, edit_mode: bool = False):
+        row = self.db.ingest_candidate_row(candidate_id)
+        if not row: 
+            return
+        surf = (row["candidate"] or "").strip()
+        kind = (row["kind_guess"] or "").strip().lower()  # guesses: character/place/org/object/concept
+
+        if not edit_mode:
+            # View mode but world item doesn't exist yet
+            # TODO: replace this with a dialog to choose Create/Alias/Reject
+            # Simply focus in Extract tab for now
+            cid = row["id"]
+            self.tabExtract.focus_candidate(candidate_id)
+            return
+
+        # edit_mode True
+        canonical = {"person":"character", "char":"character"}
+        k = canonical.get(kind, kind or "misc")
+
+        if k == "character":
+            # Create/find, open CharacterDialog
+            wid = row["target_world_item_id"] or self.ensure_world_item_from_candidate(row)
+            if wid:
+                print("Opening character editor from _open_candidate_editor")
+                self.open_character_dialog(wid)
+            return
+
+        # Other kinds: open right panel in edit mode
+        wid = row["target_world_item_id"] or self.ensure_world_item_from_candidate(row)
+        if wid:
+            # Optional: seed starter MD if brand-new and none exists
+            meta = self.db.world_item_meta(wid)
+            md   = (meta["content_md"] or "").strip()
+            if not md:
+                scaffold = f"# {surf}\n\n"
+                self.db.world_item_update_content(wid, scaffold)
+                self.rebuild_world_item_render(wid)  # keep render in sync
+            print("load_world_item from _open_candidate_editor", wid, "edit:", True)
+            self.load_world_item(wid, edit_mode=True)
+
+    def resolve_candidate_chapter_and_version(self, cand_id: int) -> tuple[int | None, int | None]:
+        cand_row = self.db.ingest_candidate_row(cand_id)
+        if cand_row:
+            chap_id = cand_row["scope_id"]
+            ver_id = cand_row["version_id"]
+            return chap_id, ver_id
+        print(f"Warning: candidate id {cand_id} not found when resolving chapter/version.")
+        return None, None
+
+    def resolve_candidate_to_existing(self, cand_id: int, wid: int, also_alias: bool):
+        cur = self.db.conn.cursor()
+        # 1) mark candidate as linked
+        cur.execute("UPDATE ingest_candidates SET status='linked', target_world_item_id=? WHERE id=?",
+                    (wid, cand_id))
+        # 2) optional alias
+        if also_alias:
+            # Pull candidate
+            row = cur.execute("SELECT label FROM ingest_candidates WHERE id=?", (cand_id,)).fetchone()
+            if row and row[0]:
+                alias = row[0].strip()
+                if alias:
+                    cur.execute("INSERT INTO world_aliases(world_item_id, alias, status, deleted) VALUES(?, ?, 'active', 0)",
+                                (wid, alias))
+        self.db.conn.commit()
+        # 3) refresh
+        # self.recompute_chapter_references(self._current_chapter_id)
+        chap_id, ver_id = self.resolve_candidate_chapter_and_version(cand_id)
+        self.recompute_chapter_references(chapter_id=chap_id, chapter_version_id=ver_id, text=None)
+        self._render_center_preview(ver_id)
+
+    def accept_candidate_create(self, cand_id: int):
+        """
+        Convenience wrapper: accept as NEW world item (no alias-of picker).
+        """
+        return self.accept_candidate(cand_id, as_alias_of=None)
+
+    def pick_alias_target(self) -> int | None:
+        dlg = AliasPicker(self.db.conn, self._current_project_id, self)
+        return dlg.sel_wid if dlg.exec() == dlg.Accepted else None
+
+    def accept_candidate(self, cand_id: int, *, as_alias_of: int | None = None, add_alias: bool = True, alias_type: str = "alias") -> None:
+        """
+        Accept a candidate:
+        - if as_alias_of is given: add candidate text as an active alias to that item and mark candidate 'linked'
+        - else: create a new world item, add alias == candidate text, mark candidate 'accepted'
+        Always recompute+rerender current chapter version afterwards.
+        """
+        row = self.db.ingest_candidate_row(cand_id)
+        if not row:
+            return
+        (project_id, scope_type, scope_id, version_id,
+        candidate_text, kind_guess, source, confidence, status, target_wid) = row
+
+        title = (candidate_text or "").strip()
+        if not title:
+            return
+
+        if as_alias_of:
+            # Resolve to existing item
+            if add_alias:
+                self.db.alias_add(as_alias_of, title, alias_type=alias_type, status="active", is_primary=0)
+            self.db.ingest_candidate_mark_resolved(cand_id, target_world_item_id=as_alias_of, status="linked")
+        else:
+            # Create a brand-new item titled by the candidate
+            kind = (kind_guess or "item")
+            wid = self.db.world_item_insert(project_id=project_id, item_type=kind, title=title, content_md="")
+            # world_item_insert already adds + primary-sets the title alias; no extra alias call needed.
+            self.db.ingest_candidate_mark_resolved(cand_id, target_world_item_id=wid, status="accepted")
+            # seed starter MD so there's something to render
+            scaffold = f"# {title}\n\nNo content yet.\n"
+            self.db.world_item_update_content(wid, scaffold)
+            self.rebuild_world_item_render(wid)  # keep render in sync
+
+        # Recompute references in current chapter version if applicable
+        if scope_type == "chapter":
+            # Recompute/refresh the chapter we are *currently showing*
+            chap_id = int(scope_id) if scope_id else getattr(self, "_current_chapter_id", None)
+            ver_id = (version_id if version_id else getattr(self, "_view_version_id", None)) or (self.db.get_active_version_id(chap_id) if chap_id else None)
+            if chap_id and ver_id:
+                self.recompute_references(doc_type="chapter", doc_id=chap_id, version_id=ver_id, text=None)
+                self._render_center_preview(ver_id)
+
+    def link_candidate_to_existing(self, cand_id: int, wid: int):
+        cur = self.db.conn.cursor()
+        cur.execute("""
+            UPDATE ingest_candidates
+            SET status='linked', target_world_item_id=?
+            WHERE id=?""", (wid, cand_id))
+        self.db.conn.commit()
+        self._render_center_preview()  # relink now that a known item exists
+
+    def reject_candidate(self, cand_id: int, rerender: bool = True) -> None:
+        self.db.ingest_candidate_mark_dismissed(cand_id)
+        # Optionally re-render if you overlay candidates everywhere
+        if rerender:
+            self.rerender_center_and_extract()
+
+    def rerender_center_and_extract(self):
+        chap_id = getattr(self, "_current_chapter_id", None)
+        if chap_id:
+            ver_id = self._view_version_id or self.db.get_active_version_id(chap_id)
+            if ver_id:
+                self._render_center_preview(ver_id)
+        if hasattr(self, "tabExtract"):
+            self.tabExtract.refresh()
+
+    def _hover_card_html_for(self, qurl: QUrl) -> str | None:
+        info = parse_internal_url(qurl)
+        if not info:
+            return None
+        cur = self.db.conn.cursor()
+
+        if info["kind"] == "world":
+            wid = info["id"]
+            alias_id = info.get("alias_id")
+            row = cur.execute("""
+                SELECT type, title, content_render, content_md
+                FROM world_items WHERE id=?""", (wid,)).fetchone()
+            if not row:
+                return None
+            kind, title, render, md = row
+            title = html_mod.escape(title or "")
+            kind  = html_mod.escape(kind or "")
+            text  = ""
+            if render:
+                print("HoverCard: using rendered HTML")
+                render = render or ""
+                render = re.sub(r"(?is)<(style|script)[^>]*>.*?</\1>", "", render or "")  # drop style/script blocks fully
+                text = re.sub(r"(?s)<[^>]+>", "", render).strip()
+            elif md:
+                print("HoverCard: using markdown snippet")
+                text = (md or "")
+            text = html_mod.escape(text.strip())[:240]
+            print(f"HoverCard: {title} {kind}\n{text}")
+
+            alias_note_html = ""
+            if alias_id:
+                arow = cur.execute("SELECT note FROM world_aliases WHERE id=?", (alias_id,)).fetchone()
+                if arow and arow[0]:
+                    alias_note_html = f'<div style="margin-top:4px; font-style:italic; opacity:.85;">{html_mod.escape(arow[0])}</div>'
+
+            return f"""
+            <div style="max-width:420px;">
+            <div style="font-weight:600; margin-bottom:4px;">{title}</div>
+            <div style="opacity:.7; font-size:90%; margin-bottom:4px;">{kind}</div>
+            <div style="margin-bottom:6px;">{text}</div>
+            {alias_note_html}
+            <div style="margin-top:6px;"><a href="world://item/{wid}?edit=1">Edit</a></div>
+            </div>"""
+
+        if info["kind"] == "suggest":
+            cid = info["id"]
+            row = cur.execute("""
+                SELECT candidate, kind_guess, confidence
+                FROM ingest_candidates WHERE id=?""", (cid,)).fetchone()
+            if not row:
+                return None
+            label, s_type, conf = row
+            label = html_mod.escape(label or "")
+            s_type = html_mod.escape(s_type or "item")
+            conf_txt = f"{int((conf or 0)*100)}%"
+            return f"""
+            <div style="max-width:420px;">
+            <div style="font-weight:600; margin-bottom:4px;">{label}</div>
+            <div style="opacity:.7; font-size:90%; margin-bottom:4px;">suggested {s_type} · confidence {conf_txt}</div>
+            <div style="margin-top:6px;"><a href="suggest://quick/{cid}">Open in Extract</a></div>
+            </div>"""
+
+        return None
+
+    # --- Word Sync --------------------------------------------------------
     def _toggle_word_sync_clicked(self):
         if getattr(self, "_word_lock_chapter_id", None) == getattr(self, "_current_chapter_id", None):
             self.action_stop_word_sync()
@@ -642,27 +1179,21 @@ class StoryArkivist(QMainWindow):
         if key.startswith("culture"):   return "culture"
         return "misc"
 
-    def load_world_item(self, world_item_id: int, edit_mode: bool = False):
+    def load_world_item(self, world_item_id: int, edit_mode: bool = False, item_type: str = None):
         """Show a world item in the right panel and focus it in the tree."""
-        # Prefer the widget’s own loader if present
-        if hasattr(self.worldDetail, "show_item"):
-            self.worldDetail.show_item(world_item_id, view_mode=not edit_mode)
-        else:
-            # minimal fallback
-            row = self.db.world_item_meta(world_item_id)
-            if not row:
-                return
-            title, md, html = ((row["title"], row["content_md"], row["content_render"])
-                            if isinstance(row, sqlite3.Row) else row)
-            # ensure right panel shows View mode with rendered HTML
-            if hasattr(self.worldDetail, "set_mode"):
-                self.worldDetail.set_mode("view")
-            if hasattr(self.worldDetail, "view"):
-                self.worldDetail.view.setHtml(html or "")
-            if hasattr(self.worldDetail, "edit"):
-                self.worldDetail.edit.setPlainText(md or "")
-            if hasattr(self.worldDetail, "_current_world_item_id"):
-                self.worldDetail._current_world_item_id = world_item_id
+        if not item_type:
+            item_type = self.db.world_item_type(world_item_id)
+        if item_type == "character" and edit_mode:
+            print("Opening character editor from load_world_item")
+            self.open_character_dialog(world_item_id)
+            edit_mode = False # always view mode for characters in world panel
+        self.worldDetail.show_item(world_item_id, view_mode=not edit_mode)
+
+        # place the caret at the end when opening edit mode for non-characters:
+        if edit_mode and getattr(self.worldDetail, "editor", None):
+            ed = self.worldDetail.editor
+            ed.moveCursor(QTextCursor.End)
+            ed.setFocus(Qt.OtherFocusReason)
 
         # focus/select in the world tree if possible
         self.focus_world_item_in_tree(world_item_id)
@@ -756,6 +1287,9 @@ class StoryArkivist(QMainWindow):
     #         self.load_world_item(char_id, edit_mode=False)
 
     def open_character_dialog(self, char_id: int, refresh_world_panel_on_close=True):
+        import traceback, time
+        print(f"[char-dialog] open wid={char_id} t={time.time()} stack:")
+        traceback.print_stack(limit=6)
         dlg = CharacterDialog(self, self.db, char_id, self)
         if refresh_world_panel_on_close:
             dlg.finished.connect(
@@ -780,13 +1314,15 @@ class StoryArkivist(QMainWindow):
         else:
             # immediate delete (not recorded on outline stack)
             self.outlineWorkspace.page.undoController._apply_delete_step(
-                chap_id, payload=None, undo=False, db=self.db
+                chap_id, undo=False, db=self.db,
+                payload={"project_id": self._current_project_id, "book_id": self._current_book_id, "position": None}
             )
 
         # 2) Refresh the tree UI
         self.populate_chapters_tree()
         # clear editor if we just hid the active chapter
         if getattr(self, "_current_chapter_id", None) == chap_id:
+            self._current_chapter_id = None
             self._current_chapter_id = None
             self.titleEdit.setText("")
             self.centerEdit.setPlainText("")
@@ -1185,7 +1721,7 @@ class StoryArkivist(QMainWindow):
         meta = self.db.chapter_meta(chap_id)
         pid, from_book = meta["project_id"], meta["book_id"]
         # Move to target index (your API):
-        self.db.chapter_move_to_index(chap_id, to_index, to_book_id)
+        self.db.chapter_move_to_index(pid, to_book_id, chap_id, to_index)
         # Compact both books (source & dest) in case of inter-book move
         self.db.chapter_compact_positions(pid, from_book)
         if to_book_id != from_book:
@@ -1396,8 +1932,8 @@ class StoryArkivist(QMainWindow):
         self.centerEdit = QPlainTextEdit()
         self.centerEdit.textChanged.connect(self._center_mark_dirty)
         self.centerView = QTextBrowser()
-        self.centerView.setOpenExternalLinks(True)
-        self.centerView.setOpenLinks(True)
+        self._attach_link_handlers(self.centerView)
+        self._apply_doc_styles(self.centerView)
 
         self.centerPane = DropPane(self)
         cv = QVBoxLayout(self.centerPane)
@@ -1412,6 +1948,18 @@ class StoryArkivist(QMainWindow):
     def _add_right_panel(self):
         # Right detail panel
         self.worldDetail = WorldDetailWidget(self)
+        vb = getattr(self.worldDetail, "get_view_browser", lambda: None)()
+        if vb:
+            self.app._attach_link_handlers(vb)   # uses squelch-aware router + hides card
+            self._install_wikilink_hover(vb)     # hover behavior
+
+    def _install_wikilink_hover(self, tb):
+        if not tb: return
+        tb.viewport().setMouseTracking(True)
+        if not getattr(tb, "_wl_hover_installed", False):
+            self._wl_hover = getattr(self, "_wl_hover", None) or _WikiHoverFilter(self)
+            tb.viewport().installEventFilter(self._wl_hover)
+            tb._wl_hover_installed = True
 
     def _add_bottom_tabs(self):
         # Bottom tabs
@@ -1681,9 +2229,11 @@ class StoryArkivist(QMainWindow):
         # open characters in character editor
         if item_type == "character":
             # self.open_character_editor(new_id)
+            print("Opening character editor from _on_worldtree_item_changed_name")
             self.open_character_dialog(new_id)
         # Open in right panel, EDIT mode, cursor ready
         else:
+            print("load_world_item from _on_worldtree_item_changed_name")
             self.load_world_item(new_id, edit_mode=True)  # use your updated method that replaces old load_world_detail
 
 
@@ -1927,6 +2477,7 @@ class StoryArkivist(QMainWindow):
 
         self.worldTree.expandAll()
 
+    # TODO: make this version-spcific
     def populate_refs_tree(self, chapter_id: int | None):
         t = self.refsTree
         t.clear()
@@ -2285,6 +2836,7 @@ class StoryArkivist(QMainWindow):
         chap_id = getattr(self, "_current_chapter_id", None)
         if chap_id is None:
             return
+        ver_id = self._view_version_id or self.db.get_active_version_id(chap_id)
 
         # 0) Word lock guard
         word_locked_id = getattr(self, "_word_lock_chapter_id", None)
@@ -2305,11 +2857,13 @@ class StoryArkivist(QMainWindow):
 
             if text_changed:
                 # Update preview + references
-                self._render_center_preview()
-                self.recompute_chapter_references(chap_id, md)
+                self.cmd_quick_parse(doc_type="chapter", doc_id=chap_id, version_id=ver_id)
+                # (cmd_quick_parse already recomputes refs and refreshes the preview)
+                # self.recompute_chapter_references(chapter_id=chap_id, chapter_version_id=ver_id, text=None)
+                # self.render_center_preview(version_id=ver_id)
                 self.populate_refs_tree(chap_id)
 
-        # 2) Persist To-Dos/Notes
+        # 2) Persist To-Dos/Notes #TODO: make this version-specific
         if hasattr(self.tabTodos, "save_if_dirty"):
             self.tabTodos.save_if_dirty(chap_id)
 
@@ -2319,21 +2873,12 @@ class StoryArkivist(QMainWindow):
 
 
     # ---------- Reference extraction on save ----------
-    def  recompute_chapter_references(self, chapter_id: int, text: str,
-                                    chapter_version_id: int | None = None) -> None:
-        """
-        Longest-phrase matching across titles + aliases.
-        No raw SQL here; use Database helpers only.
-        """
-        pid = self._current_project_id
-        if chapter_version_id is None:
-            vr = self.db.chapter_active_version_row(chapter_id)
-            if not vr: return
-            chapter_version_id = vr["id"]
-
-        pairs = [(p, wid) for (wid, p) in self.db.world_phrases_for_project(pid)]
+    def seek_references(self, text: str) -> set[int]:
+        """Lists longest-phrase matching across project's known titles + aliases found within text."""
+        # pairs = [(p, wid) for (wid, p) in self.db.world_phrases_for_project(self._current_project_id)]
+        pairs = [(phrase_norm, wid) for (phrase_norm, wid, alias_id) in self.db.world_phrases_for_project_detailed(self._current_project_id)]
         pairs.sort(key=lambda t: len(t[0]), reverse=True)
-        print(f"Recomputing refs for chapter {chapter_id} (ver {chapter_version_id}): {len(pairs)} phrases to match.")
+        print(f"Recomputing refs: {len(pairs)} phrases to match.")
 
         # Normalize haystack: lowercase, collapse whitespace
         hay = re.sub(r"\s+", " ", (text or "").lower()).strip()
@@ -2345,8 +2890,29 @@ class StoryArkivist(QMainWindow):
                 s,e = m.span()
                 if overlaps(s,e): continue
                 found_ids.add(int(wid)); used.append((s,e))
+        return found_ids
 
-        print(f"Found {len(found_ids)} referenced world items in chapter {chapter_id}.")
+    DOC_SCHEMA = {
+        "chapter":   {"text_field": "content_md", "id_field": "id", "versioned": True},
+        "world_item":{"text_field": "content_md", "id_field": "id", "versioned": False},
+        # "note": {"text_field":"...", ...}
+        # NOTE: when updating this, also update recompute_references and db.fetch_text_for_doc
+    }
+
+    def recompute_references(self, *, doc_type, doc_id, version_id=None, text=None):
+        if text is None:
+            text = self.db.fetch_text_for_doc(doc_type=doc_type, doc_id=doc_id, version_id=version_id) or ""
+        # compute occurrences/refs based on doc_type rules
+        found_ids = self.seek_references(text)
+        # persist based on doc_type
+        if doc_type == "chapter":
+            self.persist_chapter_references(doc_id, version_id, found_ids)
+        elif doc_type == "world_item":
+            self.persist_world_item_references(doc_id, found_ids)
+        else:
+            self.persist_references(doc_type=doc_type, doc_id=doc_id, version_id=version_id, found_ids=found_ids)
+
+    def persist_chapter_references(self, chapter_id: int, chapter_version_id: int, found_ids: list[int]):
         # write per-version
         self.db.set_chapter_version_world_refs(chapter_version_id, sorted(found_ids))
         # if this is the active version, mirror to chapter-level for legacy UI
@@ -2354,64 +2920,205 @@ class StoryArkivist(QMainWindow):
         if av and int(av) == int(chapter_version_id):
             self.db.set_chapter_world_refs(chapter_id, sorted(found_ids))
 
+    def persist_references(self, *, doc_type: str, doc_id: int, version_id: int | None, found_ids: list[int]):
+        """Generic persister for recompute_references."""
+        self.db.set_doc_refs(doc_type=doc_type, doc_id=doc_id, version_id=version_id, world_ids=found_ids or [])
+
+    def persist_world_item_references(self, world_item_id: int, found_ids: list[int]):
+        self.db.set_world_item_refs(world_item_id, found_ids or [])
+
+    def  recompute_chapter_references(self, chapter_id: int = None, text: str = None,
+                                    chapter_version_id: int | None = None) -> None:
+        """
+        Fetch the version text (if not provided) and recompute refs
+        Longest-phrase matching across titles + aliases.
+        """
+        if chapter_version_id is None:
+            vr = self.db.chapter_active_version_row(chapter_id)
+            if not vr: return
+            chapter_version_id = vr["id"]
+        if text is None:
+            text = self.db.chapter_content(chapter_id, version_id=chapter_version_id) or ""
+
+        found_ids = self.seek_references(text)
+
+        print(f"Found {len(found_ids)} referenced world items in chapter {chapter_id}.")
+        self.persist_chapter_references(chapter_id, chapter_version_id, found_ids)
+
     def dedup_candidates(self, candidates: list[dict], known_phrases: set[str]) -> list[dict]:
-        """Deduplicate candidate list by (surface.lower(), start_off, end_off)."""
+        """Deduplicate candidate list by (candidate.lower(), start_off, end_off)."""
         seen = set()
         uniq = []
         for c in candidates:
-            key = (c["surface"].strip().lower(), c.get("start_off") or -1, c.get("end_off") or -1)
+            key = (c["candidate"].strip().lower(), c.get("start_off") or -1, c.get("end_off") or -1)
             if key in seen:
                 continue
             seen.add(key)
-            if c["surface"].strip().lower() not in known_phrases:
+            if c["candidate"].strip().lower() not in known_phrases:
                 uniq.append(c)
         return uniq
 
-    def cmd_quick_parse_chapter(self, chapter_id: int, version_id: int | None = None):
+    def quick_parse_text(self, text: str, *, doc_type: str, doc_id: int | None,
+                        version_id: int | None) -> list[dict]:
         """
+        Generic candidate generator for any doc_type.
+        Uses existing spaCy/heuristics functions and project-known phrases.
+        For 'chapter', keeps metrics cache; for others, skips metrics.
+        Returns: [{'surface': str, 'kind_guess': str|None, 'confidence': float|None,
+                'start_off': int|None, 'end_off': int|None}]
+        """
+        pid = self._current_project_id
+        text = text or ""
+
+        # (A) metrics (chapters only)
+        if doc_type == "chapter" and doc_id and version_id is not None:
+            text_hash = self.db.chapter_version_hash(version_id)
+            mrow = self.db.metrics_get(doc_id, version_id, text_hash or "")
+            if not mrow:
+                metrics = compute_metrics(text)
+                self.db.metrics_upsert(doc_id, version_id, text_hash or "", metrics)
+
+        # (B) known phrases (aliases only; already normalized)
+        known = {phrase_norm for (phrase_norm, wid, alias_id)
+                in self.db.world_phrases_for_project_detailed(pid)}
+
+        # (C) baseline candidates (spaCy ents only by default)
+        plain = scrub_markdown_for_ner(text)
+        cand = spacy_candidates_strict(plain, known_phrases=known)
+        print("sorted spacy cands:\n", sorted([c["surface"] for c in cand]))
+        # optionally normalize individual surfaces
+        normed = []
+        for c in cand:
+            base, is_poss = normalize_possessive(c["surface"])
+            # prefer base if both forms end up present later (UI de-dupe handles)
+            c2 = c.copy(); c2["surface"] = base if is_poss else c["surface"]; c2["is_possessive"] = 1 if is_poss else 0
+            normed.append(c2)
+        cand = drop_overlapped_shorter(normed)
+
+        # (D) optional heuristics (same knob used for chapters)
+        if getattr(self, "extract_use_heuristics", False):
+            doc = spacy_doc(plain)
+            supplement = heuristic_candidates_spacy(doc, find_known_spans(plain, known)) if doc else []
+            cand = drop_overlapped_shorter(cand + supplement)
+
+        # (E) De-dupe “simple vs possessive” candidates, preferring base form
+        seen = {}
+        for c in cand:
+            key = c["surface"].lower()
+            prev = seen.get(key)
+            if not prev:
+                seen[key] = c
+            else:
+                # prefer non-possessive
+                if prev.get("is_possessive",0) and not c.get("is_possessive",0):
+                    seen[key] = c
+        cand = list(seen.values())
+        print("sorted final cands:\n", sorted([c["surface"] for c in cand]))
+
+        # print(f"candidates: {cand}")
+        return cand
+
+    def cmd_quick_parse(self, *, doc_type: str, doc_id: int, version_id: int | None = None):
+        """Run quick-parse on any text-bearing doc and upsert scope-specific candidates.
         1) get active text/hash
         2) compute metrics (cache keyed by version+hash)
         3) build ingest candidates (heuristic + optional spaCy)
         """
         pid = self._current_project_id
-        if version_id is None:
-            text, text_hash, ver_id = self.db.chapter_active_text_and_hash(chapter_id)
+
+        # Resolve effective version for chapters
+        if doc_type == "chapter":
+            ver_id = version_id or (self._view_version_id or self.db.get_active_version_id(doc_id))
+            if not ver_id:
+                print(f"[quick-parse] No version resolved for chapter:{doc_id}")
+                return
         else:
-            text = self.db.chapter_content(chapter_id, version_id=version_id) or ""
-            text_hash = self.db.chapter_version_hash(version_id)
-            ver_id = version_id
-        if ver_id is None:
+            ver_id = None  # world_item, notes, etc.
+
+        # Fetch the exact text we’ll parse (so recompute+render see the same text)
+        md = self.db.fetch_text_for_doc(doc_type=doc_type, doc_id=doc_id, version_id=ver_id) or ""
+        if not md.strip():
+            print(f"[quick-parse] Empty text for {doc_type}:{doc_id} ver={ver_id}")
             return
+        print(f"[quick-parse] {doc_type}:{doc_id} ver={version_id} …")
+        # Extract suggestions (spaCy + optional heuristics)
+        suggestions = self.quick_parse_text(md, doc_type=doc_type, doc_id=doc_id, version_id=ver_id)
 
-        # (2) metrics cache
-        mrow = self.db.metrics_get(chapter_id, ver_id, text_hash or "")
-        if not mrow:
-            metrics = compute_metrics(text)
-            self.db.metrics_upsert(chapter_id, ver_id, text_hash or "", metrics)
-
-        # (3) build candidates (Always add spaCy ents)
-        known = {p for _, p in self.db.world_phrases_for_project(pid)}  # lowercased
-        cand = spacy_candidates_strict(text, known_phrases=known) # default: spaCy only
-        # cand = build_candidates(text, known, super_lenient=getattr(self, "extract_lenient", False))
-
-        # Optionally add a stricter heuristic supplement *inside* sentences:
-        if getattr(self, "extract_use_heuristics", False):
-            doc = spacy_doc(text)
-            supplement = heuristic_candidates_spacy(doc, find_known_spans(text, known)) if doc else []
-            cand = drop_overlapped_shorter(cand + supplement)
-
-        print("Quick parse found", len(cand), "candidates.")
-        # persist (upserts; version-aware)
-        for c in cand:
+        # Upsert candidates *with the same resolved scope+version*
+        for s in suggestions:
             self.db.ingest_candidate_upsert(
-                project_id=pid, chapter_id=chapter_id, chapter_version_id=ver_id,
-                surface=c["surface"], kind_guess=c.get("kind_guess"), context=None,
-                start_off=c.get("start_off"), end_off=c.get("end_off"),
-                confidence=c.get("confidence"), status="pending"
+                project_id=pid, scope_type=doc_type, scope_id=doc_id, version_id=ver_id,
+                candidate=s["surface"], kind_guess=s.get("kind_guess"), source="quick",
+                confidence=s.get("confidence"), status="pending",
+                start_off=s.get("start_off"), end_off=s.get("end_off"), context=s.get("context")
             )
+        # Refresh the viewer that shows links for this scope
+        if doc_type == "chapter":
+            # Recompute refs using the *same* md we just parsed
+            self.recompute_chapter_references(chapter_id=doc_id, text=md, chapter_version_id=ver_id)
+            self._render_center_preview(ver_id)
+        elif doc_type == "world_item":
+            self.rebuild_world_item_render(doc_id)
+            self.worldDetail.refresh_if_showing(doc_id)  # small helper, no-op if not visible
 
-        # recompute refs for the viewed version only
-        self.recompute_chapter_references(chapter_id, text, chapter_version_id=ver_id)
+    def cmd_quick_parse_chapter(self, chapter_id: int, version_id: int | None = None):
+        self.cmd_quick_parse(doc_type="chapter", doc_id=chapter_id, version_id=version_id)
+
+    # # TODO: remove old version
+    # def cmd_quick_parse_chapter(self, chapter_id: int, version_id: int | None = None):
+    #     """
+    #     1) get active text/hash
+    #     2) compute metrics (cache keyed by version+hash)
+    #     3) build ingest candidates (heuristic + optional spaCy)
+    #     """
+    #     pid = self._current_project_id
+    #     if version_id is None:
+    #         text, text_hash, ver_id = self.db.chapter_active_text_and_hash(chapter_id)
+    #     else:
+    #         text = self.db.chapter_content(chapter_id, version_id=version_id) or ""
+    #         text_hash = self.db.chapter_version_hash(version_id)
+    #         ver_id = version_id
+    #     if ver_id is None:
+    #         return
+
+    #     # (2) metrics cache
+    #     mrow = self.db.metrics_get(chapter_id, ver_id, text_hash or "")
+    #     if not mrow:
+    #         metrics = compute_metrics(text)
+    #         self.db.metrics_upsert(chapter_id, ver_id, text_hash or "", metrics)
+
+    #     # (3) build candidates (Always add spaCy ents)
+    #     # known = {p for _, p in self.db.world_phrases_for_project(pid)}  # lowercased
+    #     known = {phrase_norm for (phrase_norm, wid, alias_id) in self.db.world_phrases_for_project_detailed(pid)}
+    #     cand = spacy_candidates_strict(text, known_phrases=known) # default: spaCy only
+    #     # cand = build_candidates(text, known, super_lenient=getattr(self, "extract_lenient", False))
+
+    #     # Optionally add a stricter heuristic supplement *inside* sentences:
+    #     if getattr(self, "extract_use_heuristics", False):
+    #         doc = spacy_doc(text)
+    #         supplement = heuristic_candidates_spacy(doc, find_known_spans(text, known)) if doc else []
+    #         cand = drop_overlapped_shorter(cand + supplement)
+    #     print(f"candidates: {cand}")
+
+    #     print("Quick parse found", len(cand), "candidates to upsert for chapter", chapter_id, "version", ver_id)
+    #     # persist (upserts; version-aware)
+    #     for c in cand:
+    #         self.db.ingest_candidate_upsert(
+    #             project_id=pid, scope_type="chapter", scope_id=chapter_id, version_id=ver_id,
+    #             candidate=c["surface"], kind_guess=c.get("kind_guess"), context=None,
+    #             start_off=c.get("start_off"), end_off=c.get("end_off"),
+    #             confidence=c.get("confidence"), status="pending"
+    #         )
+    #     # refresh the viewer that shows links for this scope
+    #     # recompute refs for the viewed version only
+    #     self.recompute_chapter_references(chapter_id, text, chapter_version_id=version_id)
+    #     # after all upserts/commits, refresh center:
+    #     ver_id = version_id or (self._view_version_id or self.db.get_active_version_id(chapter_id))
+    #     if ver_id:
+    #         self._render_center_preview(ver_id)
+
+    def cmd_quick_parse_world_item(self, world_item_id: int):
+        self.cmd_quick_parse(doc_type="world_item", doc_id=world_item_id)
 
     def on_view_version_changed(self, version_id: int | None):
         """User changed the viewed version (does NOT change the book's active version)."""
@@ -2428,17 +3135,6 @@ class StoryArkivist(QMainWindow):
         auto = getattr(self, "auto_parse_on_view_change", True)
         if auto:
             self.cmd_quick_parse_chapter(chap_id, version_id=version_id)
-
-    def create_person_from_selection(self, text: str):
-        choice = self.tabExtract._prompt_person_choice(text)
-        if choice == "alias":
-            wid = self.tabExtract._prompt_pick_world_item(prefill=text, restrict_kind="character")
-            if wid:
-                alias_type = self.tabExtract._prompt_alias_type()
-                if alias_type:
-                    self.db.alias_add(wid, text, alias_type)
-        elif choice == "create":
-            self.find_or_create_world_item(text, "character")
 
     def find_or_create_world_item(self, title_or_alias: str, kind: str) -> int | None:
         """
@@ -2471,7 +3167,7 @@ class StoryArkivist(QMainWindow):
         return wid
 
     def ensure_world_item_from_candidate(self, cand_row) -> int | None:
-        title = (cand_row["surface"] or "").strip()
+        title = (cand_row["candidate"] or "").strip()
         kind = (cand_row["kind_guess"] or "").strip()
         if not kind:
             kind = self._prompt_kind_for_new_item()
@@ -2485,44 +3181,25 @@ class StoryArkivist(QMainWindow):
         return kind if ok else None
 
     # ---------- Render world MD with auto-links ----------
+    def _render_html_from_md(self, md: str, *,
+                            known_only: bool,
+                            scope: tuple[str, int, int | None] | None = None,
+                            exclude_world_id: int | None = None) -> str:
+        md_linked = self._linkify_md(md or "",
+                                    known_only=known_only,
+                                    scope=scope,
+                                    exclude_world_id=exclude_world_id)
+        print("MD linked, known_only:", known_only, "|", md_linked)
+        return md_to_html(md_linked)
+
     def rebuild_world_item_render(self, world_item_id: int):
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT title, content_md FROM world_items WHERE id=?", (world_item_id,))
-        row = cur.fetchone()
-        if not row: 
-            return
-        title, md = row["title"], row["content_md"] or ""
-
-        # Build alias->id map across project
-        alias_map = {}
-        cur.execute("SELECT id, title FROM world_items WHERE project_id=? AND COALESCE(deleted,0)=0", (self._current_project_id,))
-        for wid, ttl in cur.fetchall():
-            if ttl: alias_map[ttl.lower()] = wid
-        cur.execute("""
-            SELECT wa.world_item_id, wa.alias
-            FROM world_aliases wa
-            JOIN world_items wi ON wi.id=wa.world_item_id
-            WHERE wi.project_id=?
-        """, (self._current_project_id,))
-        for wid, alias in cur.fetchall():
-            if alias and alias.lower() not in alias_map:
-                alias_map[alias.lower()] = wid
-
-        # Linkify tokens, but never link to self
-        def linkify(match):
-            w = match.group(0)
-            wid = alias_map.get(w.lower())
-            if wid and wid != world_item_id:
-                return f'<a href="world://{wid}">{w}</a>'
-            # optional: style self mentions (commented out)
-            # if wid == world_item_id:
-            #     return f'<span style="color:#888;text-decoration:underline dotted">{w}</span>'
-            return w
-
-        md_linked = re.sub(r"\b[\w'-]+\b", linkify, md)
-        html = md_to_html(md_linked)
-        cur.execute("UPDATE world_items SET content_render=? WHERE id=?", (html, world_item_id))
-        self.db.conn.commit()
+        md = self.db.world_item_md(world_item_id)
+        html_raw  = self._render_html_from_md(
+            md, known_only=False,
+            scope=("world_item", world_item_id, None),
+            exclude_world_id=world_item_id
+        )
+        self.db.world_item_render_update(world_item_id, html_raw )
 
     # ---------- DnD persistence ----------
     def sync_chapters_order_from_tree(self):
@@ -2698,7 +3375,7 @@ class StoryArkivist(QMainWindow):
         # If already syncing another chapter, stop it
         self.action_stop_word_sync()
 
-        rt = DocxRoundTrip(self, self._current_chapter_id)
+        rt = DocxRoundTrip(self, self._current_chapter_id, self._view_version_id)
         rt.synced.connect(self._apply_word_sync)
         try:
             rt.start()
@@ -2742,10 +3419,7 @@ class StoryArkivist(QMainWindow):
             return
         # Update DB for the locked chapter id, not necessarily the current one
         target_id = locked
-        cur = self.db.conn.cursor()
-        cur.execute("UPDATE chapters SET content=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (md, target_id))
-        self.db.conn.commit()
+        self.db.set_chapter_version_text(self._view_version_id, md)
 
         # If user is viewing that same chapter, update UI preview; keep View mode
         if chap_id == target_id:
@@ -2927,10 +3601,10 @@ class StoryArkivist(QMainWindow):
         id_map_wi = {}
         cur.execute("""SELECT id, category_id, title, content_md, content_render 
                     FROM world_items WHERE project_id=? AND COALESCE(deleted,0)=0""", (src_project_id,))
-        for wid, cat_id, title, md, html in cur.fetchall():
+        for wid, cat_id, title, md, html_content in cur.fetchall():
             ncat = id_map_wc.get(cat_id)
             cur.execute("""INSERT INTO world_items(project_id, category_id, title, content_md, content_render)
-                        VALUES (?,?,?,?,?)""", (new_pid, ncat, title, md, html))
+                        VALUES (?,?,?,?,?)""", (new_pid, ncat, title, md, html_content))
             id_map_wi[wid] = cur.lastrowid
 
         # duplicate aliases
@@ -2970,6 +3644,7 @@ class StoryArkivist(QMainWindow):
         self.populate_world_tree()
         self.populate_refs_tree(None)
         # clear center/right panes
+        self._current_chapter_id = None
         self._current_chapter_id = None
         self.titleEdit.setText("")
         self.centerEdit.setPlainText("")

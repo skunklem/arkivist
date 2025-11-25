@@ -24,15 +24,16 @@ from utils.md import md_to_html
 from ui.widgets.helpers import PlainNoTab
 
 class MiniDoc(QTextBrowser):
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
+    def __init__(self, app, parent=None, *a, **kw):
+        super().__init__(parent, *a, **kw)
+        self.app = app
         self.setFrameShape(QFrame.NoFrame)
         self.setOpenExternalLinks(False)
         self.setOpenLinks(False)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.anchorClicked.connect(self._relay_anchor)
+        self.app._attach_link_handlers(self)
 
         # inherit app palette & keep fully transparent background
         self.setPalette(QApplication.palette(self))
@@ -45,22 +46,14 @@ class MiniDoc(QTextBrowser):
         # no document margin (this cured the tiny indent)
         self.document().setDocumentMargin(0)  # ← remove default margin
 
-    def _relay_anchor(self, url):
-        # parent() chain to WorldDetailWidget and reuse its handler
-        w = self.parent()
-        while w and not hasattr(w, "_anchor_clicked"):
-            w = w.parent()
-        if w:
-            w._anchor_clicked(url)
-
     def setHtmlAndFit(self, html: str):
-        # Strip default margins on body/p
-        html = (
-            "<style>"
-            "html, body { margin:0; padding:0; }"
-            "p { margin:0; }"
-            "</style>" + html
-        )
+        # # Strip default margins on body/p
+        # html = (
+        #     "<style>"
+        #     "html, body { margin:0; padding:0; }"
+        #     "p { margin:0; }"
+        #     "</style>" + html
+        # )
         self.setHtml(html)
         # Fit height to document width
         doc = self.document()
@@ -168,9 +161,8 @@ class WorldDetailWidget(QWidget):
     def _add_views(self):
         # create view/edit widgets inside contentBox (not vbox)
         self.view = QTextBrowser()
-        self.view.setOpenExternalLinks(False)
-        self.view.setOpenLinks(False)
-        self.view.anchorClicked.connect(self._anchor_clicked)
+        self.app._apply_doc_styles(self.view)
+        self.app._attach_link_handlers(self.view)
         self.contentBox.addWidget(self.view)
 
         self.edit = PlainNoTab()
@@ -254,18 +246,26 @@ class WorldDetailWidget(QWidget):
     def _save_current_if_dirty(self):
         if not self._current_world_item_id or not self._dirty:
             return
-        md = self.edit.toPlainText()
-        cur = self.app.db.conn.cursor()
-        cur.execute("UPDATE world_items SET content_md=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (md, self._current_world_item_id))
-        self.app.db.conn.commit()
-        self.app.rebuild_world_item_render(self._current_world_item_id)
+
+        wid = self._current_world_item_id
+        md = self.edit.toPlainText() or ""
+
+        # 1) persist MD (DB helper)
+        self.app.db.world_item_update_content(wid, md)
+
+        # 2) re-render + cache
+        self.app.rebuild_world_item_render(wid)
+
+        # 3) quick-parse this world item so its candidates appear in its view
+        self.app.cmd_quick_parse(doc_type="world_item", doc_id=wid, version_id=None)
+
+        # 4) UI state
         self._dirty = False
         if hasattr(self, "statusLine"):
             self.statusLine.set_saved_now()
 
-        if getattr(self.app, "_current_world_item_id", None):
-            self.app.show_world_item(self._current_world_item_id, edit_mode=False)
+        # 5) refresh the visible view (remain in view mode after save)
+        self.app.show_world_item(wid, edit_mode=False)
 
     def _delete_layout(self, layout):
         """Recursively delete all items (widgets or sublayouts) from a *child* layout."""
@@ -364,7 +364,7 @@ class WorldDetailWidget(QWidget):
             
             self.app.db.ui_pref_set(self.app._current_project_id, "world:last_item_id", str(world_item_id))
 
-            self.lblTitle.setText(item["title"] or "World Detail")
+            self.lblTitle.setText("World Detail")
 
             if item["type"] == "character":
                 # build character summary in contentBox
@@ -427,7 +427,7 @@ class WorldDetailWidget(QWidget):
 
         # Description
         self._add_label(self.contentBox, "<b>Character Description</b>", set_size_policy=False)
-        desc = MiniDoc(self)
+        desc = MiniDoc(app=self.app)
         desc.setHtmlAndFit(md_to_html(md or ""))
         self.contentBox.addWidget(desc)
 
@@ -483,29 +483,15 @@ class WorldDetailWidget(QWidget):
 
     def _anchor_clicked(self, qurl):
         """Handle world:// links from QTextBrowser & QLabel."""
-        url = qurl.toString()
-        # Accept several patterns:
-        #   world://123
-        #   world://item/123
-        #   world://0.0.0.123   (old buggy pattern you saw)
-        m = re.search(r'world://(?:item/)?(\d+)$', url)
-        if not m:
-            m = re.search(r'world://(?:[\d.]*)(\d+)$', url)
-        if m:
-            wid = int(m.group(1))
-            # Use your centralized loader:
-            if hasattr(self.app, "load_world_item"):
-                self.app.load_world_item(wid, edit_mode=False)
-            return
+        # delegate to app if available (single routing point)
+        if hasattr(self, "app") and hasattr(self.app, "route_anchor_click"):
+            return self.app.route_anchor_click(qurl)
 
-        # Fallback: ignore unknown schemes (don't hand to OS)
-        # Optionally: handle http(s) internally if you have external docs
-        # e.g., QDesktopServices.openUrl(qurl) for http(s) only:
-        # If you also hyperlink http(s), optionally allow:
-        # if url.startswith("http"):
-        #     QDesktopServices.openUrl(qurl)
-        # else:
-        #     print("Unknown link scheme:", url)
+        # Fallback (should rarely run)
+        url = qurl.toString()
+        m = re.search(r'world://(?:item/)?(\d+)$', url) or re.search(r'world://(?:[\d.]*)(\d+)$', url)
+        if m and hasattr(self, "app") and hasattr(self.app, "load_world_item"):
+            self.app.load_world_item(int(m.group(1)), edit_mode=False)
 
     def refresh(self):
         """Refresh the currently shown item."""
@@ -520,10 +506,7 @@ class WorldDetailWidget(QWidget):
                 e.blockSignals(False)
             self.statusLine.show_neutral("Select an item")
             return
-        cur = self.app.db.conn.cursor()
-        cur.execute("SELECT title, content_md, content_render, type FROM world_items WHERE id=?",
-                    (self._current_world_item_id,))
-        row = cur.fetchone()
+        row = self.app.db.world_item_meta(self._current_world_item_id)
         if not row:
             self.lblTitle.setText("World Detail (missing)")
             if v: v.setHtml("<i>Item not found</i>")
@@ -534,7 +517,7 @@ class WorldDetailWidget(QWidget):
             self.statusLine.show_neutral("Missing")
             return
 
-        title, md, html, wtype = row
+        title, md, html, wtype = row["title"], row["content_md"], row["content_render"], row["type"]
         self.lblTitle.setText(title or "World Detail")
 
         if wtype == "character":
@@ -552,3 +535,7 @@ class WorldDetailWidget(QWidget):
             e.blockSignals(False)
             self._dirty = False
             self.statusLine.show_neutral("Editing")
+
+    def get_view_browser(self):
+        """Return the QTextBrowser used for view mode, if present."""
+        return self._views.get("view")
