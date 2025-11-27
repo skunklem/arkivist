@@ -14,6 +14,7 @@ class MiniOutlineTab(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._version_name = "v1"  # current version mini is meant to show
 
         # UI setup
         v = QtWidgets.QVBoxLayout(self)
@@ -71,6 +72,9 @@ class MiniOutlineTab(QtWidgets.QWidget):
 
     # ------- public API -------
 
+    def set_outline_version_name(self, vname: str):
+        self._version_name = vname
+
     def set_workspace(self, ws: "OutlineWorkspace"):
         """Attach a workspace and register as the 'single mini'."""
         self._workspace = ws
@@ -90,9 +94,35 @@ class MiniOutlineTab(QtWidgets.QWidget):
         self._row = self._workspace.row_for_chapter_id(chap_id) if self._workspace else -1
         self._mirror_from_pane()
 
-    def refresh_from_workspace(self):
-        """Explicitly refresh (e.g., after version change in header/workspace)."""
-        self._mirror_from_pane()
+    def refresh_from_workspace(self, *, reason: str = "", cid: int | None = None):
+        if cid is None:
+            cid = getattr(self, "_chap_id", None)
+        if not cid or cid != getattr(self, "_chap_id", None):
+            return
+
+        ws  = self._workspace
+        app = self.window()
+
+        view_name = (app.view_version_name_for(cid) or "").strip()
+        ws_name   = (ws.current_version_name_for(cid) or "").strip()
+        print(f"[MINI refresh] reason={reason} cid={cid} mini_ver='{getattr(self, '_version_name', None)}' "
+            f"VIEW='{view_name}' WS='{ws_name}'")
+
+        if view_name and ws_name and (view_name == ws_name):
+            print("[MINI refresh] ACTION: MIRROR_FROM_PANE")
+            self._mirror_from_pane()
+            return
+
+        # Different versions ⇒ show exact requested version for the *view*
+        lines = ws.version_lines_for_chapter_id(cid, view_name) if view_name else []
+        print(f"[MINI refresh] ACTION: LOAD_STATIC view='{view_name}' lines={len(lines)}")
+        self.editor.blockSignals(True)
+        try:
+            self.editor.set_lines(lines or [])
+            # For static show, put caret at start; it’s display-only
+            self.editor.clamp_and_place_cursor(0, 0) # TODO: maybe hide caret in mini
+        finally:
+            self.editor.blockSignals(False)
 
     # ------- private helpers -------
 
@@ -124,6 +154,14 @@ class MiniOutlineTab(QtWidgets.QWidget):
         if self._row < 0 or self._row >= len(page.panes):
             return None
         return page.panes[self._row]
+
+    def set_version_name(self, vname: str):
+        self._version_name = vname  # store desired view-version label
+
+    def set_version_by_id(self, ver_id: int):
+        # optional convenience, resolve to name via workspace/db, then call set_version_name()
+        name = self._workspace.page.model.version_name_for_id(self._chap_id, ver_id)
+        self.set_version_name(name)
 
     def _mirror_from_pane(self):
         p = self._pane_for_row()
@@ -284,7 +322,7 @@ class MiniOutlineTab(QtWidgets.QWidget):
                 p.editor.blockSignals(False)
 
             self._workspace.page._indent_outdent(p, delta)
-            self._mirror_from_pane()
+            self.mirror_from_pane()
         finally:
             self._applying_from_mini = False
 

@@ -108,3 +108,30 @@ class ChaptersModel(QtCore.QAbstractListModel):
         if not isinstance(idx, QtCore.QModelIndex) or not idx.isValid():
             return -1
         return self.chapter_id_for_row(idx.row())
+
+    def chapter_by_id(self, cid: int):
+        for ch in self._chapters:
+            if getattr(ch, "id", None) == cid:
+                return ch
+        return None
+
+    def version_by_name_for_cid(self, cid: int, name: str):
+        ch = self.chapter_by_id(cid)
+        if not ch:
+            return None
+        for v in getattr(ch, "versions", []) or []:
+            if v.name == name:
+                return v
+        return None
+
+    def version_name_for_id(self, cid: int, ver_id: int) -> str | None:
+        ch = self.chapter_by_id(cid)
+        if not ch: return None
+        for v in getattr(ch, "versions", []) or []:
+            if getattr(v, "id", None) == ver_id:
+                return v.name
+        return None
+
+    def version_id_for_name(self, cid: int, name: str) -> int | None:
+        v = self.version_by_name_for_cid(cid, name)
+        return getattr(v, "id", None) if v else None

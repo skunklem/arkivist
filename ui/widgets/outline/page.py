@@ -79,17 +79,88 @@ class ChaptersPage(QtWidgets.QWidget):
     def suppress_focus(self, on: bool):
         self._suppress_focus = bool(on)
 
+    def _outline_lines_for(self, cid: int, vname: str) -> list[str]:
+        # Prefer model if available
+        chapter = self.model.chapter_by_id(cid)
+        if chapter:
+            for ver in getattr(chapter, "versions", []) or []:
+                if getattr(ver, "name", "") == vname:
+                    return list(getattr(ver, "lines", []) or [])
+
+        # Fallback to ui_prefs (keeps this robust)
+        proj = self.workspace.project_id
+        raw = self.workspace.db.ui_pref_get(proj, f"outline:{cid}:{vname}") or "[]"
+        try:
+            return json.loads(raw) or []
+        except Exception:
+            print(f"WARNING: Failed to load outline lines for cid={cid} vname={vname}")
+            return []
+
+    @QtCore.Slot(int, str)
+    def on_app_outline_version_changed(self, cid: int, vname: str):
+        """
+        App told us the current outline version for cid changed.
+        Policy:
+          • Mini always follows the app version for that cid.
+          • A pane updates its text ONLY if that pane is already on the same version.
+        """
+        # 1) Update the mini if it's on this chapter
+        mini = getattr(self.workspace, "single_mini", None)
+        if mini and getattr(mini, "_chap_id", None) == cid:
+            mini.set_outline_version_name(vname)
+            # load correct lines for mini directly from model/db
+            lines = self._outline_lines_for(cid, vname)
+            ed = mini.editor
+            ed._suppress_text_undo_event = True
+            self._mirroring_from_pane = True
+            try:
+                ln, col = ed.get_line_col()
+                ed.set_text_and_cursor("\n".join(lines), ln, col)
+            finally:
+                self._mirroring_from_pane = False
+                ed._suppress_text_undo_event = False
+
+        # 2) If a pane for this cid exists and is already on the SAME version, refresh its text
+        p = self.pane_for_cid(cid)
+        if p and getattr(p, "current_version_name", None) == vname:
+            ed = p.editor
+            lines = self._outline_lines_for(cid, vname)
+            ed._suppress_text_undo_event = True
+            self._mirroring_from_pane = True
+            try:
+                ln, col = ed.get_line_col()
+                ed.set_text_and_cursor("\n".join(lines), ln, col)
+                # keep snapshots fresh so undo doesn’t treat this as user text
+                self.undoController.refresh_all_snapshots()
+            finally:
+                self._mirroring_from_pane = False
+                ed._suppress_text_undo_event = False
+
     def _on_pane_text_changed(self, ed):
         uc = self.undoController
         if uc.is_applying() or ed._suppress_text_undo_event:
             return
 
-        # 2) mirror pane → mini as you already do
-        mini = getattr(self.workspace.page, "single_mini", None)
-        if mini and mini._chap_id == uc._chapter_id_for_editor(ed):
-            mini._mirror_from_pane()
+        mini = self.workspace.page.single_mini
+        if not mini:
+            return
 
-        print("PANE textChanged → mirror mini for ed", id(ed))
+        cid = self.workspace.cid_for_editor(ed)
+        if cid is None or getattr(mini, "_chap_id", None) != cid:
+            return  # mini is showing a different chapter
+
+        # WS current version (pane's combo), and Main Window's *view* version
+        ws_name = (self.workspace.current_version_name_for(cid) or "").strip()
+        app = mini.window()
+        view_name = (app.view_version_name_for(cid) or "").strip()
+
+        will_mirror = bool(ws_name and (ws_name == view_name))
+        print(f"[PANE textChanged] cid={cid} ws='{ws_name}' view='{view_name}' "
+            f"mini_cid={mini._chap_id} → {'MIRROR' if will_mirror else 'SKIP'}")
+
+        if will_mirror:
+            mini._mirror_from_pane()
+        # else: keep mini on its independent version
 
     # def _mirror_minis_for_editor(self, ed):
     #     print("PAGE _mirror_minis_for_editor: ctrl", id(self.undoController), "ed", id(ed))
@@ -134,11 +205,8 @@ class ChaptersPage(QtWidgets.QWidget):
         # mirror the mini for this chapter if present
         mini = self.workspace.page.single_mini
         if mini:
-            try:
-                if mini._chap_id == self.undoController._chapter_id_for_editor(ed):
-                    mini._mirror_from_pane()
-            except Exception:
-                pass  # be robust — mirroring is best-effort
+            if mini._chap_id == self.workspace.cid_for_editor(ed):
+                mini.refresh_from_workspace(reason="after-apply", cid=mini._chap_id)
 
     def _pane_for_widget(self, w: QtWidgets.QWidget | None):
         if not w: return None
@@ -267,11 +335,20 @@ class ChaptersPage(QtWidgets.QWidget):
         """Model replaced or fully reset: rebuild all panes from scratch."""
         self._rebuild_all_panes()
 
-
     def _on_pane_version_changed(self, row: int, name: str):
-        ch = self.model._chapters[row]
-        if getattr(ch, "id", None) is not None:
-            self.versionChanged.emit(ch.id, name)
+        # 1) resolve cid from row
+        try:
+            cid = self.model._chapters[row].id
+        except Exception:
+            cid = None
+        if cid is None:
+            return
+
+        # 2) tell the workspace its *pane* version (this is the piece you were missing)
+        self.workspace.set_current_version_name_for(cid, name, source="pane")
+
+        # 3) if you also propagate to the app (StoryArkivist) for persistence or header sync:
+        self.workspace.versionChanged.emit(cid, name)
 
     def _install_undo_hooks(self, pane):
         ed = pane.editor
@@ -342,6 +419,21 @@ class ChaptersPage(QtWidgets.QWidget):
 
         # 4) Pane→mini live mirror for normal typing; ignore during applying
         ed.textChanged.connect(lambda e=ed: self._on_pane_text_changed(e))
+
+        # 5) monitor version change
+        pane.versionChanged.connect(lambda vname, r=row: self._on_pane_version_changed(r, vname))
+
+        # 6) Hook combo changes → page → WS
+        pane.verCombo.currentTextChanged.connect(lambda name, r=row: self._on_pane_version_changed(r, name))
+
+        # 7) Seed WS version for this cid from the combo’s current label
+        try:
+            cid = self.model._chapters[row].id
+            vname = pane.verCombo.currentText().strip()
+            if vname:
+                self.workspace.set_current_version_name_for(cid, vname, source="wire-seed")
+        except Exception:
+            pass
 
         # 8) Keep left list in sync when pane is interacted with
         pane.activated.connect(lambda p=pane: self._select_in_list_by_pane(p))
@@ -769,6 +861,11 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         self.project_id = None       # active project
         self.book_id = None          # active book
 
+        # Keep this filled whenever a pane’s version changes or when we select a version by code
+        # {cid -> version_label}
+        self._current_version_name_by_cid: dict[int, str] = {} # {cid: "v1"/"v2"/...}
+        # mirror to the setter:
+        self.versionChanged.connect(lambda cid, name: self.set_current_version_name_for(cid, name, source="signal"))
         # --- Build UI ---
 
         # Left: chapter list + buttons (expand/collapse all)
@@ -1313,11 +1410,56 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
             return None
         return self.page.panes[row].verCombo.currentText()
 
+
+    def set_current_version_name_for(self, cid: int, name: str, *, source: str = "pane") -> None:
+        prev = self._current_version_name_by_cid.get(cid)
+        self._current_version_name_by_cid[cid] = (name or "").strip()
+        print(f"[WS ver] cid={cid} {source}: '{prev}' → '{self._current_version_name_by_cid[cid]}'")
+
+    def current_version_name_for(self, cid: int) -> str | None:
+        # return what the WS (pane) believes is the current label for this chapter
+        name = self._current_version_name_by_cid.get(cid)
+        return (name or "").strip() if name is not None else None
+
+    def version_lines_for_chapter_id(self, chap_id: int, vname: str) -> list[str]:
+        v = self.page.model.version_by_name_for_cid(chap_id, vname)
+        return list(v.lines) if v else []
+
+    def select_version_for_chapter_id(self, chap_id: int, name: str, *, persist: bool = False) -> None:
+        """
+        Set the workspace's current version label for a chapter and emit versionChanged.
+        By design, this does NOT touch the center-view/mini version unless you wire it to.
+        If you later want persistence for the workspace's pick, you can write a ui_pref here.
+        """
+        if not name:
+            return
+        self._current_version_name_by_cid[chap_id] = name
+        # If you want persistence of the *workspace* pick, you can optionally do:
+        # if persist and getattr(self, "db", None) and getattr(self, "project_id", None):
+        #     self.page.set_current_outline_version_name_for(chap_id, name)  # only if you intend to share keys
+        self.versionChanged.emit(chap_id, name)
+
+    def current_version_id_for(self, chap_id: int) -> int | None:
+        """
+        Convenience: resolve the workspace's current version *id* via DB if available.
+        Safe no-op return if DB helper doesn't exist.
+        """
+        name = self.current_version_name_for(chap_id)
+        if not name:
+            return None
+        db = getattr(self, "db", None)
+        if db and hasattr(db, "outline_version_id_for_label"):
+            try:
+                return db.outline_version_id_for_label(chap_id, name)
+            except Exception:
+                return None
+        return None
+
     def select_version_for_row(self, row: int, name: str):
         if row < 0 or row >= len(self.page.panes):
             return
-        self.page.flush_outline_for_cid(p.chapter.id)
         pane = self.page.panes[row]
+        self.page.flush_outline_for_cid(pane.chapter.id)
         i = pane.verCombo.findText(name)
         if i >= 0:
             pane.verCombo.setCurrentIndex(i)
@@ -1418,16 +1560,7 @@ class OutlineWorkspace(QtWidgets.QMainWindow):
         row = self.row_for_chapter_id(chap_id)
         if row < 0 or row >= len(self.page.panes):
             return None
-        return self.page.panes[row].versionCombo.currentText()
-
-    def select_version_for_chapter_id(self, chap_id: int, name: str):
-        row = self.row_for_chapter_id(chap_id)
-        if row < 0 or row >= len(self.page.panes):
-            return
-        pane = self.page.panes[row]
-        i = pane.versionCombo.findText(name)
-        if i >= 0:
-            pane.versionCombo.setCurrentIndex(i)
+        return self.page.panes[row].verCombo.currentText()
 
     def add_version_for_chapter_id(self, chap_id: int, name: str, clone_from_current=True):
         """Create a new version on that chapter; optionally clone from current."""

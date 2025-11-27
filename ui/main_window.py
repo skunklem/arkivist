@@ -41,6 +41,7 @@ from utils.files import parse_chapter_filename
 
 class StoryArkivist(QMainWindow):
     chaptersOrderChanged = Signal(int, int, 'QVariantList')
+    outlineVersionChanged = Signal(int, str)  # (cid, vname)
 
     # StoryArkivist.__init__ (temporary)
     def _install_key_tracer(self):
@@ -1690,12 +1691,22 @@ class StoryArkivist(QMainWindow):
         if hasattr(self.chaptersTree, "set_reorder_locked"):
             self.chaptersTree.set_reorder_locked(checked)
 
-    def _on_workspace_version_changed(self, chap_id: int, name: str):
-        if chap_id == getattr(self, "_current_chapter_id", None):
-            # keep header combo and mini tab aligned
-            with QSignalBlocker(self.cmbChapterVersion):
-                self.cmbChapterVersion.setCurrentText(name)
-            self.tabMiniOutline.refresh_from_workspace()
+    def _sync_visible_pane_combo_for(self, chap_id: int, vname: str) -> None:
+        p = self.outlineWorkspace.page.pane_for_cid(chap_id)
+        if not p: 
+            return
+        if p.verCombo.currentText() != vname:
+            with QSignalBlocker(p.verCombo):
+                p.verCombo.setCurrentText(vname)
+
+    def _on_workspace_version_changed(self, chap_id: int, vname: str):
+        # persist “workspace’s current version” if you want (ui_prefs) — optional
+        # self.set_current_outline_version_name_for(chap_id, vname)
+
+        # keep the pane’s combo in sync with workspace choice
+        self._sync_visible_pane_combo_for(chap_id, vname)
+
+        # we do NOT touch the mini here — the mini follows the app header (centerView)
 
     def _refresh_outline_and_tree(self, book_id: int, focus_cid: int | None = None):
         pid = self._current_project_id
@@ -1813,6 +1824,12 @@ class StoryArkivist(QMainWindow):
         self.centerEdit.blockSignals(False)
         self._render_center_preview(version_id=self._view_version_id)
 
+        # keep mini outline in sync with center-editor version
+        mini = self.tabMiniOutline
+        if mini and mini._chap_id == chap_id:
+            mini.set_version_by_id(self._view_version_id)
+            mini.refresh_from_workspace(reason="header-version", cid=chap_id)
+
         # Extract aligns to viewed version (no auto-parse here)
         if hasattr(self, "tabExtract"):
             self.tabExtract.set_chapter_version(chap_id, self._view_version_id)
@@ -1821,71 +1838,97 @@ class StoryArkivist(QMainWindow):
         if getattr(self, "auto_parse_on_view_change", True):
             self.cmd_quick_parse_chapter(chap_id, version_id=self._view_version_id)
 
-        # Keep mini outline in sync with workspace
-        if hasattr(self, "tabMiniOutline") and hasattr(self.tabMiniOutline, "refresh_from_workspace"):
-            self.tabMiniOutline.refresh_from_workspace()
+    def select_version_name(self, suggested: str=None, prompt: bool=True, chap_id: int=None) -> str:
+        if not prompt:
+            return suggested
+        # prompt
+        while True:
+            new_name, ok = QInputDialog.getText(self, "New version", "Version name:", text=suggested)
+            if not ok:
+                # restore selection to current version
+                cur = None
+                try:
+                    cur = self.outlineWorkspace.current_version_for_chapter_id(chap_id)
+                except Exception:
+                    pass
+                with QSignalBlocker(self.cmbChapterVersion):
+                    if cur:
+                        self.cmbChapterVersion.setCurrentText(cur)
+                return
+            new_name = new_name.strip()
+            if new_name:
+                break
+            QMessageBox.warning(self, "Name required", "Please provide a version name.")
+        return new_name
+
+    # def view_version_name_for(self, chap_id: int) -> str:
+    #     pid = self._current_project_id
+    #     return self.db.ui_pref_get(pid, f"view_version:{chap_id}") or "v1"
+
+    def view_version_name_for(self, chap_id: int) -> str | None:
+        # whatever your centerView/header considers the current label:
+        return self._view_version_name_by_cid.get(chap_id, "v1")
+
+    def set_view_version_name_for(self, chap_id: int, vname: str) -> None:
+        pid = self._current_project_id
+        self.db.ui_pref_set(pid, f"view_version:{chap_id}", vname)
+        prev = getattr(self, "_view_version_name_by_cid", {}).get(chap_id)
+        self._view_version_name_by_cid[chap_id] = vname
+        print(f"[VIEW set] cid={chap_id} '{prev}' → '{vname}'")
+
+        mini = self.tabMiniOutline
+        if mini and mini._chap_id == chap_id:
+            mini.set_version_name(vname)
+            mini.refresh_from_workspace(reason="view-version-set")
+
+    def create_new_chapter_version(self, chap_id: int):
+        # suggest v{n+1} based on outlineWorkspace count (kept from your code)
+        count = len(self.outlineWorkspace.versions_for_chapter_id(chap_id))
+        name = self.select_version_name(suggested = f"v{count+1}", prompt=False, chap_id=chap_id)
+
+        # 1) Create the version in the WS model (labels/ordering)
+        try:
+            self.outlineWorkspace.add_version_for_chapter_id(
+                chap_id, name, clone_from_current=True)
+        except Exception:
+            pass
+
+        # 2) Create the version in DB for the *center view* (clone current view)
+        ver_id = self._create_new_version_from_current_view(chap_id, name)
+
+        # 3) Select in header (block signals to avoid recursion)
+        with QSignalBlocker(self.cmbChapterVersion):
+            self.cmbChapterVersion.setCurrentText(name)
+
+        # 4) Apply in center view + remember “view version”
+        self._apply_view_version(chap_id, ver_id)
+        self.set_view_version_name_for(chap_id, name)
+        return name, ver_id
 
     def _on_header_version_changed(self, name: str):
         chap_id = getattr(self, "_current_chapter_id", None)
         if not chap_id or not name:
             return
 
+        # --- "New version…" flow ---
         if name == "➕ New version…":
-            # suggest v{n+1} based on outlineWorkspace count (kept from your code)
-            try:
-                count = len(self.outlineWorkspace.versions_for_chapter_id(chap_id))
-            except Exception:
-                count = 0
-            suggested = f"v{count+1}"
+            name, ver_id = self.create_new_chapter_version(chap_id)
+        # --- Normal switch to an existing version label ---
+        else:
+            ver_id = self._resolve_version_id_from_label(chap_id, name)
 
-            # prompt
-            while True:
-                new_name, ok = QInputDialog.getText(self, "New version", "Version name:", text=suggested)
-                if not ok:
-                    # restore selection to current version
-                    cur = None
-                    try:
-                        cur = self.outlineWorkspace.current_version_for_chapter_id(chap_id)
-                    except Exception:
-                        pass
-                    with QSignalBlocker(self.cmbChapterVersion):
-                        if cur:
-                            self.cmbChapterVersion.setCurrentText(cur)
-                    return
-                new_name = new_name.strip()
-                if new_name:
-                    break
-                QMessageBox.warning(self, "Name required", "Please provide a version name.")
-
-            # 1) Update outlineWorkspace model (your existing behavior)
-            try:
-                self.outlineWorkspace.add_version_for_chapter_id(chap_id, new_name, clone_from_current=True)
-            except Exception:
-                pass
-
-            # 2) Create a *DB* version cloned from current viewed version (NOT active)
-            new_ver_id = self._create_new_version_from_current_view(chap_id, new_name)
-
-            # 3) Rebuild header list and select the new label
-            if hasattr(self, "_populate_header_versions"):
-                self._populate_header_versions(chap_id)
-            with QSignalBlocker(self.cmbChapterVersion):
-                self.cmbChapterVersion.setCurrentText(new_name)
-
-            # 4) Apply viewed version using the new DB id (if we have it)
-            self._apply_view_version(chap_id, new_ver_id)
-            return
-
-        # Normal switch to an existing label
-        # Tell workspace first (your behavior)
-        try:
-            self.outlineWorkspace.select_version_for_chapter_id(chap_id, name)
-        except Exception:
-            pass
-
-        # Resolve DB version id for this label and apply 'view'
-        ver_id = self._resolve_version_id_from_label(chap_id, name)
+        # Apply in center view + remember “view version”
         self._apply_view_version(chap_id, ver_id)
+
+        # 1) remember per-chapter header version for the session
+        self._view_version_name_by_cid[chap_id] = name
+        # 2) update the mini to *display* the header’s version
+        self.set_view_version_name_for(chap_id, name)
+
+        # (independent modes) do NOT change WS panes here
+        # if you ever want “linking”, check a flag and call:
+        # if getattr(self, "_link_view_and_outline_versions", False):
+        #     self.outlineWorkspace.select_version_for_chapter_id(chap_id, name)
 
     def _add_center_editor(self):
         topBar = QWidget()
@@ -1916,6 +1959,7 @@ class StoryArkivist(QMainWindow):
         self.cmbChapterVersion.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.cmbChapterVersion.setToolTip("View a different version of this chapter")
         self.cmbChapterVersion.currentTextChanged.connect(self._on_header_version_changed)
+        self._view_version_name_by_cid = {}
 
         topLay = QHBoxLayout(topBar); topLay.setContentsMargins(0,0,0,0)
         topLay.addWidget(self.titleEdit, 1)          # stretch title to use space
@@ -2082,6 +2126,17 @@ class StoryArkivist(QMainWindow):
         act.triggered.connect(slot)
         return act
 
+
+    def _wire_outline_version_bridge(self):
+        # Workspace → Page listens for app-level version changes
+        self.outlineVersionChanged.connect(
+            self.outlineWorkspace.page.on_app_outline_version_changed
+        )
+
+        # If the workspace emits pane version changes, rebroadcast up
+        self.outlineWorkspace.versionChanged.connect(self._on_workspace_version_changed)
+        # (and page already hooked to call self.set_current_outline_version_name_for)
+
     def _wire_actions(self):
         # Chapters tree signals
         self.chaptersTree.itemClicked.connect(self.on_chapter_clicked)
@@ -2111,12 +2166,12 @@ class StoryArkivist(QMainWindow):
 
         # Outline workspace signals
         self.outlineWorkspace.adopt_db_and_scope(self.db, self._current_project_id, self._current_book_id)
-        self.outlineWorkspace.versionChanged.connect(self._on_workspace_version_changed)
         self.outlineWorkspace.chapterInsertRequested.connect(self._on_outline_insert_requested)
         self.outlineWorkspace.chapterRenameRequested.connect(self._on_outline_rename_requested)
         self.outlineWorkspace.chapterMoveRequested.connect(self._on_outline_move_requested)
         self.outlineWorkspace.chapterDeleteRequested.connect(self._on_outline_delete_chapter)
         self.chaptersOrderChanged.connect(self.outlineWorkspace.apply_order_by_ids)
+        self._wire_outline_version_bridge()
 
     def _outline_controller(self):
         return self.outlineWorkspace.page.undoController
@@ -2676,7 +2731,7 @@ class StoryArkivist(QMainWindow):
         with QSignalBlocker(self.cmbChapterVersion):
             self.cmbChapterVersion.clear()
             self.cmbChapterVersion.addItems(names)
-            # self.cmbChapterVersion.addItem("➕ New version…")
+            self.cmbChapterVersion.addItem("➕ New version…")
             self.cmbChapterVersion.setCurrentText(current)
 
     def load_chapter(self, chap_id: int):
@@ -2771,6 +2826,9 @@ class StoryArkivist(QMainWindow):
                 pass
         return outline_row
 
+    def append_new_version_option(self, combo_box: QComboBox):
+        combo_box.addItem("➕ New version…")
+
     def _populate_version_combo(self, outline_row: int, chap_id: int):
         with QSignalBlocker(self.cmbChapterVersion):
             self.cmbChapterVersion.clear()
@@ -2792,6 +2850,7 @@ class StoryArkivist(QMainWindow):
                 for r in rows:
                     label = f"v{r['version_number']}" + ("  (active)" if r["is_active"] else "")
                     self.cmbChapterVersion.addItem(label, userData=int(r["id"]))
+                self.append_new_version_option(self.cmbChapterVersion)
                 # Select active
                 act = self.db.get_active_version_id(chap_id)
                 if act is not None:
@@ -2803,6 +2862,7 @@ class StoryArkivist(QMainWindow):
 
             # Workspace provided names (string list) path:
             self.cmbChapterVersion.addItems(versions)
+            self.append_new_version_option(self.cmbChapterVersion)
             if current_name:
                 self.cmbChapterVersion.setCurrentText(current_name)
             else:
@@ -3120,7 +3180,7 @@ class StoryArkivist(QMainWindow):
     def cmd_quick_parse_world_item(self, world_item_id: int):
         self.cmd_quick_parse(doc_type="world_item", doc_id=world_item_id)
 
-    def on_view_version_changed(self, version_id: int | None):
+    def on_center_version_changed(self, version_id: int | None):
         """User changed the viewed version (does NOT change the book's active version)."""
         chap_id = getattr(self, "_current_chapter_id", None)
         if chap_id is None: return

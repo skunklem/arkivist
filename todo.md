@@ -1,5 +1,6 @@
 TO-Dos
 ## New
+* undo stack: changing versions needs to update the last cursor position (or even act as its own step) so `type > switch v > type > undo` sets cursor at start of last typing step, not end position in previous version.
 * chapter view needs to update with newly ingested links
 * character editor and world panel edit for aliases: right click alias table to change which one is primary (effects label for hover and view of item)
 * link adding: characters should be added to Character tab in world tree, places to Places

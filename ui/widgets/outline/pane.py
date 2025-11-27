@@ -79,6 +79,7 @@ class ChapterPane(QtWidgets.QWidget):
         super().__init__(parent)
         self.model = model
         self.row = row
+        self._current_version_name = "v1"  # sensible default
 
         # --- layout shell ---
         self.setLayout(QtWidgets.QVBoxLayout())
@@ -254,6 +255,15 @@ class ChapterPane(QtWidgets.QWidget):
 
     # --- Data sync helpers ---
 
+    def set_version_name(self, vname: str):
+        if vname == self._current_version_name:
+            return
+        self._current_version_name = vname
+        self.versionChanged.emit(vname)
+
+    def current_version_name(self) -> str:
+        return self._current_version_name
+
     # persistence into the model Chapter struct
     def sync_into_model(self):
         self.chapter.title = (self.titleEdit.text().strip() or "Untitled")
@@ -338,10 +348,8 @@ class ChapterPane(QtWidgets.QWidget):
         self.chapter.active_index = idx
         # 3) load the chosen version into UI
         self._load_version_to_ui()
-        # 4) notify the outside world
+        # 4) notify the outside world (which will set current outline version name)
         self.versionChanged.emit(vname)
-        # 5) set current outline version
-        self.set_current_outline_version_name_for(self.chapter.id, vname)
 
     def _add_version_named(self, name: str, clone_from_current=True):
         # the same logic you use in your "Add version…" action:

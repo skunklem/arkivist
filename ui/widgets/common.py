@@ -362,7 +362,7 @@ class _WikiHoverFilter(QObject):
     def __init__(self, mw, text_browser: QTextBrowser):
         super().__init__(mw)
         self.mw = mw
-        self._hover_debug = True
+        self._hover_debug = False
 
         # weakrefs to avoid touching deleted C++ objects
         self._tb_ref = weakref.ref(text_browser)
