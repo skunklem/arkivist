@@ -3476,22 +3476,34 @@ class StoryArkivist(QMainWindow):
         chap_id = getattr(self, "_current_chapter_id", None)
         locked  = getattr(self, "_word_lock_chapter_id", None)
         if locked is None:
+            # print("[WordSync] No locked chapter; ignoring sync")
             return
-        # Update DB for the locked chapter id, not necessarily the current one
-        target_id = locked
-        self.db.set_chapter_version_text(self._view_version_id, md)
 
-        # If user is viewing that same chapter, update UI preview; keep View mode
+        # Always resolve a concrete version id:
+        target_id = locked
+        ver_id = self._view_version_id or self.db.get_active_version_id(target_id)
+        if not ver_id:
+            # print(f"[WordSync] No version id resolved for chapter {target_id}; aborting sync")
+            return
+
+        # print(f"[WordSync] Applying to chap_id={target_id}, ver_id={ver_id}, len={len(md or '')}")
+
+        # 1) Write updated text to DB
+        self.db.set_chapter_version_text(ver_id, md or "")
+
+        # 2) If the locked chapter is currently visible, update editor + preview
         if chap_id == target_id:
             self.centerEdit.blockSignals(True)
             self.centerEdit.setPlainText(md or "")
             self.centerEdit.blockSignals(False)
-            self._render_center_preview()
+
+            # Keep View mode, but preview the same version we just wrote
+            self._render_center_preview(version_id=ver_id)
             self._center_set_mode(view_mode=True)
 
-        # Update references & refs tree if the locked chapter is the current one
+        # 3) Recompute references + refresh refs tree for that chapter/version
+        self.recompute_chapter_references(chapter_id=target_id, text=md or "", chapter_version_id=ver_id)
         if chap_id == target_id:
-            self.recompute_chapter_references(target_id, md)
             self.populate_refs_tree(target_id)
 
 
