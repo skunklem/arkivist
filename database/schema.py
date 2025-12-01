@@ -233,6 +233,83 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_world_cat_parent_name ON world_categories(project_id, parent_id, lower(name));
     """)
 
+    # --- Tags & Notes tree ---
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS entity_tags (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT,
+        visibility_default TEXT DEFAULT 'public',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    );
+    -- one tag name per project (case-insensitive)
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_tags_project_name
+        ON entity_tags(project_id, lower(name));
+
+    CREATE TABLE IF NOT EXISTS world_item_tags (
+        id INTEGER PRIMARY KEY,
+        world_item_id INTEGER NOT NULL,
+        tag_id INTEGER NOT NULL,
+        source TEXT, -- e.g. 'manual','notes-node:42'
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(world_item_id) REFERENCES world_items(id),
+        FOREIGN KEY(tag_id) REFERENCES entity_tags(id)
+    );
+    -- prevent duplicate tag assignment per item
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_world_item_tags_unique
+        ON world_item_tags(world_item_id, tag_id);
+
+    CREATE TABLE IF NOT EXISTS notes_nodes (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL,
+        parent_node_id INTEGER,
+        title TEXT NOT NULL,
+        node_kind TEXT NOT NULL CHECK (node_kind IN ('category','note','members_container','members_subcategory')),
+        position INTEGER DEFAULT 0,
+        allowed_item_type TEXT,     -- e.g. 'character','location','event' (world_items.type)
+        relationship_label TEXT,    -- semantic label, e.g. 'resident','member','festival'
+        implied_tag_id INTEGER,     -- if set, membership here implies this tag
+        implied_facet_kind TEXT,    -- optional: string key for facet/add-on template (handled in code later)
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(project_id) REFERENCES projects(id),
+        FOREIGN KEY(parent_node_id) REFERENCES notes_nodes(id),
+        FOREIGN KEY(implied_tag_id) REFERENCES entity_tags(id)
+    );
+    -- fast lookup by project/parent for tree building
+    CREATE INDEX IF NOT EXISTS idx_notes_nodes_project_parent
+        ON notes_nodes(project_id, parent_node_id, position);
+
+    CREATE TABLE IF NOT EXISTS notes_docs (
+        id INTEGER PRIMARY KEY,
+        node_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        position INTEGER DEFAULT 0,
+        content_md TEXT,
+        content_render TEXT,
+        visibility TEXT DEFAULT 'public',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(node_id) REFERENCES notes_nodes(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS note_members (
+        id INTEGER PRIMARY KEY,
+        node_id INTEGER NOT NULL,
+        world_item_id INTEGER NOT NULL,
+        position INTEGER DEFAULT 0,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(node_id) REFERENCES notes_nodes(id),
+        FOREIGN KEY(world_item_id) REFERENCES world_items(id)
+    );
+    -- each node/world_item pair only once
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_note_members_node_item
+        ON note_members(node_id, world_item_id);
+    """)
+
     # --- References ---
     cur.executescript("""
         CREATE TABLE IF NOT EXISTS chapter_world_refs (

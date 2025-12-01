@@ -265,7 +265,7 @@ class WorldDetailWidget(QWidget):
             self.statusLine.set_saved_now()
 
         # 5) refresh the visible view (remain in view mode after save)
-        self.app.show_world_item(wid, edit_mode=False)
+        self.app.load_world_item(wid, edit_mode=False)
 
     def _delete_layout(self, layout):
         """Recursively delete all items (widgets or sublayouts) from a *child* layout."""
@@ -535,6 +535,16 @@ class WorldDetailWidget(QWidget):
             e.blockSignals(False)
             self._dirty = False
             self.statusLine.show_neutral("Editing")
+
+    def refresh_if_showing(self, world_item_id: int) -> None:
+        """
+        Refresh the panel only if it's currently showing the given world item.
+
+        Used by quick-parse and other background updates so we don't stomp on
+        whatever else the user is viewing.
+        """
+        if self._current_world_item_id == world_item_id:
+            self.refresh()
 
     def get_view_browser(self):
         """Return the QTextBrowser used for view mode, if present."""

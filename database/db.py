@@ -569,6 +569,113 @@ class Database:
         )
         self.conn.commit()
 
+    def notes_tree_seed(self, project_id: int) -> None:
+        """
+        Seed a basic Notes tree structure for a new project, if it does not
+        already have any notes_nodes. This is only intended for demo /
+        first-run projects.
+        """
+        c = self.conn.cursor()
+        row = c.execute(
+            "SELECT id FROM notes_nodes WHERE project_id=? LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        if row:
+            return  # project already has notes nodes; do not override
+
+        # World Overview note under root
+        overview_node_id = self.notes_node_insert(
+            project_id=project_id,
+            title="World Overview",
+            node_kind="note",
+            parent_node_id=None,
+        )
+        self.notes_doc_insert(
+            node_id=overview_node_id,
+            title="Overview",
+            content_md="# World Overview\n\nUse this note to summarize the big picture of your world.",
+        )
+
+        # Religion category
+        religion_id = self.notes_node_insert(
+            project_id=project_id,
+            title="Religion",
+            node_kind="category",
+            parent_node_id=None,
+        )
+        self.notes_doc_insert(
+            node_id=religion_id,
+            title="Overview",
+            content_md="# Religion\n\nUse this area to describe pantheons, belief systems, and rituals.",
+        )
+
+        # Deities category under Religion
+        deities_id = self.notes_node_insert(
+            project_id=project_id,
+            title="Deities",
+            node_kind="category",
+            parent_node_id=religion_id,
+        )
+        self.notes_doc_insert(
+            node_id=deities_id,
+            title="Overview",
+            content_md="# Deities\n\nHigh-level notes about your gods, spirits, or cosmic beings.",
+        )
+
+        # Members container for Deities (characters only)
+        deities_members_id = self.notes_node_insert(
+            project_id=project_id,
+            title="Members",
+            node_kind="members_container",
+            parent_node_id=deities_id,
+            allowed_item_type="character",
+            relationship_label="deity",
+        )
+        self.notes_doc_insert(
+            node_id=deities_members_id,
+            title="Overview",
+            content_md="# Deity Members\n\nAttach character world items here to mark them as deities.",
+        )
+
+        # Cultures category
+        cultures_id = self.notes_node_insert(
+            project_id=project_id,
+            title="Cultures",
+            node_kind="category",
+            parent_node_id=None,
+        )
+        self.notes_doc_insert(
+            node_id=cultures_id,
+            title="Overview",
+            content_md="# Cultures\n\nNotes on cultures, societies, and social structures.",
+        )
+
+        # Magic / Systems category
+        magic_id = self.notes_node_insert(
+            project_id=project_id,
+            title="Magic & Systems",
+            node_kind="category",
+            parent_node_id=None,
+        )
+        self.notes_doc_insert(
+            node_id=magic_id,
+            title="Overview",
+            content_md="# Magic & Systems\n\nOutline magical systems, technologies, or other special systems here.",
+        )
+
+        # History / Timeline category
+        history_id = self.notes_node_insert(
+            project_id=project_id,
+            title="History & Timeline",
+            node_kind="category",
+            parent_node_id=None,
+        )
+        self.notes_doc_insert(
+            node_id=history_id,
+            title="Overview",
+            content_md="# History & Timeline\n\nMajor eras, events, and turning points.",
+        )
+
     def alias_types_seed(self, project_id: int, aliases: Iterable[str] = ("nickname","pseudonym","title","alias")) -> None:
         c = self.conn.cursor()
         c.executemany("INSERT OR IGNORE INTO alias_types (project_id, name) VALUES (?, ?)", ((project_id, alias) for alias in aliases))
@@ -705,6 +812,439 @@ class Database:
         c.execute("UPDATE world_aliases SET deleted=1 WHERE id=?", (alias_id,))
         self.conn.commit()
 
+    # ---- Tags / classification ----
+
+    def entity_tags_for_project(self, project_id: int) -> list[sqlite3.Row]:
+        """
+        Return all tags defined for this project.
+        """
+        c = self.conn.cursor()
+        c.execute(
+            """SELECT id, project_id, name, description, visibility_default
+               FROM entity_tags
+               WHERE project_id=?
+               ORDER BY lower(name), id""",
+            (project_id,),
+        )
+        return c.fetchall()
+
+    def entity_tag_upsert(
+        self,
+        project_id: int,
+        name: str,
+        description: str = "",
+        visibility_default: str = "public",
+    ) -> int:
+        """
+        Create or update a tag by (project_id, name). Returns tag_id.
+        """
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("Tag name cannot be empty")
+
+        c = self.conn.cursor()
+        row = c.execute(
+            "SELECT id FROM entity_tags WHERE project_id=? AND lower(name)=lower(?)",
+            (project_id, name),
+        ).fetchone()
+
+        if row:
+            tag_id = int(row["id"])
+            c.execute(
+                "UPDATE entity_tags "
+                "SET description=?, visibility_default=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=?",
+                (description, visibility_default, tag_id),
+            )
+            self.conn.commit()
+            return tag_id
+
+        c.execute(
+            "INSERT INTO entity_tags(project_id, name, description, visibility_default) "
+            "VALUES (?,?,?,?)",
+            (project_id, name, description, visibility_default),
+        )
+        self.conn.commit()
+        return int(c.lastrowid)
+
+    def world_item_tags_for_item(self, world_item_id: int) -> list[sqlite3.Row]:
+        """
+        Return all tags attached to a world item, with tag names/descriptions.
+        """
+        c = self.conn.cursor()
+        c.execute(
+            """SELECT wit.id,
+                      wit.world_item_id,
+                      wit.tag_id,
+                      wit.source,
+                      et.name   AS tag_name,
+                      et.description
+               FROM world_item_tags wit
+               JOIN entity_tags et ON et.id = wit.tag_id
+               WHERE wit.world_item_id=?
+               ORDER BY et.name""",
+            (world_item_id,),
+        )
+        return c.fetchall()
+
+    def world_item_tag_add(
+        self,
+        world_item_id: int,
+        tag_id: int,
+        source: str | None = None,
+    ) -> int:
+        """
+        Attach a tag to a world item. Returns world_item_tags.id.
+        If the tag is already present, returns the existing row id.
+        """
+        c = self.conn.cursor()
+        row = c.execute(
+            "SELECT id FROM world_item_tags WHERE world_item_id=? AND tag_id=?",
+            (world_item_id, tag_id),
+        ).fetchone()
+        if row:
+            return int(row["id"])
+
+        c.execute(
+            "INSERT INTO world_item_tags(world_item_id, tag_id, source) VALUES (?,?,?)",
+            (world_item_id, tag_id, source),
+        )
+        self.conn.commit()
+        return int(c.lastrowid)
+
+    def world_item_tag_remove(self, world_item_id: int, tag_id: int) -> None:
+        """
+        Remove a tag from a world item.
+        """
+        c = self.conn.cursor()
+        c.execute(
+            "DELETE FROM world_item_tags WHERE world_item_id=? AND tag_id=?",
+            (world_item_id, tag_id),
+        )
+        self.conn.commit()
+
+    # ---- Notes tree / world notes ----
+
+    def notes_nodes_for_project(self, project_id: int) -> list[sqlite3.Row]:
+        """
+        Return all notes_nodes for a project. You can group/filter in Python.
+        """
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT * FROM notes_nodes WHERE project_id=? "
+            "ORDER BY parent_node_id, position, id",
+            (project_id,),
+        )
+        return c.fetchall()
+
+    def notes_children(self, project_id: int, parent_node_id: int | None) -> list[sqlite3.Row]:
+        """
+        Convenience helper: return children of a given parent (or root nodes if parent_node_id is None).
+        """
+        c = self.conn.cursor()
+        if parent_node_id is None:
+            c.execute(
+                "SELECT * FROM notes_nodes "
+                "WHERE project_id=? AND parent_node_id IS NULL "
+                "ORDER BY position, id",
+                (project_id,),
+            )
+        else:
+            c.execute(
+                "SELECT * FROM notes_nodes "
+                "WHERE project_id=? AND parent_node_id=? "
+                "ORDER BY position, id",
+                (project_id, parent_node_id),
+            )
+        return c.fetchall()
+
+    def notes_node_get(self, node_id: int) -> sqlite3.Row | None:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM notes_nodes WHERE id=?", (node_id,))
+        return c.fetchone()
+
+    def notes_node_insert(
+        self,
+        project_id: int,
+        title: str,
+        node_kind: str,
+        parent_node_id: int | None = None,
+        allowed_item_type: str | None = None,
+        relationship_label: str | None = None,
+        implied_tag_id: int | None = None,
+        implied_facet_kind: str | None = None,
+        position: int | None = None,
+    ) -> int:
+        """
+        Insert a notes_nodes row. If position is None, append after existing siblings.
+        """
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("Notes node title cannot be empty")
+
+        c = self.conn.cursor()
+        if position is None:
+            if parent_node_id is None:
+                row = c.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 "
+                    "FROM notes_nodes "
+                    "WHERE project_id=? AND parent_node_id IS NULL",
+                    (project_id,),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 "
+                    "FROM notes_nodes "
+                    "WHERE project_id=? AND parent_node_id=?",
+                    (project_id, parent_node_id),
+                ).fetchone()
+            position = int(row[0] if row[0] is not None else 0)
+
+        c.execute(
+            """INSERT INTO notes_nodes(
+                   project_id,
+                   parent_node_id,
+                   title,
+                   node_kind,
+                   position,
+                   allowed_item_type,
+                   relationship_label,
+                   implied_tag_id,
+                   implied_facet_kind
+               )
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                project_id,
+                parent_node_id,
+                title,
+                node_kind,
+                position,
+                allowed_item_type,
+                relationship_label,
+                implied_tag_id,
+                implied_facet_kind,
+            ),
+        )
+        self.conn.commit()
+        return int(c.lastrowid)
+
+    def notes_docs_for_node(self, node_id: int) -> list[sqlite3.Row]:
+        """
+        Return all tabs (notes_docs) for a node, ordered by position.
+        """
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT * FROM notes_docs WHERE node_id=? ORDER BY position, id",
+            (node_id,),
+        )
+        return c.fetchall()
+
+    def notes_doc_insert(
+        self,
+        node_id: int,
+        title: str,
+        content_md: str = "",
+        content_render: str | None = None,
+        position: int | None = None,
+        visibility: str = "public",
+    ) -> int:
+        """
+        Insert a notes_docs row. If position is None, append after existing tabs.
+        """
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("Notes doc title cannot be empty")
+
+        c = self.conn.cursor()
+        if position is None:
+            row = c.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM notes_docs WHERE node_id=?",
+                (node_id,),
+            ).fetchone()
+            position = int(row[0] if row[0] is not None else 0)
+
+        if content_render is None:
+            html = md_to_html(content_md or "", css=None, include_scaffold=False)
+        else:
+            html = content_render
+
+        c.execute(
+            "INSERT INTO notes_docs(node_id, title, position, content_md, content_render, visibility) "
+            "VALUES (?,?,?,?,?,?)",
+            (node_id, title, position, content_md, html, visibility),
+        )
+        self.conn.commit()
+        return int(c.lastrowid)
+    
+    def notes_doc_get(self, doc_id: int) -> sqlite3.Row | None:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM notes_docs WHERE id=?", (doc_id,))
+        return c.fetchone()
+
+    def notes_doc_update_content(self, doc_id: int, content_md: str) -> None:
+        html = md_to_html(content_md or "", css=None, include_scaffold=False)
+        c = self.conn.cursor()
+        c.execute(
+            """UPDATE notes_docs
+               SET content_md=?, content_render=?, updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (content_md, html, doc_id),
+        )
+        self.conn.commit()
+
+    def notes_doc_delete(self, doc_id: int) -> None:
+        c = self.conn.cursor()
+        c.execute("DELETE FROM notes_docs WHERE id=?", (doc_id,))
+        self.conn.commit()
+
+    def note_members_for_node(self, node_id: int) -> list[sqlite3.Row]:
+        """
+        Return all members for a membership node, joined with world item title/type.
+        """
+        c = self.conn.cursor()
+        c.execute(
+            """SELECT nm.id,
+                      nm.node_id,
+                      nm.world_item_id,
+                      nm.position,
+                      wi.title AS world_title,
+                      wi.type  AS world_type
+               FROM note_members nm
+               JOIN world_items wi ON wi.id = nm.world_item_id
+               WHERE nm.node_id=?
+               ORDER BY nm.position, wi.title""",
+            (node_id,),
+        )
+        return c.fetchall()
+
+    def note_member_add(
+        self,
+        node_id: int,
+        world_item_id: int,
+        position: int | None = None,
+    ) -> int:
+        """
+        Attach a world item to a membership node.
+        - Enforces allowed_item_type (for now: block on mismatch).
+        - Applies implied_tag_id if present on the node.
+        """
+        c = self.conn.cursor()
+
+        node = c.execute(
+            "SELECT project_id, node_kind, allowed_item_type, implied_tag_id "
+            "FROM notes_nodes WHERE id=?",
+            (node_id,),
+        ).fetchone()
+        if node is None:
+            raise ValueError(f"Notes node {node_id} does not exist")
+
+        item = c.execute(
+            "SELECT project_id, type FROM world_items WHERE id=?",
+            (world_item_id,),
+        ).fetchone()
+        if item is None:
+            raise ValueError(f"World item {world_item_id} does not exist")
+
+        allowed = node["allowed_item_type"]
+        if allowed and item["type"] != allowed:
+            raise ValueError(
+                f"World item type {item['type']!r} does not match allowed_item_type {allowed!r}"
+            )
+
+        # Avoid duplicates; unique index will also enforce this.
+        existing = c.execute(
+            "SELECT id FROM note_members WHERE node_id=? AND world_item_id=?",
+            (node_id, world_item_id),
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
+
+        if position is None:
+            row = c.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM note_members WHERE node_id=?",
+                (node_id,),
+            ).fetchone()
+            position = int(row[0] if row and row[0] is not None else 0)
+
+        c.execute(
+            "INSERT INTO note_members(node_id, world_item_id, position) VALUES (?,?,?)",
+            (node_id, world_item_id, position),
+        )
+        nm_id = int(c.lastrowid)
+
+        # Apply implied tag if present
+        tag_id = node["implied_tag_id"]
+        if tag_id:
+            # This will no-op if the tag is already attached
+            self.world_item_tag_add(world_item_id, tag_id, source=f"notes-node:{node_id}")
+
+        self.conn.commit()
+        return nm_id
+
+    def note_member_remove(self, node_id: int, world_item_id: int) -> None:
+        """
+        Remove a world item from a membership node.
+        If the node has implied_tag_id and there are no other memberships
+        that imply that tag for this item, remove the tag from the item.
+        """
+        c = self.conn.cursor()
+
+        node = c.execute(
+            "SELECT implied_tag_id FROM notes_nodes WHERE id=?",
+            (node_id,),
+        ).fetchone()
+        implied_tag_id = node["implied_tag_id"] if node else None
+
+        c.execute(
+            "DELETE FROM note_members WHERE node_id=? AND world_item_id=?",
+            (node_id, world_item_id),
+        )
+
+        if implied_tag_id:
+            # Check whether any other membership still implies this tag
+            row = c.execute(
+                """
+                SELECT 1
+                FROM note_members nm
+                JOIN notes_nodes nn ON nn.id = nm.node_id
+                WHERE nm.world_item_id=? AND nn.implied_tag_id=?
+                LIMIT 1
+                """,
+                (world_item_id, implied_tag_id),
+            ).fetchone()
+            if not row:
+                # For now, remove the tag entirely. When we later add manual tag UI,
+                # we can refine this to only remove tags with source='notes-node:*'.
+                self.world_item_tag_remove(world_item_id, implied_tag_id)
+
+        self.conn.commit()
+
+    # ---- World items ----
+
+    def world_items_by_type(self, project_id: int, item_type: str | None) -> list[sqlite3.Row]:
+        """
+        Return world items of a given type for a project (ignores deleted).
+        If item_type is falsy, returns all types.
+        """
+        c = self.conn.cursor()
+        if item_type:
+            c.execute(
+                """SELECT id, title, COALESCE(type,'') AS kind
+                   FROM world_items
+                   WHERE project_id=? AND COALESCE(deleted,0)=0 AND type=?
+                   ORDER BY LOWER(title)""",
+                (project_id, item_type),
+            )
+        else:
+            c.execute(
+                """SELECT id, title, COALESCE(type,'') AS kind
+                   FROM world_items
+                   WHERE project_id=? AND COALESCE(deleted,0)=0
+                   ORDER BY LOWER(title)""",
+                (project_id,),
+            )
+        return c.fetchall()
+
     def world_items_by_category(self, project_id: int, category_id: int) -> list[sqlite3.Row]:
         c = self.conn.cursor()
         c.execute("""SELECT id, title
@@ -775,29 +1315,52 @@ class Database:
         self.conn.commit()
         return new_id
 
-    # TODO: figure out what to do with category_id when none is given (0 is a placeholder for now)
+    # TODO: figure out what to do with category_id when none is given
     #       maybe `item_type` can determine default category?
-    def world_item_insert(self, project_id: int, category_id: int = 0, title: str = "", content_md: str = "", item_type: str = "", aliases: dict[str, str] = {}) -> int:
+    def world_item_insert(self,
+        project_id: int,
+        category_id: int | None = None,
+        title: str = "",
+        item_type: str = "",
+        content_md: str = "",
+        aliases: dict[str, str] | None = None,
+    ) -> int:
         """
-        Create a new world item under a category.
-        Returns the new world_item id.
+        Create a new world item.
+
+        - category_id can be None (no world_category row required).
+        - Sorting / grouping can be done by item_type instead of category.
+        - Returns the new world_item id.
         """
-        title = title.strip()
+        if aliases is None:
+            aliases = {}
+
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("world_item_insert: title cannot be empty")
+
+        content_md = content_md or ""
         html = md_to_html(content_md, css=None, include_scaffold=False)
+
         c = self.conn.cursor()
         c.execute(
-            """INSERT INTO world_items (project_id, category_id, title, type, content_md, content_render)
-            VALUES (?, ?, ?, ?, ?, ?)""",
+            """
+            INSERT INTO world_items
+                (project_id, category_id, title, type, content_md, content_render)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
             (project_id, category_id, title, item_type.strip(), content_md.strip(), html),
         )
-        wid = c.lastrowid
+        wid = int(c.lastrowid)
         self.conn.commit()
+
         # add aliases
-        if not title in aliases:
+        if title not in aliases:
             aliases[title] = "alias"
         self.alias_add_multiple(wid, aliases)
         self.alias_set_primary(wid, alias_title=title)
-        return int(wid)
+
+        return wid
 
     def world_item_update_content(self, world_item_id: int, md: str) -> None:
         self.conn.execute("""UPDATE world_items

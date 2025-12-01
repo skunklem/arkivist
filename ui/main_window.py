@@ -31,6 +31,8 @@ from ui.widgets.character_editor import CharacterEditorDialog
 from ui.widgets.character_dialog import CharacterDialog
 from ui.widgets.chapter_todos import ChapterTodosWidget
 from ui.widgets.chapters_tree import ChaptersTree
+from ui.widgets.notes_tree import NotesTree
+from ui.widgets.notes_notebook import NotesNotebook
 from ui.widgets.helpers import DropPane, PlainNoTab, chapter_display_label, normalize_possessive, parse_internal_url, scrub_markdown_for_ner
 from ui.widgets.common import StatusLine, _WikiHoverFilter, AliasPicker
 from database.db import Database
@@ -342,9 +344,23 @@ class StoryArkivist(QMainWindow):
         self.db.ui_pref_set(pid, f"outline:{c3}:v1", json.dumps(v1_c3))
         self.db.ui_pref_set(pid, f"outline:{c4}:v1", json.dumps(v1_c3))
 
+        # seed some stock alias_types # TODO: make this configurable in project manager
+        self.db.alias_types_seed(self._current_project_id)
+
+        # seed some stock traits # TODO: make this configurable in project manager
+        data = {
+            "trait_physical": ["Eye color","Hair","Height","Build","Skin","Age"],
+            "trait_character": ["Personality","Mannerisms","Goal","Fear","Flaw","Virtue"]
+        }
+        self.db.traits_seed(self._current_project_id, data)
+
+        # seed initial Notes tree structure (Religion/Deities/etc.)
+        self.db.notes_tree_seed(self._current_project_id)
+
         # refresh UI
         self.populate_chapters_tree()
         self.populate_world_tree()
+        self.populate_notes_tree()
         self.load_chapter(c1)
         self.rebuild_search_indexes()
 
@@ -1248,12 +1264,14 @@ class StoryArkivist(QMainWindow):
             if not ok or not new.strip(): return
             self.db.world_category_rename(obj_id, new.strip())
             self.populate_world_tree()
+            self.populate_notes_tree()
         elif kind == "world_item":
             old = self.db.world_item(obj_id)
             new, ok = QInputDialog.getText(self, "Rename World Item", "New title:", text=old or "")
             if not ok or not new.strip(): return
             self.db.world_item_rename(obj_id, new.strip())
             self.populate_world_tree()
+            self.populate_notes_tree()
             # refresh right panel if it's the one currently shown
             if getattr(self.worldDetail, "_current_world_item_id", None) == obj_id:
                 self.load_world_item(obj_id)
@@ -1263,9 +1281,11 @@ class StoryArkivist(QMainWindow):
             # mark the category deleted (children remain, but won’t show because parent is hidden)
             self.db.world_category_soft_delete(obj_id)
             self.populate_world_tree()
+            self.populate_notes_tree()
         elif kind == "world_item":
             self.db.world_item_soft_delete(obj_id)
             self.populate_world_tree()
+            self.populate_notes_tree()
             # clear right panel if we just hid the current item
             if getattr(self.worldDetail, "_current_world_item_id", None) == obj_id:
                 if hasattr(self.worldDetail, "set_mode"): self.worldDetail.set_mode("view")
@@ -1273,11 +1293,12 @@ class StoryArkivist(QMainWindow):
                 if hasattr(self.worldDetail, "edit"):     self.worldDetail.edit.setPlainText("")
                 self.worldDetail._current_world_item_id = None
 
+    # TODO: remove or use
     def open_character_editor(self, char_id: int):
         dlg = CharacterEditorDialog(self, self.db, char_id, self)
         dlg.exec()
         # refresh right panel if it was showing this character
-        if getattr(self, "_current_world_item_id", None) == char_id:
+        if getattr(self.worldDetail, "_current_world_item_id", None) == char_id:
             self.load_world_item(char_id, edit_mode=False)
 
     # def open_character_dialog(self, char_id: int):
@@ -1604,6 +1625,9 @@ class StoryArkivist(QMainWindow):
     def _add_left_panel(self):
         # Left column: Chapters / Worldbuilding / Referenced-in-chapter
         self.chaptersTree = ChaptersTree(self)
+        self.notesTree = NotesTree(self)
+        self.notesTree.setHeaderHidden(True)
+        self.notesTree.itemClicked.connect(self.on_notes_tree_clicked)
         self.worldTree    = WorldTree(self, db=self.db)
         self.refsTree     = QTreeWidget()
         self.refsTree.setHeaderHidden(True)
@@ -1666,9 +1690,15 @@ class StoryArkivist(QMainWindow):
 
         # --- Worldbuilding and referenced-in-chapter trees ---
 
+        # World tree (simple flat list of world items by type)
         worldWrap = QWidget(); v2 = QVBoxLayout(worldWrap); v2.setContentsMargins(0,0,0,0)
         v2.addWidget(QLabel(" Worldbuilding")); v2.addWidget(self.worldTree)
 
+        # Notes tree (world notes / classifications)
+        v2.addWidget(QLabel(" Notes"))
+        v2.addWidget(self.notesTree)
+
+        # Referenced-in-chapter tree #TODO: this will be dropped or linked into world tree filters later
         refsWrap = QWidget(); v3 = QVBoxLayout(refsWrap); v3.setContentsMargins(0,0,0,0)
         v3.addWidget(QLabel(" Referenced in Chapter")); v3.addWidget(self.refsTree)
 
@@ -2008,6 +2038,10 @@ class StoryArkivist(QMainWindow):
     def _add_bottom_tabs(self):
         # Bottom tabs
         self.bottomTabs = QTabWidget()
+
+        # Notes / World Notes tab
+        self.tabNotes = NotesNotebook(self, self.db)
+        self.bottomTabs.addTab(self.tabNotes, "World Notes")
 
         # Mini Outline tab
         self.tabMiniOutline = MiniOutlineTab(self)
@@ -2462,8 +2496,36 @@ class StoryArkivist(QMainWindow):
     def populate_all(self):
         self.populate_chapters_tree()
         self.populate_world_tree()
+        self.populate_notes_tree()
         self.populate_refs_tree(None)
         self.populate_outline_workspace()
+
+    def populate_notes_tree(self):
+        """Rebuild the NotesTree for the current project."""
+        if not hasattr(self, "notesTree"):
+            return
+
+        t = self.notesTree
+        t.clear()
+        pid = self._current_project_id
+        if not pid:
+            return
+
+        def add_children(parent_node_id, parent_item):
+            rows = self.db.notes_children(pid, parent_node_id)
+            for row in rows:
+                node_id = int(row["id"])
+                title = row["title"] or "(untitled)"
+                item = NotesTree.make_item(title, node_id)
+                if parent_item is None:
+                    t.addTopLevelItem(item)
+                else:
+                    parent_item.addChild(item)
+                # recurse into children
+                add_children(node_id, item)
+
+        add_children(None, None)
+        t.expandAll()
 
     def populate_chapters_tree(self):
         self.chaptersTree.clear()
@@ -2717,6 +2779,21 @@ class StoryArkivist(QMainWindow):
         data = item.data(0, Qt.UserRole)
         if data and data[0] == "world_item":
             self.worldDetail.show_item(int(data[1]))
+
+    def on_notes_tree_clicked(self, item, col):
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        kind = data[0]
+        if kind != "notes_node":
+            return
+
+        node_id = int(data[1])
+        if hasattr(self, "tabNotes"):
+            self.tabNotes.show_node(node_id)
+            idx = self.bottomTabs.indexOf(self.tabNotes)
+            if idx != -1:
+                self.bottomTabs.setCurrentIndex(idx)
 
     # ---------- Chapter load/save ----------
     def _current_outline_row(self) -> int:
@@ -3313,6 +3390,7 @@ class StoryArkivist(QMainWindow):
                 recurse(node, d[1])
         self.db.conn.commit()
         self.populate_world_tree()
+        self.populate_notes_tree()
 
     # ---------- Import ----------
     # def action_import_chapter(self):
@@ -3714,6 +3792,7 @@ class StoryArkivist(QMainWindow):
         # rebuild UI lists
         self.populate_chapters_tree()
         self.populate_world_tree()
+        self.populate_notes_tree()
         self.populate_refs_tree(None)
         # clear center/right panes
         self._current_chapter_id = None
