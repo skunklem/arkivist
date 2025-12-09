@@ -1,14 +1,16 @@
 import re
 import traceback
 
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut, QCursor
 from PySide6.QtCore import Qt, QTimer, QUrl, QDateTime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QScrollArea,
     QTextBrowser, QPlainTextEdit,QTableWidget, QTableWidgetItem,
-    QLabel, QPushButton, QSizePolicy, QHBoxLayout, QApplication
+    QLabel, QPushButton, QSizePolicy, QHBoxLayout, QApplication,
+    QToolTip
 )
-from ui.widgets.common import StatusLine
+from ui.widgets.common import StatusLine, _HoverCardPopup, RichEditorToolbar
+from ui.widgets.rich_text_editor import RichTextEditor
 
 def _safe(fn):
     def wrap(self, *a, **k):
@@ -82,6 +84,18 @@ class WorldDetailWidget(QWidget):
         self.vbox.addWidget(self.statusLine)
         self.statusLine.show_neutral("Select a world item")
 
+        # Editor prefs + toolbar (controls rich editor behavior)
+        self._editor_prefs = {
+            "autoPairs": True,
+            "showWikilinks": "full",
+            "highlightLinksWhileCtrl": True,
+            "linkFollowMode": "ctrlClick",
+        }
+        self.editorToolbar = RichEditorToolbar(self)
+        self.editorToolbar.set_prefs(self._editor_prefs)
+        self.editorToolbar.prefsChanged.connect(self._on_editor_prefs_changed)
+        self.vbox.addWidget(self.editorToolbar)
+
         # --- SCROLLABLE content area ---
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
@@ -108,9 +122,26 @@ class WorldDetailWidget(QWidget):
         self._current_world_item_id = None
         self._dirty = False
         self._views = {}  # optional: keep references
+        self._pending_follow_world_item_id = None
 
-        # default to View
-        self._set_mode(view_mode=True)
+        # Hover card support for rich-editor wikilinks
+        self._editor_hover_card = None
+        self._editor_hover_poll = QTimer(self)
+        self._editor_hover_poll.setInterval(120)
+        self._editor_hover_poll.setSingleShot(False)
+        self._editor_hover_poll.timeout.connect(self._hide_editor_hover_if_outside)
+
+        # default to Edit
+        self._set_mode(view_mode=False)
+
+    def _on_editor_prefs_changed(self, prefs: dict) -> None:
+        """
+        Update stored editor preferences when the toolbar changes.
+
+        The new prefs will be applied the next time we load a document into
+        the embedded editor via _refresh_render_only.
+        """
+        self._editor_prefs = dict(prefs or {})
 
     def _update_nav_buttons(self):
         self.btnBack.setEnabled(self._hindex > 0)
@@ -165,10 +196,20 @@ class WorldDetailWidget(QWidget):
         self.app._attach_link_handlers(self.view)
         self.contentBox.addWidget(self.view)
 
-        self.edit = PlainNoTab()
-        self.edit.setPlaceholderText("Markdown content…")
-        self.edit.textChanged.connect(self._mark_dirty)
+        # WorldDetail-simple: use RichTextEditor for edit mode
+        self.edit = RichTextEditor(self)
         self.contentBox.addWidget(self.edit)
+
+        # Hook editor events into world-detail logic
+        self.edit.docChanged.connect(self._on_editor_doc_changed)
+        self.edit.requestSave.connect(self._on_editor_request_save)
+        self.edit.linkInteraction.connect(self._on_editor_link_interaction)
+        self.edit.contextAction.connect(self._on_editor_context_action)
+        self.edit.activityPing.connect(self._on_editor_activity_ping)
+        self.edit.focusGained.connect(
+            lambda: self.statusLine.show_neutral("Editing")
+        )
+        self.edit.focusLost.connect(self._on_editor_focus_lost)
 
         self._views["view"] = self.view
         self._views["edit"] = self.edit
@@ -219,8 +260,225 @@ class WorldDetailWidget(QWidget):
         if hasattr(self, "statusLine"):
             self.statusLine.set_dirty()
 
+    # --- RichTextEditor integration callbacks -----------------------------
+
+    def _on_editor_focus_lost(self) -> None:
+        """
+        Auto-save the current world item when the rich editor loses focus.
+        For now we treat any dirty state as needing a save.
+        """
+        print("Lost focus: saving if dirty")
+        self._save_current_if_dirty()
+        self.statusLine.show_neutral("Viewing")
+
+    def _on_editor_doc_changed(self, doc_id: str, version_id: int, dirty: bool) -> None:
+        """
+        Called when the embedded rich editor reports a docChanged event.
+        For now we treat any change as marking the current world item dirty.
+        """
+        if not self._current_world_item_id:
+            return
+        # Optional: ignore changes for other docs if doc_id doesn't match
+        try:
+            if doc_id and int(doc_id) != int(self._current_world_item_id):
+                return
+        except Exception:
+            # If doc_id isn't numeric, just ignore the check
+            pass
+        if dirty:
+            self._mark_dirty()
+
+    @_safe
+    def _on_editor_request_save(
+        self,
+        doc_id: str,
+        version_id: int,
+        markdown: str,
+        html_snapshot: str,
+    ) -> None:
+        """
+        Persist the current world item content from the rich editor.
+
+        IMPORTANT:
+        We trust doc_id (from JS) to decide which world item to update,
+        so saves triggered just before navigation still go to the right row.
+        """
+        print("[WorldDetailWidget] _on_editor_request_save doc_id=", doc_id, "current wid=", self._current_world_item_id)
+        if not doc_id and not self._current_world_item_id:
+            # No idea what to save against; bail loudly.
+            print("[WorldDetailWidget] requestSave with no doc_id and no current item")
+            return
+
+        wid: int | None = None
+
+        if doc_id:
+            try:
+                wid = int(doc_id)
+            except ValueError:
+                print("[WorldDetailWidget] non-numeric doc_id from editor:", repr(doc_id))
+                return
+        else:
+            # Fallback: older editors may not send doc_id
+            wid = int(self._current_world_item_id)
+
+        if not wid:
+            return
+
+        # 1) write both markdown + HTML snapshot via DB helper
+        self.app.db.world_item_update_text_and_render(
+            wid,
+            markdown or "",
+            html_snapshot or "",
+        )
+
+        # 2) quick-parse this world item so extracted refs stay in sync
+        self.app.cmd_quick_parse(doc_type="world_item", doc_id=wid, version_id=None)
+
+        # 3) mark clean + status IF this is the item currently shown
+        if self._current_world_item_id and int(self._current_world_item_id) == int(wid):
+            self._dirty = False
+            if hasattr(self, "statusLine"):
+                self.statusLine.set_saved_now()
+
+            # 4) update the view widget to use the new HTML snapshot
+            v = self._views.get("view")
+            if v:
+                v.setHtml(html_snapshot or "<i>(empty)</i>")
+        else:
+            # Save completed for a doc that is no longer active in this panel.
+            # That’s okay; we just don’t touch the current UI.
+            print(
+                "[WorldDetailWidget] requestSave applied to wid",
+                wid,
+                "but current panel item is",
+                self._current_world_item_id,
+            )
+
+        # 4) After save, if a wikilink click queued a follow, do it now
+        pending = self._pending_follow_world_item_id
+        if pending is not None:
+            print("[WorldDetailWidget] save completed; following pending wid", pending)
+            self._pending_follow_world_item_id = None
+            if hasattr(self.app, "load_world_item"):
+                self.app.load_world_item(pending, edit_mode=False)
+
+
+    def _on_editor_link_interaction(self, payload: dict) -> None:
+        """
+        Handle interactions from the rich editor.
+
+        For wikilinks:
+          - trigger == "click"      → navigate to the item
+          - trigger == "hoverStart" → show hover card
+          - trigger == "hoverEnd"   → (ignored; card is hidden by polling)
+
+        For wikilinks (kind == "candidate"):
+          - trigger == "click"      → reveal in Extract tab (TODO)
+          - trigger == "hoverStart" → show hover card
+          - trigger == "hoverEnd"   → (ignored; card is hidden by polling)
+
+        For external links (kind == "external"):
+          - trigger == "click" → open in browser
+        """
+        kind = payload.get("linkKind") or payload.get("kind")
+        trigger = payload.get("trigger") or "click"
+
+        if kind == "wikilink":
+            wid = payload.get("worldItemId") or payload.get("world_item_id")
+            if wid is None:
+                return
+            wid = int(wid)  # let errors surface if this is bad
+
+            if trigger == "hoverStart":
+                # Reuse main-window hover-card HTML logic, but show it via a
+                # hoverable popup so the user can move the mouse onto it.
+                if hasattr(self.app, "_hover_card_html_for"):
+                    url = QUrl(f"world://item/{wid}")
+                    html = self.app._hover_card_html_for(url)
+                    if html:
+                        if self._editor_hover_card is None:
+                            self._editor_hover_card = _HoverCardPopup(self.app)
+                        global_pos = QCursor.pos()
+                        self._editor_hover_card.show_card(html, global_pos)
+                        self._editor_hover_poll.start()
+                return
+
+            if trigger == "hoverEnd":
+                # Don't immediately hide; the polling timer will hide the card
+                # once the pointer leaves both the editor and the card.
+                return
+
+            if trigger == "click":
+                # Rich editor: queue follow, then request save
+                if isinstance(self.edit, RichTextEditor):
+                    print("[WorldDetailWidget] wikilink click → queue follow after save; wid=", wid)
+                    self._pending_follow_world_item_id = wid
+                    self.edit.request_save()
+                    return
+
+
+            # Legacy/plain editor path: save-if-dirty, then navigate immediately
+            self._save_current_if_dirty()
+            if hasattr(self.app, "load_world_item"):
+                self.app.load_world_item(wid, edit_mode=False)
+
+        elif kind == "external":
+            href = payload.get("href") or payload.get("url")
+            if href and trigger == "click":
+                QDesktopServices.openUrl(QUrl(href))
+
+    def _hide_editor_hover_if_outside(self) -> None:
+        """
+        Hide the rich-editor hovercard when the pointer is no longer over
+        the editor or the card itself.
+
+        This mirrors the behavior of _WikiHoverFilter for the main view.
+        """
+        card = self._editor_hover_card
+        if not card or not card.isVisible():
+            self._editor_hover_poll.stop()
+            return
+
+        pos = QCursor.pos()
+
+        # Keep the card if the pointer is inside the card geometry
+        if card.geometry().contains(pos):
+            return
+
+        # Keep the card if the pointer is still over the editor (or a child)
+        w = QApplication.widgetAt(pos)
+
+        def _is_child_of(a, b):
+            while a:
+                if a is b:
+                    return True
+                a = a.parentWidget()
+            return False
+
+        if w is not None and _is_child_of(w, self.edit):
+            return
+
+        # Otherwise hide and stop polling
+        card.hide()
+        self._editor_hover_poll.stop()
+
+    def _on_editor_context_action(self, payload: dict) -> None:
+        """
+        Forward context actions (synonyms, rejectAutoLink, makeWikilink, etc.).
+        For now, we just log them; future versions will hook into link_rejections, etc.
+        """
+        print("[WorldDetailWidget] contextAction:", payload)
+
+    def _on_editor_activity_ping(self, kind: str) -> None:
+        """
+        Lightweight activity events from the rich editor (typing/scrolling/selecting).
+        For now, just log; later we can tie this into time-tracking.
+        """
+        print("[WorldDetailWidget] activity:", kind)
+
     def toggle_mode(self):
         """Toggles View/Edit for generic world items; opens dialog for characters."""
+        print("WorldDetailWidget.toggle_mode()")
         if not self._current_world_item_id:
             return
         meta = self.app.db.world_item_meta(self._current_world_item_id)
@@ -243,14 +501,28 @@ class WorldDetailWidget(QWidget):
         if v:
             self._refresh_render_only()
 
+    @_safe
     def _save_current_if_dirty(self):
-        if not self._current_world_item_id or not self._dirty:
+        """Persist current item if we have unsaved edits.
+
+        For the rich editor, we just ask it to send us the current state;
+        the actual DB write happens in _on_editor_request_save().
+        """
+        wid = self._current_world_item_id
+        print("[WorldDetailWidget] _save_current_if_dirty; wid=", wid, "dirty=", self._dirty)
+
+        if not wid or not self._dirty:
             return
 
-        wid = self._current_world_item_id
+        if isinstance(self.edit, RichTextEditor):
+            print("[WorldDetailWidget] delegating save to RichTextEditor.request_save()")
+            self.edit.request_save()
+            return
+
+        # --- Legacy plain-text path (fallback only) ---
         md = self.edit.toPlainText() or ""
 
-        # 1) persist MD (DB helper)
+        # 1) persist MD
         self.app.db.world_item_update_content(wid, md)
 
         # 2) re-render + cache
@@ -264,7 +536,7 @@ class WorldDetailWidget(QWidget):
         if hasattr(self, "statusLine"):
             self.statusLine.set_saved_now()
 
-        # 5) refresh the visible view (remain in view mode after save)
+        # 5) refresh in view mode
         self.app.load_world_item(wid, edit_mode=False)
 
     def _delete_layout(self, layout):
@@ -307,32 +579,94 @@ class WorldDetailWidget(QWidget):
     #                 sub.setParent(None)
     #     # Now self.vbox exists and is empty; safe to rebuild header/body
 
-    def _refresh_render_only(self):
-        """Update the rendered HTML/text into self.view/edit (no rebuilding UI)."""
-        v = self._views.get("view"); e = self._views.get("edit")
-        if not v:
+    @_safe
+    def _refresh_render_only(self, refresh_editor: bool = True):
+        """Re-read content_md/render and push into view + rich editor."""
+        v = self._views.get("view")
+        e = self._views.get("edit")
+
+        if not v and not e:
+            print("[WorldDetailWidget] _refresh_render_only: no view or edit pane")
             return
+
+        # Editor prefs (can later be pulled from real settings)
+        prefs = dict(getattr(self, "_editor_prefs", {}))
+        if not prefs:
+            prefs = {
+                "autoPairs": True,
+                "showWikilinks": "full",
+                "highlightLinksWhileCtrl": True,
+                "linkFollowMode": "ctrlClick",
+            }
+
+        # Build worldIndex for this project so JS can auto-link known entities
+        project_id = getattr(self.app, "_current_project_id", None)
+        if project_id is not None:
+            world_index = self.app.db.world_index_for_project(project_id)
+            print("[WorldDetailWidget] _refresh_render_only: world_index has", len(world_index), "items")
+            # print(world_index)
+        else:
+            world_index = []
+
+        # No active item
         if self._current_world_item_id is None:
-            v.setHtml("<i>Select a world item</i>")
-            e.setPlainText("")
-            return
-
-        cur = self.app.db.conn.cursor()
-        cur.execute("SELECT content_md, content_render FROM world_items WHERE id=?", (self._current_world_item_id,))
-        row = cur.fetchone()
-        if not row:
-            v.setHtml("<i>Item not found</i>")
-            e.setPlainText("")
-            return
-
-        md, html = row
-        if v.isVisible():
-            v.setHtml(html or "<i>(empty)</i>")
-        elif e.isVisible():
-            e.blockSignals(True)
-            e.setPlainText(md or "")
-            e.blockSignals(False)
+            print("[WorldDetailWidget] _refresh_render_only: no current item")
+            if v:
+                v.setHtml("<i>Select a world item</i>")
+            if e and refresh_editor:
+                doc_config = {
+                    "docType": "world_item",
+                    "docId": "",
+                    "versionId": 1,
+                    "markdown": "",
+                    "worldIndex": world_index,
+                    "prefs": prefs,
+                }
+                e.load_document(doc_config)
             self._dirty = False
+            return
+
+        # Missing row
+        row = self.app.db.world_item_meta(self._current_world_item_id)
+        if not row:
+            print("[WorldDetailWidget] _refresh_render_only: missing world item")
+            if v:
+                v.setHtml("<i>Item not found</i>")
+            if e and refresh_editor:
+                doc_config = {
+                    "docType": "world_item",
+                    "docId": str(self._current_world_item_id),
+                    "versionId": 1,
+                    "markdown": "",
+                    "worldIndex": world_index,
+                    "prefs": prefs,
+                }
+                e.load_document(doc_config)
+            self._dirty = False
+            return
+
+        md = row["content_md"] or ""
+        html = row["content_render"] or ""
+
+        # View pane always shows the snapshot
+        if v:
+            v.setHtml(html or "<i>(empty)</i>")
+
+        # Edit pane always gets a fresh doc config
+        if e and refresh_editor:
+            print("[WorldDetailWidget] _refresh_render_only: setting edit pane to:")
+            print(repr(md))
+            doc_config = {
+                "docType": "world_item",
+                "docId": str(self._current_world_item_id),
+                "versionId": 1,   # we can introduce true versioning later
+                "markdown": md,
+                "worldIndex": world_index,
+                "prefs": prefs,
+            }
+            e.load_document(doc_config)
+
+        self._dirty = False
 
     def show_item(self, world_item_id: int, add_to_history: bool = True, view_mode: bool = True):
         """Load a world item. Saves edit if needed, updates history, rebuilds body once."""
@@ -374,6 +708,7 @@ class WorldDetailWidget(QWidget):
             else:
                 # build view/edit pair in contentBox
                 self._add_views()
+                print(f"WorldDetailWidget.show_item({world_item_id}) view_mode={view_mode}")
                 self._set_mode(view_mode=view_mode)
                 self.refresh()  # will fill view/edit as appropriate
 
@@ -494,47 +829,45 @@ class WorldDetailWidget(QWidget):
             self.app.load_world_item(int(m.group(1)), edit_mode=False)
 
     def refresh(self):
-        """Refresh the currently shown item."""
+        """Refresh the currently shown item (title + content + status line)."""
         v = self._views.get("view")
         e = self._views.get("edit")
+
+        # Nothing selected
         if self._current_world_item_id is None:
             self.lblTitle.setText("World Detail")
-            if v: v.setHtml("<i>Select a world item</i>")
-            if e:
-                e.blockSignals(True)
-                e.setPlainText("")
-                e.blockSignals(False)
+            self._refresh_render_only()
             self.statusLine.show_neutral("Select an item")
             return
+
         row = self.app.db.world_item_meta(self._current_world_item_id)
         if not row:
             self.lblTitle.setText("World Detail (missing)")
-            if v: v.setHtml("<i>Item not found</i>")
-            if e:
-                e.blockSignals(True)
-                e.setPlainText("")
-                e.blockSignals(False)
+            self._refresh_render_only()
             self.statusLine.show_neutral("Missing")
             return
 
-        title, md, html, wtype = row["title"], row["content_md"], row["content_render"], row["type"]
+        title = row["title"]
+        wtype = row["type"]
         self.lblTitle.setText(title or "World Detail")
 
         if wtype == "character":
-            # Character summaries are built in show_item(); nothing to do here.
+            # Character summaries are built in show_item(); nothing else to do here.
+            self.modeBtn.setText("Edit")
             self.statusLine.show_neutral("Viewing")
+            self._dirty = False
             return
 
-        # Generic world item: update whichever subview is visible
+        # Generic world item: push latest content into view + editor
+        self._refresh_render_only()
+
+        # Status based on which pane is visible
         if v and v.isVisible():
-            v.setHtml(html or "<i>(empty)</i>")
             self.statusLine.show_neutral("Viewing")
-        if e and e.isVisible():
-            e.blockSignals(True)
-            e.setPlainText(md or "")
-            e.blockSignals(False)
-            self._dirty = False
+        elif e and e.isVisible():
             self.statusLine.show_neutral("Editing")
+        else:
+            self.statusLine.show_neutral("")
 
     def refresh_if_showing(self, world_item_id: int) -> None:
         """
@@ -544,7 +877,19 @@ class WorldDetailWidget(QWidget):
         whatever else the user is viewing.
         """
         if self._current_world_item_id == world_item_id:
-            self.refresh()
+            v = self._views.get("view")
+            e = self._views.get("edit")
+
+            # Only refresh the view pane here – keep the editor DOM (and caret) intact.
+            self._refresh_render_only(refresh_editor=False)
+
+            # Keep the status line semantics consistent with `refresh()`
+            if v and v.isVisible():
+                self.statusLine.show_neutral("Viewing")
+            elif e and e.isVisible():
+                self.statusLine.show_neutral("Editing")
+            else:
+                self.statusLine.show_neutral("")
 
     def get_view_browser(self):
         """Return the QTextBrowser used for view mode, if present."""

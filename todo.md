@@ -5,7 +5,6 @@ TO-Dos
 * separate world-item window
   * allow world items to be sorted by selectable categories (possibly different tabs for major categories).
   * Maybe user wants to sort people by organizations they're a part of (if member of multiple, name can appear under each supercategory). Maybe there's a high level category with characters, but if you look through locations it could have a subcategory with citizens that lets you find some of the same people there, too.
-*  Extract tab shows number tag that indicates how many potential characters have been found in chapter (or book)
 * import world items picker: need to be able to add category options if you don't have a relevant one to drop your item in
 * drag-reordering of items within a category, we can add a position column to world_items
 * Add access to soft-deleted books/chapters/world-items
@@ -29,6 +28,29 @@ TO-Dos
 * world panel header and label don't need to be redundant - make header label "Side Notes". Then label what type of world item overview we're getting (character summary, world item details, setting details, etc) - this will prevent the side panel from resizing every time a name changes
 * allow multiple books in Outline: add a book selector above the Outline list and call workspace.load_from_db(db, project_id, chosen_book_id) on change; the same reorder signal will keep ordering consistent per book.
 * add arrow symbol like "-->|" for skipping to last world item instead of only going step by step (also ctrl+alt+right arrow for last item and ctrl+alt+left arrow for first)
+* quote-able world document: add a world doc type within Notes that can be quoted within chapters and and quoted sections will change if the quote is adjusted.
+* activity stack: track every place the user is when they click somewhere or jump somewhere via a link to allow ALT+left/right or mouse-fwd/back to flip through recent activity sites
+* make panels collapsable
+* Outline editor could have tabs for each pane to show to-dos/notes (only do this when willing to commit time to making sure the main-window version and outline version mirror perfectly)
+* Allow click&drag text between chapters/items/notes
+
+### Unused scenes for easy access later
+* Context menu for selected text: Allow "Move to {top, bottom, another chapter, Unused/deleted Scenes}"
+* Auto-populate a page of unused scenes (by comparing unused chapter versions with the active one)
+  * Maybe this only happens when requested for a specific chapter
+  * Generate a title and summary detailing what it is and the key differences
+  * Allow user to filter by whether they explicitely saved this scene for later or if it was extracted from differing versions
+  * User can peruse these for reinserting elsewhere
+    * Mark it as incorporated elsewhere (and link the chapter)
+
+
+### Extract tab
+* show number tag that indicates how many potential characters have been found in chapter (or book)
+* Make sure when active chapter gets new candidates they show up in Extract tab without needing to quick parse again.
+* make buttons look more buttony
+* offer all options at the top rahter than lumping alias with create: create (as is), create (with changes), add as alias, dismiss
+* optional dropdown in "kind" cells to edit that before accepting
+* maybe add an alias column that populates a dropdown if you select that cell
 
 ### Alias management
 * character editor and world panel edit for aliases: right click alias table to change which one is primary (effects label for hover and view of item) (or have radiobuttons in one column)
@@ -45,12 +67,27 @@ TO-Dos
 * Text color link is too close to the white theme bg on theme change. Leaving chapter and returning fixes that, so should we paint links on theme change somehow?
 * Extract checkboxes are too hard to see in white theme.
 
-### Center Editor Tabs (potential)
-* should we allow multiple tabs to be open (multiple different chapters that you can click through on the top for easy access) where all of those things can be autosaved in their dirty state without being committed to the db (unless user explicitely saves)
-* Should we allow for world items to appear in the center editor rather than forcing them to open in new windows/modals. They could be another item in the aforementioned tab system
-* If we do tabs, could we optionally pop out a tab into a secondary main-window to allow for multiple views?
-* If we do tabs, should we also allow spliting the centerView to show two chapters or two versoins of the same chapter side by side? This would likely require having two or more centerViews that each display their own thing, so possibly serious rewiring.
-* Outline editor could have tabs for each pane to show to-dos/notes (only do this when willing to commit time to making sure the main-window version and outline version mirror perfectly)
+### DocPage
+* a single easy to build place to host all widgets used to view/edit something
+  * hosts RichTextEditors/RichTextPanes, photos, minor text boxes for simple things, labels for any of those widgets, derived widget e.g. one that shows all the chapters where this item is mentioned, etc.
+  * allows for formatting specifications (row/column preferences upheld if space allows)
+  * eventually, user should be able to add new facets
+* could contain chapter editors, notes, world items, settings page?, ...
+* each additional facet item (currently only characters) can have different editor types and/or photo-displayer specified. Each additional item would need to know where to retrieve/store its data
+  * maybe this can all be fed in as a dict?
+* should optionally have different modes/layouts
+  * chapter page will want a distraction-free mode where it's just the chapter and maybe links switch to only diplay with ctrl held.
+
+### Center Tabs container
+* each tab will host a DocPage
+* allow multiple tabs to be open in their dirty state until user explicitely saves
+* chapters, world item details, and notes call all appear in a tab
+* world details: allow them to open in side panel, still?
+  * if so, should each tab have its own right panel with its own item history or should the right panel be its own thing
+* Now, character editing can happen in a tab rather than in a separate window
+* Any tab container should maybe be more like a container of tab containers. That way it can be "split" for side-by-side viewing
+  * that makes it so we can show two chapters or two versoins of the same chapter side by side
+* Pop out a tab into a secondary main-window (or a window that is only another container of tab containers) to allow for spread out views
 
 ### Complex outlining: Plot Arcs (for individuals, locations, or general changing circumstances)
 * world items (notably characters) can have outlines or plot arcs, and user can create named plot arcs (like "infiltrating the castle") that span multiple chapters. 
@@ -72,6 +109,7 @@ TO-Dos
   * change positioning to look better
   * can be a simple mark in chapter tabs, if we use those
   * in character editor, shouldn't show unsaved changes once table has been edited (it's already saved to db and table by then)
+* consider placing within top of RichTextEditor
 
 ### World tree
 * add right click options for chapters in world tree: insert blank chapter before/after | insert chapter from file before/after (and rename isn't working)
@@ -113,15 +151,23 @@ TO-Dos
   * graphics (x-axis can be time, if applicable, or chapter)
 * Allow for custom calendar systems
 
-### Advanced center editor for chapters (at minimum)
-* swap to a web editor (B2) for full rich editing + spellcheck + future autocomplete
-* Sub in a nicer text editor for chapters that includes basic formatting and spellcheck with suggestions
-* Possibly add in autocomplete (at least of names from world)
-* Add in right-click for synonym replacement, link/create
-* Wikilinks show up even in edit mode
-* No more need for view mode?
-* How to ensure center/right align persists through markdown conversion (or switch to better editor)
+# Advanced editor to use for all large text editing
+## Goals
+* swap to a web editor for full rich editing + spellcheck + (future) autocomplete
+* Add in right-click for synonym replacement
+* tight click for linking text to existing (or new) items
+* Wikilinks render while editing
+  * For performance issued, re-refresh could be constrained by time, small chunks, or only on typing pauses
+* No more need for view mode
+* Will this help ensure center/right align and other alignment details persist through markdown conversion?
+  * How might that impact the current content_md and content_render fields used in the db?
 * preserve comments (especially if users export as docx, get comments from friends, reimport) and allow merging in external edits
+* Simple and complex versions depending on features needed (chapters need more formatting than simpler multi-line text containers)
+## Considerations
+* What areas of the app will this improve and what will have significant changes?
+* What other features will be important to add that will be useful for any current or anticipated app features?
+* What's the best option based on the needs of the app?
+* Any likely problems from adding this in?
 
 ### Theme/aesthetics complaints
 * Hovercard needs to be smaller (shrink to content?)
@@ -141,6 +187,17 @@ TO-Dos
 * Use AI to detect plot holes or inconsitencies in how characters/locations/etc are discussed (especially if the same character refers to things in vastly different ways)
 * Use AI to aggregate all details about a given world item or plot arc and either summarize or list out direct quotes (with links to view them in context) for easy checking
 * Easily flip through every place a character/item is mentioned (including aliases or not), choose to go through chapters, outlines, notes, to-dos, world items. Do we need a separate search panel, or do we add a search bar to each of these things or do we want a modal (or panel or tab in the left panel) that lets us do the selecting/filtering and clicking in there brings up (and highlights) the relevant chapter/content?
+* Create an ideas dump area and use AI to organize them and to search for old ideas that might be good for X
+* Break down goals for a book/scene, simplify/sumarize, easier decision making
+* Easily ask about the book: where/when did X happen?
+* Help consolidate facts about character/item/event to add in summary/facets: What are X traits that Y displays
+* Brainstorm possible disruptions/natural catastrophies I can add into this scene based on things known about this world/region and its 
+* Use it to ask probing questions that help with character/event/item development
+  * ask what if questions that force you to think of logistics and how certain things work
+  * guide naming decisions
+* Get writing prompts/inspiration about what to develp next
+* Do quick research about a related concept
+* Keep you on track: indicate where you diverge unexpectedly from outline/plan or where worldbuilding is going deeper than necessary
 
 ### Draft versioning considerations
 #### Thoughts/desires (some of which may conflict and evolve as the list continues)
@@ -155,6 +212,7 @@ TO-Dos
   * Then, when user chooses to revert to a previous version, there can be a separate view for comparing/selecting past versions. We wouldn't need the version combo-boxes or could move them to a history tab. How should we handle outline versions? Do we actually need different ones for each chapter, or is that something that gets its own snapshot in the draft timestamp and might stay the same for multiple versions of the same chapter? If so, the draft or pseudo-draft versions can all have their own timestamp-based name which is what appears in any combo-box/selector plus any custom name. If one version of a chapter/outline persisted throughout
   * While meddling with the db, each chapter version should get its own name that defaults to the name it has when saved.
   * Then, if user wants to create a new version of a chapter, under the hood it simply finalizes a draft report so that any alterations become new chapter versions
+  * But new versions are only added to the version dropdown in certain circumstances, not every pseudoversion, so it doesn't get too busy
   * Each time a new draft is started, user can add a name, a note about what they plan to change/add/delete, preemptively select chapters to remove, etc., and there's also a field that tracks the reason the new draft snapshot (psuedo-draft: used for tracking reordering/deletion actions maybe, versioning: user wants to create an alternate version of a specific chapter, revising: User wants to start a completely new draft for the purposes of making major planned revisions, time-capsule: user simply wants a more permanent save point that they could potentially revert to without inducing the draft-creation steps, draft: created whenever user wants to export current version of manuscript and ensures reproducibility and can be one of many drafts per revision round)
     * some of those "reasons" can autopoulate defaults, especially those that don't start new revision rounds.
     * there should be a revision_round table so multiple drafts/exports can point to the same revision round of specific changes the user wants to make
@@ -162,6 +220,9 @@ TO-Dos
     * That means we can create a history mode where you can look at old versions (read-only) and revert to specific versions (chapter/outline version only or completely) and this finalizes the last pseudo-draft or versioning timecapsule and starts a new chageable one.
 * undo stack: changing versions needs to update the last cursor position (or even act as its own step) so `type > switch v > type > undo` sets cursor at start of last typing step, not end position in previous version.
 * better to enforce outline and main window are in same version? This update may cause that, anyway
+* Is it better to version at the document level and force the user to distinguish between named versions with notes about the differences?
+  * Document level: If we choose to create a new version, we use the draft idea from above and new versions get created any time we make a change in any chapter moving forward (for chapters or outlines but not notes/world items)
+  * Chapter level: Chapters can have alternate versions without having to increment the whole document's version. Then, you just select which chapter versions should be active (defaulting to whatever was active in last draft version unless altered)
 #### Help needed:
 * Consolidate ideas
 * Decide on consistent and obvious naming practices for referring to these new ideas
@@ -172,55 +233,13 @@ TO-Dos
 * Create a plan for UI updates (what can be removed or needs to be added)
 
 ### World tree & Notes Restructuring
-#### General discussion of current behavior, actual needs/desires, ways I can imagine things implemented, and questions to consider
-World tree and custom categorization of details for world items:
-* I want an easy way to sift through both world items and notes about the world and important relationships, histories, events, holidays, cultural details, etc. Obviously some of these things could be as simple as a list of items in a category, but what if I decide to delve into more details about one or multiple items in the list (write up extra details about them)?
-* Do I need to have a separate notes tree to best organize this, rather than including world notes in the world tree of world items?
-* If it is possible to create world items without assigning them to a category, the world tree needs an uncategorized branch that shows such items. We could ensure the world tree has some major categories (characters/settings/general items/...) that display all items in a simple manner so that nothing is ever impossible to find within the tree.
-* I originally wanted the world tree to display things grouped into categories. Let's say Deities is a mojor categoryu that I wan tto have that is distinct from the "Characters" category (or a subcategory of it)
-  * Deities should contain a list of gods, each one with info about the god if you click on it. Clicking on the parent category "Deities" could bring up a markdown page describing details about the gods in general and how they interact with each other. That's more of a note than a world item. What if I want to have several different notes about deities? Could I have each note nested under the Deities category but also have a nested list of the deities (perhaps in a subcategory called memebers or items)?
-  * How to treat clicking on a member/item: Most memebers would have similar information categories to store, so it would be nice if we could essentially make a template of data display categories that can be different by category. Deities might have name, domain, worshipers, practices, religions, colors, etc. that the user expects to fill out for every one of them. So it would be great if clicking on a member of the deities category brought up a page of separate editors for each of these for ease of display/data entry. Does the existing schema allow for multiple subcategories specified by the user and different by category? This is a bit like the character facets. Maybe that could be generalized to "world_item_facets" and facet_templates works for adding the user-designed templates. When setting the template, the user can decide whether the category should have long-answers or short-answers (large editor or single-line editor) or selectors. Perhaps deities should also be character world items with their own character page. Should that be separate from this list of deity-specific info or should it be an addendum to the character page for anything that is a character_type==deity? Similarly, we could have additional template character page add-ons for a character that is part of X organization that might have [job, codename, mentor, boss].
-  * Possible idea for unifying notes with the categorization potential of the world tree: What if each item allowed multiple tabs? Then I could click on a category like Deities, pulling up its text and within the centerView there would be named tabs of general/categorized info (classification of deities, discussions of where they get their power, history of some divine conflict,...) and then the world tree world could only nest the members/items classifying underneath deities (characters who are deities).
-  * Which of these possibilities causes less confusion? Do they produce too complicated relationships to adequately control/monitor?
-  With all the potential for links, will it be simpler to force world items into simpler categories in the world tree and figure out the rest via notes, or can we handle multiple levels of categorization and interspersed notes without getting recursive or unruly?
-* Once that's finalized, we need to rework world item creation and positioning depending on whether a world item is created in the world tree or elsewhere. Perhaps it should auto-position alphabetically or by insert order and reposition by word tree dragging and then anything without a position value is tacked onto the bottom (like when creating from extracted names). If we flesh out how world items should best be stored, that will help with decisions on how to add them.
-* If we want the world tree to be filterable/searchable, should we allow no same-level reorganization and only let dragging move which category something is nested under?
-* When categories/subcategories are created, can we enforce a type on their members and make sure nothing of different types can drag under them?
-* We could allow world item settings to have subcategories (like a room in a house) but maybe forbid characters or simple items from having subcategories.
-* What if we want to view a list of all members of X organization? Should we make it so any category can have a members list from which items can be added/deleted without impacting the world's character list? What if membership is time-based and we want to see former members but not current ones? Any object that holds members could also allow you to specify when someone was part of it (possibly even multiple stints)
-* It seems like we should have root-level categories that are always present (based on template choices). But then, should we allow the characters category to have subcategories like northerners/southerners or does one of the root categories need to be Notes which is super free in its subcategories and nesting (where other sections aren't)? Or, if the Notes section is going to be free, does it simply need to be its own separate tree that contains notes but also allows membership by any world item?
-* Currently, self.db.world_item_insert is struggling with a foreign key constraint error, likely candidate_id. I hope that reworking this plan (and any subsequent schema adjustments) help with that.
-* figure out what to do with category_id in world_item_insert when none is given (0 is a placeholder for now). Maybe `item/item_type` can determine default category? Or if we want to have user-specified categories, we could display the world tree in one of two sorting methods (1. simple grouped by item type without deeper nesting, 2. complex with nesting by user labels)
-* Once all places are known to be places, it will also be easy to populate the "Setting" dropdown in the outline window, and we can potentially suggest settings at the top of the list based on things like characters found in the  chapter and locations they have known relationships with.
-* ensure any world_item we create is immediately added as an alias of itself (like we already do for characters in accept_candidate)
-#### Help needed:
-* Don't write any code yet.
-* Consolidate ideas
-* Decide on consistent and obvious naming practices for referring to these new ideas
-* Consider feasibility of these changes
-  * If there are multiple conflicting ideas, compare all options and suggest which is best
-* Suggest any similar use-cases or tweaks to this plan that could prove useful here or in other parts of the app
-* Determine how much change will be needed from what already exists
-  * Create a general plan for db schema updates
-  * Create a general plan for UI updates (what can be removed or needs to be added)
-#### Follow-up:
-Currently, membership has a start/end date. We may need to add a membership period table so multiple periods of membership can be tracked. This would allow for a membership timeline (like a resume) to show different roles at different times, too. Eventually, I want a timeline feature that tracks events across time for various people/groups/regions/..., so perhaps a more generalizable table would also set up for that.
-Thoughts on the Category Notebook being in the right panel: (This section is not to add in today but to consider if it requires schema changes). I wonder if it would be possible to add this in the main center panel as another tab. I'm starting to wonder if it would be better to have a main viewing area that allows for tabs and then, rather than the current world-detail right panel, clicking on a world item brings it up in a new tab. The main viewing area could be optionally be split into two or even more viewing areas side-by-side, each with its own tabs. When a chapter tab is open, it displays the chapter just like the centerView currently does, but when displaying world categories, it acts as this Category Notebook with tabs of its own. In the future, world items can a character editor-like dialog or a mimic of the world detail panel, but, for now, we can keep world items in the right panel.
-Item Detail: I could see this having tabs with those optional panels you mentioned, but I think I'd rather it all be a single scrollable form with the description, facets either tabular or with nice headings and possibly multiple per row depending on width, notes with headers that are their title/label, memberships/relationships organized possibly tabular. All these items could be text boxes that only become editable once clicked on and otherwise render with a clean, viewing aesthetic.
-I like the look of that design discussion. It seems like any given item can have multiple facet templates that it adheres to, some which add facet items and others which might take away or give default values for certain facets. We would just have to make sure that overlapping templates play nicely or know when to defer to the rules of the other.
-3.1: I think we keep the world tree very simple. We have major root categories that are determined by world item type (characters under Characters, organizations under Organizations, locations under Settings etc.). Nothing is duplicated. Everything is filterable (including an option to show only items found in a certain chapter(s) which could replace the need for the reference tree). The categories are simple, no subcategories. Then we have a Note branch (or a separate Notes tree) where lots of categories can be created (many of which come stock from a template for the project style). The same world items can nest in multiple locations. This is where people store research notes or write all about their religion and can have a Deities section with its member deities and tabs of additional notes. Let's say any character can be classified from their character page as a deity and will then appear in the deities list. But we can also add subcategories specifically for classification. (Certain gods are creation gods and others are destruction gods. Certain soldiers are archers and others are spies and some fit in multiple categories.) This way we can allow infinite categorization opportunities, and subcategories like destruction deities could have their own facet template that extends/overrides the deity template. Based on the extra functionality, I think this warrants a separate notes tree which is great because it can link world items many times without confusion. Tabs are optional but each note can have lots of nested items (can be a node or a child). If it allows members, it can have subcategories within its nested Members where the characters are listed (rather than directly under members). Members-type subcategories won't have anything nested under them except either deeper member-subcategories or the listed members (no need to have CategoryName>Members>SubcategoryName>Members>Member1,Member2 but rather CategoryName>Members>SubcategoryName>Member1,Member2), and those members (sub)categories can have a landing page with tabs but they can't have nested notes. We may need a new table to hold these subtypes if any world item can be a member of multiple or do we have a table that could be added to? Member items are then end (never act as nodes). Any note page (that isn't already a node) can optionally be converted into a world item from there, its content becoming the new item's description.
-3.2: Like the category type specifications for nesting rules in the world tree, we can now use those for the notes tree. Deities>Members only holds type-character and also marks any added characters as subtype-deity or takes away that distinction if removed from the category. Locations are special and can host different types of membership subcategories. i.e. Big City can have a Residents membership category that holds people and a sub-setting membership category that holds locations with can hold other settings and an event membership category that holds any local festivals or holidays or such. We don't yet have events as a world item type, but we should add it so events get a landing page and wikilinks.
-3.3 I don't mind migrating character_facets immediately, since I'm just using a memory db for testing.
-UI-wise: Click on a deity (or other category/subcategory). Along with the description and any summary section, there's a gear icon or notepad/tinkering icon that brings up the template builder. The template builder could start with its supercategory's template (character-template) and let you add or subtract facets from that, but it might be better to treat these as add-ons, show the character template without allowing deletions, and allow user to add items.
-3.4: If this ever moves to a sharable format, it would be nice to be able to mark certain tabs or facets as visible for only certain users or user/subscriber types. We could add that in wit a bunch of defaults for now if that's easier than adding it later. These tabs within a note are great for concepts that would never need to host nested details of their own.
-3.5: I would be interested in "A dedicated world_memberships", but we can start with "level 1) for now. I believe world_facts is eventually supposed to host details that are extracted by AI from the text, so I'm not sure if it's the right place to store membership details.
-3.6: I like having these NULL category_ids. Let's make sure that an "Uncategorized" branch appears at root if an object is added without type. Interacting with items there, we'll have the option to add them to a category. For the most part, I think its better to force items to be added in with a category, but this might be good if we're adding world items via file upload dnd (which isn't yet available but would benefit from AI detail extraction).
-View options: We should also have a priority-based view that lists main/secondary/tertiary/minor characters/locations/world-items in that order for easy hunting.
-4. This is mostly accurate for the notes tree. You just need to work in the rules from my comments above (mostly 3.1). Is there still merit in having the world tree or would it be better to have a world-item lookup where you can a) start typing and choose your item or b) choose a category which pulls up a list of items of that type and optionally type to wean down the list?
-5. Update this with my updated ideas.
-6. World tree root level: Allow user to create additional item types which also add root categories (e.g. magical items, spells,...)
-
-
+* world tree flattening/simplification
+  * Ensure multiple categories aren't getting added except via (a) defaults for project type or (b) new item types
+* Notes tree
+  * finalize how everything is viewed
+  * finalize viewing location
+  * make everything editable
+  * ensure the right sorts of data are collected
 
 ### Done but keep monitoring
 * save last state so startup reopens where user left off

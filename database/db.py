@@ -1368,6 +1368,31 @@ class Database:
                              WHERE id=?""", (md, world_item_id))
         self.conn.commit()
     
+    def world_item_render_update(self, world_item_id, html_content):
+        cur = self.conn.cursor()
+        cur.execute("UPDATE world_items SET content_render=? WHERE id=?", (html_content, world_item_id))
+        self.conn.commit()
+
+    def world_item_update_text_and_render(
+        self,
+        world_item_id: int,
+        content_md: str,
+        content_render: str,
+    ) -> None:
+        """Update both the markdown and HTML snapshot for a world item."""
+        c = self.conn.cursor()
+        c.execute(
+            """
+            UPDATE world_items
+               SET content_md    = ?,
+                   content_render = ?,
+                   updated_at    = CURRENT_TIMESTAMP
+             WHERE id = ?
+            """,
+            (content_md, content_render, world_item_id),
+        )
+        self.conn.commit()
+
     def world_item_update(self, world_item_id: int, title: Optional[str]=None, position: Optional[int]=None, content_md: Optional[str]=None) -> None:
         self.conn.execute("""UPDATE world_items
                              SET title=COALESCE(?, title), position=COALESCE(?, position), content_md=COALESCE(?, content_md), updated_at=CURRENT_TIMESTAMP
@@ -1383,6 +1408,89 @@ class Database:
         self.conn.execute("UPDATE world_items SET deleted=1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                           (world_item_id,))
         self.conn.commit()
+
+    def world_index_for_project(self, project_id: int) -> list[dict]:
+        """
+        Build a worldIndex snapshot for the rich editor.
+
+        Shape:
+            [
+                {
+                    "id": <world_item_id>,
+                    "title": <world_items.title>,
+                    "type": <world_items.type or "">,
+                    "aliases": [
+                        {
+                            "id": <alias_id>,
+                            "alias": <world_aliases.alias>,
+                            "alias_type": <world_aliases.alias_type>,
+                            "alias_norm": <world_aliases.alias_norm>,
+                            "status": <world_aliases.status>,
+                            "is_primary": bool(<world_aliases.is_primary>),
+                            "case_mode": "ignore",  # placeholder until we add column
+                        },
+                        ...
+                    ],
+                },
+                ...
+            ]
+        """
+        c = self.conn.cursor()
+        c.execute(
+            """
+            SELECT
+                wi.id          AS world_item_id,
+                wi.title       AS title,
+                wi.type        AS type,
+                wa.id          AS alias_id,
+                wa.alias       AS alias,
+                wa.alias_type  AS alias_type,
+                wa.alias_norm  AS alias_norm,
+                wa.status      AS status,
+                wa.is_primary  AS is_primary
+            FROM world_items wi
+            LEFT JOIN world_aliases wa
+              ON wa.world_item_id = wi.id
+             AND COALESCE(wa.deleted,0) = 0
+            WHERE wi.project_id = ?
+              AND COALESCE(wi.deleted,0) = 0
+            ORDER BY LOWER(wi.title), wi.id, wa.is_primary DESC, wa.alias
+            """,
+            (project_id,),
+        )
+        rows = c.fetchall()
+
+        index_by_item: dict[int, dict] = {}
+
+        for r in rows:
+            wid = int(r["world_item_id"])
+            item = index_by_item.get(wid)
+            if item is None:
+                item = {
+                    "id": wid,
+                    "title": r["title"] or "",
+                    "type": r["type"] or "",
+                    "aliases": [],
+                }
+                index_by_item[wid] = item
+
+            alias_id = r["alias_id"]
+            if alias_id is not None:
+                alias_entry = {
+                    "id": int(alias_id),
+                    "alias": r["alias"] or "",
+                    "alias_type": r["alias_type"] or "",
+                    "alias_norm": r["alias_norm"] or "",
+                    "status": r["status"] or "",
+                    "is_primary": bool(r["is_primary"]),
+                    # Everything case-insensitive for now; will hook real column later.
+                    "case_mode": "ignore",
+                }
+                item["aliases"].append(alias_entry)
+
+        result = list(index_by_item.values())
+        result.sort(key=lambda it: ((it["title"] or "").lower(), it["id"]))
+        return result
 
     # --- World aliases/titles (phrases to world IDs)
     def world_phrases_for_project_detailed(self, project_id: int, ids: list[int] | None = None):
@@ -1664,11 +1772,6 @@ class Database:
         else:
             # TODO: extend when notes/outlines have a cache table
             pass
-
-    def world_item_render_update(self, world_item_id, html_content):
-        cur = self.conn.cursor()
-        cur.execute("UPDATE world_items SET content_render=? WHERE id=?", (html_content, world_item_id))
-        self.conn.commit()
 
     def chapter_version_render_update(self, version_id, html_content):
         cur = self.conn.cursor()

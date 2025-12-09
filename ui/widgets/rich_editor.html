@@ -1,0 +1,85 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>StoryArkivist Experimental Editor</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #1e1e1e;
+      color: #f0f0f0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    #toolbar {
+      display: flex;
+      gap: 4px;
+      padding: 6px 8px;
+      background: #2b2b2b;
+      border-bottom: 1px solid #3a3a3a;
+      font-size: 12px;
+    }
+    #toolbar button {
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid #444;
+      background: #333;
+      color: #eee;
+      cursor: pointer;
+    }
+    #toolbar button:hover {
+      background: #444;
+    }
+    #editor-container {
+      flex: 1;
+      overflow: auto;
+    }
+    #editor {
+      padding: 8px 10px;
+      min-height: 100%;
+      outline: none;
+      white-space: pre-wrap;
+    }
+    #editor:focus {
+      box-shadow: inset 0 0 0 1px #4a90e2;
+    }
+    .demo-links {
+      font-size: 11px;
+      opacity: 0.7;
+      margin-top: 8px;
+    }
+    .demo-links a {
+      color: #9bdcff;
+    }
+  </style>
+
+  <!-- Qt WebChannel script -->
+  <!-- <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="editor_bundle.js"></script> -->
+</head>
+<body>
+  <div id="toolbar">
+    <span>Experimental stub editor</span>
+    <span style="flex:1"></span>
+    <!-- Context actions -->
+    <button type="button" onclick="makeWikilink()">Make wikilink</button>
+    <button type="button" onclick="rejectAutoLink('spot')">Don’t auto-link here</button>
+    <button type="button" onclick="requestSynonyms()">Synonyms…</button>
+  </div>
+
+  <div id="editor-container">
+    <div id="editor" contenteditable="true"></div>
+    <div class="demo-links">
+      Demo links (Ctrl+Click):
+      <a href="#nerina" data-link-kind="wikilink" data-world-id="1001">Nerina (wikilink)</a> ·
+      <a href="https://example.com" data-link-kind="external">Example.com (external)</a>
+    </div>
+  </div>
+
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="editor_bundle.js"></script>
+</body>
+</html>

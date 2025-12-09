@@ -35,6 +35,7 @@ from ui.widgets.notes_tree import NotesTree
 from ui.widgets.notes_notebook import NotesNotebook
 from ui.widgets.helpers import DropPane, PlainNoTab, chapter_display_label, normalize_possessive, parse_internal_url, scrub_markdown_for_ner
 from ui.widgets.common import StatusLine, _WikiHoverFilter, AliasPicker
+from ui.widgets.rich_text_editor import RichTextEditor
 from database.db import Database
 from utils.icons import make_lock_icon
 from utils.word_integration import DocxRoundTrip
@@ -74,6 +75,9 @@ class StoryArkivist(QMainWindow):
         # self.outlineWorkspace.install_global_shortcuts(self)  # pass main window as host
 
         self._build_ui()
+
+        # NEW: set up the Experimental bottom-tab rich editor
+        self._init_experimental_editor()
 
         # Pick or create a project immediately
         # self._ensure_project_exists_or_prompt()
@@ -283,7 +287,7 @@ class StoryArkivist(QMainWindow):
         elyn   = self.db.world_item_insert(pid, characters_cid, "Elyn",   item_type="character", aliases={}, content_md="**Elyn**: novice acolyte.")
 
         # Places
-        dawn_temple = self.db.world_item_insert(pid, places_cid, "Temple of Dawn", item_type="place", aliases={"Dawn Temple":"title",}, content_md="Ancient temple to Solara.")
+        dawn_temple = self.db.world_item_insert(pid, places_cid, "Temple of Dawn", item_type="place", aliases={"Dawn Temple":"title",}, content_md="Ancient temple to Solara.\n\nJust north of the Black Gate, Temple is a refuge protected by Markus and his men.")
         black_gate  = self.db.world_item_insert(pid, places_cid, "Black Gate", item_type="place", aliases={"Gate of Night":"title",}, content_md="Northern border fortress.")
 
         world = [solara, markus, elyn, dawn_temple, black_gate]
@@ -1288,10 +1292,11 @@ class StoryArkivist(QMainWindow):
             self.populate_notes_tree()
             # clear right panel if we just hid the current item
             if getattr(self.worldDetail, "_current_world_item_id", None) == obj_id:
-                if hasattr(self.worldDetail, "set_mode"): self.worldDetail.set_mode("view")
-                if hasattr(self.worldDetail, "view"):     self.worldDetail.view.setHtml("")
-                if hasattr(self.worldDetail, "edit"):     self.worldDetail.edit.setPlainText("")
+                if hasattr(self.worldDetail, "set_mode"):
+                    self.worldDetail.set_mode("view")
                 self.worldDetail._current_world_item_id = None
+                self.worldDetail.refresh()
+
 
     # TODO: remove or use
     def open_character_editor(self, char_id: int):
@@ -2039,7 +2044,11 @@ class StoryArkivist(QMainWindow):
         # Bottom tabs
         self.bottomTabs = QTabWidget()
 
-        # Notes / World Notes tab
+        # TEMP: Experimental rich text editor tab ---
+        self.tabExperimentalEditor = RichTextEditor(self)
+        self.bottomTabs.addTab(self.tabExperimentalEditor, "Experimental editor")
+
+        # TEMP: Notes / World Notes tab
         self.tabNotes = NotesNotebook(self, self.db)
         self.bottomTabs.addTab(self.tabNotes, "World Notes")
 
@@ -2207,6 +2216,12 @@ class StoryArkivist(QMainWindow):
         self.chaptersOrderChanged.connect(self.outlineWorkspace.apply_order_by_ids)
         self._wire_outline_version_bridge()
 
+        # Global Ctrl+S shortcut (applies to the whole window)
+        self._global_save_shortcut = QShortcut(QKeySequence.Save, self)
+        self._global_save_shortcut.setContext(Qt.ApplicationShortcut)
+        self._global_save_shortcut.activated.connect(self._on_global_save_shortcut)
+
+
     def _outline_controller(self):
         return self.outlineWorkspace.page.undoController
 
@@ -2251,6 +2266,26 @@ class StoryArkivist(QMainWindow):
         print("MAIN: Ctrl+Y / Ctrl+Shift+Z")
         if ctrl:
             ctrl.redo()
+
+    def _on_global_save_shortcut(self) -> None:
+        """
+        Handle Ctrl+S at the window level.
+
+        For now, delegate to the world-detail panel if it's active.
+        Later, this will also save the current DocPage (chapter, note, etc.).
+        """
+        print("[StoryArkivist] Global Ctrl+S pressed")
+
+        # World-detail panel
+        if hasattr(self, "worldDetail") and self.worldDetail.isVisible():
+            try:
+                self.worldDetail._save_current_if_dirty()
+            except Exception as e:
+                print("[StoryArkivist] Error saving world detail on Ctrl+S:", e)
+
+        # TODO (later): center doc pages, chapter tabs, etc.
+        # if hasattr(self, "docTabs") and self.docTabs.isVisible():
+        #     self.docTabs.save_current_doc()
 
     def insert_new_world_item_inline(self, category_id: int, category_item: QTreeWidgetItem,
                                     mode: str = "end", ref_item: QTreeWidgetItem | None = None):
@@ -3196,7 +3231,12 @@ class StoryArkivist(QMainWindow):
             self._render_center_preview(ver_id)
         elif doc_type == "world_item":
             self.rebuild_world_item_render(doc_id)
+            # Update world detail if showing this item (NOTE: doesn't update new editor)
             self.worldDetail.refresh_if_showing(doc_id)  # small helper, no-op if not visible
+            # Update world index of current world detail editor
+            world_index = self.db.world_index_for_project(self._current_project_id)
+            if self.worldDetail._current_world_item_id is not None:
+                self.worldDetail.edit.update_world_index(world_index)
 
     def cmd_quick_parse_chapter(self, chapter_id: int, version_id: int | None = None):
         self.cmd_quick_parse(doc_type="chapter", doc_id=chapter_id, version_id=version_id)
@@ -3802,6 +3842,117 @@ class StoryArkivist(QMainWindow):
         self.centerView.setHtml("")
         if hasattr(self.worldDetail, "clear"):
             self.worldDetail.clear()
+
+
+    def _init_experimental_editor(self) -> None:
+        """
+        Initialize the Experimental editor bottom tab with a scratch doc
+        and connect logging handlers.
+
+        Uses fake in-memory worldIndex + prefs; no DB writes.
+        """
+        ed = getattr(self, "tabExperimentalEditor", None)
+        if ed is None:
+            return
+
+        # --- Scratch markdown sample ---
+        scratch_md = (
+            "# Experimental editor scratch\n\n"
+            "Nerina stopped at the Gate and studied the carvings.\n\n"
+            "Later, Nerina met her mentor beneath the Black Gate, where "
+            "old stories whispered through the stone.\n"
+        )
+
+        # --- Fake world index for auto-linking ---
+        world_index = [
+            {
+                "id": 1001,
+                "title": "Nerina",
+                "type": "character",
+                "aliases": [
+                    {"id": 2001, "alias": "Nerina", "case_mode": "exact"},
+                    {"id": 2002, "alias": "Neri", "case_mode": "ignore"},
+                ],
+            },
+            {
+                "id": 1002,
+                "title": "Black Gate",
+                "type": "place",
+                "aliases": [
+                    {"id": 2101, "alias": "Black Gate", "case_mode": "ignore"},
+                    {"id": 2102, "alias": "Gate", "case_mode": "match_case"},
+                ],
+            },
+        ]
+
+        prefs = {
+            "autoPairs": True,
+            "showWikilinks": "ctrlReveal",
+            "highlightLinksWhileCtrl": True,
+            "linkFollowMode": "ctrlClick",
+        }
+
+        doc_config = {
+            "docType": "scratch",
+            "docId": "experimental",
+            "versionId": 1,
+            "markdown": scratch_md,
+            "worldIndex": world_index,
+            "prefs": prefs,
+        }
+
+        # --- Wire logging handlers ---
+        ed.requestSave.connect(self._on_experimental_request_save)
+        ed.docChanged.connect(self._on_experimental_doc_changed)
+        ed.linkInteraction.connect(self._on_experimental_link_interaction)
+        ed.contextAction.connect(self._on_experimental_context_action)
+        ed.activityPing.connect(
+            lambda kind=None: self._on_experimental_activity_ping(kind)
+        )
+        ed.focusGained.connect(
+            lambda: print("[Experimental editor] focusGained")
+        )
+        ed.focusLost.connect(
+            lambda: print("[Experimental editor] focusLost")
+        )
+
+        # Load the initial scratch document
+        ed.load_document(doc_config)
+
+    # --- Experimental editor event handlers (logging only for v0.1) ---
+
+    def _on_experimental_request_save(
+        self,
+        doc_id: str,
+        version_id: int,
+        markdown: str,
+        html_snapshot: str,
+    ) -> None:
+        print(
+            f"[Experimental editor] requestSave: doc_id={doc_id!r}, "
+            f"version_id={version_id}, "
+            f"markdown_len={len(markdown)}, html_len={len(html_snapshot)}"
+        )
+
+    def _on_experimental_doc_changed(
+        self,
+        doc_id: str,
+        version_id: int,
+        dirty: bool,
+    ) -> None:
+        print(
+            f"[Experimental editor] docChanged: doc_id={doc_id!r}, "
+            f"version_id={version_id}, dirty={dirty}"
+        )
+
+    def _on_experimental_link_interaction(self, payload: object) -> None:
+        print(f"[Experimental editor] linkInteraction: {payload!r}")
+
+    def _on_experimental_context_action(self, payload: object) -> None:
+        print(f"[Experimental editor] contextAction: {payload!r}")
+
+    def _on_experimental_activity_ping(self, kind: str = None, payload: object = {}) -> None:
+        print(f"[Experimental editor] activityPing: kind={kind!r}, payload={payload!r}")
 
 
     def changeEvent(self, e):

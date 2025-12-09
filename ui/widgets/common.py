@@ -6,7 +6,7 @@ from PySide6.QtGui import QPalette, QColor, QCursor, QPainter
 from PySide6.QtWidgets import (
     QLabel, QFrame, QSizePolicy, QToolTip, QDialog, QTextBrowser,
     QVBoxLayout, QHBoxLayout, QLineEdit, QListWidget, QPushButton,
-    QApplication, QGraphicsDropShadowEffect, QWidget
+    QApplication, QGraphicsDropShadowEffect, QWidget, QComboBox
 )
 
 from ui.widgets.helpers import parse_internal_url
@@ -201,6 +201,74 @@ class EditStateController(QObject):
         if self._state != val:
             self._state = val
             self.stateChanged.emit(val)
+
+
+class RichEditorToolbar(QFrame):
+    """
+    Small toolbar for the embedded rich text editor.
+
+    Currently exposes two preferences:
+      - showWikilinks: "full" or "ctrlReveal"
+      - linkFollowMode: "ctrlClick" or "click"
+
+    Emits prefsChanged(dict) whenever the user changes a control.
+    """
+    prefsChanged = Signal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        lbl_links = QLabel("Links:", self)
+        self.cmbLinkMode = QComboBox(self)
+        self.cmbLinkMode.addItem("Show links", "full")
+        self.cmbLinkMode.addItem("Reveal on Ctrl", "ctrlReveal")
+
+        lbl_follow = QLabel("Follow:", self)
+        self.cmbFollowMode = QComboBox(self)
+        self.cmbFollowMode.addItem("Ctrl+Click", "ctrlClick")
+        self.cmbFollowMode.addItem("Click", "click")
+
+        layout.addWidget(lbl_links)
+        layout.addWidget(self.cmbLinkMode)
+        layout.addSpacing(12)
+        layout.addWidget(lbl_follow)
+        layout.addWidget(self.cmbFollowMode)
+        layout.addStretch(1)
+
+        self.cmbLinkMode.currentIndexChanged.connect(self._emit_prefs)
+        self.cmbFollowMode.currentIndexChanged.connect(self._emit_prefs)
+
+    def prefs(self) -> dict:
+        mode = self.cmbLinkMode.currentData()
+        follow = self.cmbFollowMode.currentData()
+        return {
+            "autoPairs": True,
+            "showWikilinks": mode or "full",
+            "highlightLinksWhileCtrl": True,
+            "linkFollowMode": follow or "ctrlClick",
+        }
+
+    def set_prefs(self, prefs: dict | None) -> None:
+        prefs = prefs or {}
+        mode = prefs.get("showWikilinks", "full")
+        follow = prefs.get("linkFollowMode", "ctrlClick")
+
+        idx = self.cmbLinkMode.findData(mode)
+        if idx != -1:
+            self.cmbLinkMode.setCurrentIndex(idx)
+
+        idx = self.cmbFollowMode.findData(follow)
+        if idx != -1:
+            self.cmbFollowMode.setCurrentIndex(idx)
+
+    def _emit_prefs(self) -> None:
+        self.prefsChanged.emit(self.prefs())
 
 
 class AliasPicker(QDialog):
