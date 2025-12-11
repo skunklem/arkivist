@@ -619,6 +619,11 @@
       if (!editorDiv) return;
       const html = editorDiv.innerHTML;
       const markdown = htmlToMarkdown(html);
+
+      // Keep our local docConfig in sync so any future loadDocument()
+      // uses the latest markdown instead of stale content.
+      _docConfig.markdown = markdown;
+
       const payload = {
         docId: _docConfig.docId,
         versionId: _docConfig.versionId,

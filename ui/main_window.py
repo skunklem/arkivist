@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QDialog, QSizePolicy, QInputDialog, QMenu, QToolButton, QToolTip,
     QWidgetAction, QAbstractItemDelegate, QStyle, QApplication, QComboBox
 )
+from PySide6.QtWebEngineWidgets import QWebEngineView
+
 from ui.widgets.outline import OutlineWorkspace
 from ui.widgets.outline import MiniOutlineTab
 from ui.widgets.outline.window import OutlineWindow
@@ -76,8 +78,8 @@ class StoryArkivist(QMainWindow):
 
         self._build_ui()
 
-        # NEW: set up the Experimental bottom-tab rich editor
-        self._init_experimental_editor()
+        # Pre-warm QWebEngine/Rich editor so first use doesn't blink
+        self._prewarm_webengine()
 
         # Pick or create a project immediately
         # self._ensure_project_exists_or_prompt()
@@ -222,11 +224,11 @@ class StoryArkivist(QMainWindow):
             f.setPointSizeF(self._base_pt * z)
             self.centerEdit.setFont(f)
 
-        # 3) World detail edit (QPlainTextEdit)
+        # 3) World detail edit (rich editor pane)
         if hasattr(self, "worldDetail") and hasattr(self.worldDetail, "edit"):
-            f = self.worldDetail.edit.font()
-            f.setPointSizeF(self._base_pt * z)
-            self.worldDetail.edit.setFont(f)
+            # Scale the page itself
+            target = self.worldDetail.edit.editor._view
+            target.setZoomFactor(z)
 
         # 4) Previews (QTextBrowser) via relative zoom steps
         #    Define ~10 steps to double size (approx), so steps = round((z-1)*10)
@@ -2045,7 +2047,7 @@ class StoryArkivist(QMainWindow):
         self.bottomTabs = QTabWidget()
 
         # TEMP: Experimental rich text editor tab ---
-        self.tabExperimentalEditor = RichTextEditor(self)
+        self.tabExperimentalEditor = QWidget(self)
         self.bottomTabs.addTab(self.tabExperimentalEditor, "Experimental editor")
 
         # TEMP: Notes / World Notes tab
@@ -2169,6 +2171,32 @@ class StoryArkivist(QMainWindow):
         act.triggered.connect(slot)
         return act
 
+    def _prewarm_webengine(self) -> None:
+        """Create an offscreen RichTextEditor once to warm up QWebEngine.
+
+        This helps avoid a visible blink the first time a world item is opened,
+        because the WebEngine process and HTML shell are already initialized.
+        """
+        print("[StoryArkivist] pre-warming WebEngine/Rich editor...")
+
+        # Use a full RichTextEditor so the HTML shell + editor_bundle.js
+        # are loaded once during startup.
+        from ui.widgets.rich_text_editor import RichTextEditor
+
+        self._webengine_warmup_editor = RichTextEditor(self)
+        self._webengine_warmup_editor.hide()
+        self._webengine_warmup_editor.resize(1, 1)
+
+        def _on_warmup_finished(ok: bool) -> None:
+            print("[StoryArkivist] WebEngine warmup finished, ok=", ok)
+            # Drop the temporary editor; normal editors will be created later.
+            self._webengine_warmup_editor.deleteLater()
+            self._webengine_warmup_editor = None
+
+        # When the HTML shell finishes loading, consider warmup complete.
+        # (RichTextEditor already connects this signal for its own purposes;
+        # we just piggyback another handler here.)
+        self._webengine_warmup_editor._page.loadFinished.connect(_on_warmup_finished)
 
     def _wire_outline_version_bridge(self):
         # Workspace → Page listens for app-level version changes
@@ -3842,117 +3870,6 @@ class StoryArkivist(QMainWindow):
         self.centerView.setHtml("")
         if hasattr(self.worldDetail, "clear"):
             self.worldDetail.clear()
-
-
-    def _init_experimental_editor(self) -> None:
-        """
-        Initialize the Experimental editor bottom tab with a scratch doc
-        and connect logging handlers.
-
-        Uses fake in-memory worldIndex + prefs; no DB writes.
-        """
-        ed = getattr(self, "tabExperimentalEditor", None)
-        if ed is None:
-            return
-
-        # --- Scratch markdown sample ---
-        scratch_md = (
-            "# Experimental editor scratch\n\n"
-            "Nerina stopped at the Gate and studied the carvings.\n\n"
-            "Later, Nerina met her mentor beneath the Black Gate, where "
-            "old stories whispered through the stone.\n"
-        )
-
-        # --- Fake world index for auto-linking ---
-        world_index = [
-            {
-                "id": 1001,
-                "title": "Nerina",
-                "type": "character",
-                "aliases": [
-                    {"id": 2001, "alias": "Nerina", "case_mode": "exact"},
-                    {"id": 2002, "alias": "Neri", "case_mode": "ignore"},
-                ],
-            },
-            {
-                "id": 1002,
-                "title": "Black Gate",
-                "type": "place",
-                "aliases": [
-                    {"id": 2101, "alias": "Black Gate", "case_mode": "ignore"},
-                    {"id": 2102, "alias": "Gate", "case_mode": "match_case"},
-                ],
-            },
-        ]
-
-        prefs = {
-            "autoPairs": True,
-            "showWikilinks": "ctrlReveal",
-            "highlightLinksWhileCtrl": True,
-            "linkFollowMode": "ctrlClick",
-        }
-
-        doc_config = {
-            "docType": "scratch",
-            "docId": "experimental",
-            "versionId": 1,
-            "markdown": scratch_md,
-            "worldIndex": world_index,
-            "prefs": prefs,
-        }
-
-        # --- Wire logging handlers ---
-        ed.requestSave.connect(self._on_experimental_request_save)
-        ed.docChanged.connect(self._on_experimental_doc_changed)
-        ed.linkInteraction.connect(self._on_experimental_link_interaction)
-        ed.contextAction.connect(self._on_experimental_context_action)
-        ed.activityPing.connect(
-            lambda kind=None: self._on_experimental_activity_ping(kind)
-        )
-        ed.focusGained.connect(
-            lambda: print("[Experimental editor] focusGained")
-        )
-        ed.focusLost.connect(
-            lambda: print("[Experimental editor] focusLost")
-        )
-
-        # Load the initial scratch document
-        ed.load_document(doc_config)
-
-    # --- Experimental editor event handlers (logging only for v0.1) ---
-
-    def _on_experimental_request_save(
-        self,
-        doc_id: str,
-        version_id: int,
-        markdown: str,
-        html_snapshot: str,
-    ) -> None:
-        print(
-            f"[Experimental editor] requestSave: doc_id={doc_id!r}, "
-            f"version_id={version_id}, "
-            f"markdown_len={len(markdown)}, html_len={len(html_snapshot)}"
-        )
-
-    def _on_experimental_doc_changed(
-        self,
-        doc_id: str,
-        version_id: int,
-        dirty: bool,
-    ) -> None:
-        print(
-            f"[Experimental editor] docChanged: doc_id={doc_id!r}, "
-            f"version_id={version_id}, dirty={dirty}"
-        )
-
-    def _on_experimental_link_interaction(self, payload: object) -> None:
-        print(f"[Experimental editor] linkInteraction: {payload!r}")
-
-    def _on_experimental_context_action(self, payload: object) -> None:
-        print(f"[Experimental editor] contextAction: {payload!r}")
-
-    def _on_experimental_activity_ping(self, kind: str = None, payload: object = {}) -> None:
-        print(f"[Experimental editor] activityPing: kind={kind!r}, payload={payload!r}")
 
 
     def changeEvent(self, e):

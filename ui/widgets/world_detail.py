@@ -2,15 +2,16 @@ import re
 import traceback
 
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut, QCursor
-from PySide6.QtCore import Qt, QTimer, QUrl, QDateTime
+from PySide6.QtCore import Qt, QTimer, QUrl, QDateTime, QObject, QEvent
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QScrollArea,
     QTextBrowser, QPlainTextEdit,QTableWidget, QTableWidgetItem,
     QLabel, QPushButton, QSizePolicy, QHBoxLayout, QApplication,
     QToolTip
 )
-from ui.widgets.common import StatusLine, _HoverCardPopup, RichEditorToolbar
-from ui.widgets.rich_text_editor import RichTextEditor
+from ui.widgets.common import StatusLine, _HoverCardPopup
+from ui.widgets.rich_text_editor import RichTextEditor  # still used for type checks
+from ui.widgets.rich_editor_pane import RichEditorPane, RichEditorToolbar
 
 def _safe(fn):
     def wrap(self, *a, **k):
@@ -24,6 +25,21 @@ def _safe(fn):
 
 from utils.md import md_to_html
 from ui.widgets.helpers import PlainNoTab
+
+class _EditorClickFilter(QObject):
+    """
+    Simple filter: any mouse press inside the rich editor hides the hover card.
+    """
+    def __init__(self, cb, parent=None):
+        super().__init__(parent)
+        self._cb = cb
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.MouseButtonPress and self._cb:
+            print("Detected mouse press inside rich editor; hiding hover card")
+            self._cb()
+        return False
+
 
 class MiniDoc(QTextBrowser):
     def __init__(self, app, parent=None, *a, **kw):
@@ -84,17 +100,12 @@ class WorldDetailWidget(QWidget):
         self.vbox.addWidget(self.statusLine)
         self.statusLine.show_neutral("Select a world item")
 
-        # Editor prefs + toolbar (controls rich editor behavior)
+        # Editor prefs (shared with embedded RichEditorPane)
         self._editor_prefs = {
-            "autoPairs": True,
             "showWikilinks": "full",
             "highlightLinksWhileCtrl": True,
             "linkFollowMode": "ctrlClick",
         }
-        self.editorToolbar = RichEditorToolbar(self)
-        self.editorToolbar.set_prefs(self._editor_prefs)
-        self.editorToolbar.prefsChanged.connect(self._on_editor_prefs_changed)
-        self.vbox.addWidget(self.editorToolbar)
 
         # --- SCROLLABLE content area ---
         self.scroll = QScrollArea(self)
@@ -130,6 +141,10 @@ class WorldDetailWidget(QWidget):
         self._editor_hover_poll.setInterval(120)
         self._editor_hover_poll.setSingleShot(False)
         self._editor_hover_poll.timeout.connect(self._hide_editor_hover_if_outside)
+        # click filter for the rich editor (hooked once the pane exists)
+        self._editor_click_filter = _EditorClickFilter(
+            self._hide_editor_hover_immediate, self
+        )
 
         # default to Edit
         self._set_mode(view_mode=False)
@@ -196,11 +211,18 @@ class WorldDetailWidget(QWidget):
         self.app._attach_link_handlers(self.view)
         self.contentBox.addWidget(self.view)
 
-        # WorldDetail-simple: use RichTextEditor for edit mode
-        self.edit = RichTextEditor(self)
+        # Rich editor pane: toolbar + RichTextEditor
+        self.edit = RichEditorPane(self, initial_prefs=self._editor_prefs)
         self.contentBox.addWidget(self.edit)
 
-        # Hook editor events into world-detail logic
+        # clicks inside the editor hide hovercards
+        if hasattr(self.edit, "editor") and self.edit.editor is not None:
+            self.edit.editor.installEventFilter(self._editor_click_filter)
+
+        # Keep prefs in sync: when the pane toolbar changes, update stored prefs
+        self.edit.prefsChanged.connect(self._on_editor_prefs_changed)
+
+        # Hook editor events into world-detail logic (bubble from pane)
         self.edit.docChanged.connect(self._on_editor_doc_changed)
         self.edit.requestSave.connect(self._on_editor_request_save)
         self.edit.linkInteraction.connect(self._on_editor_link_interaction)
@@ -409,11 +431,19 @@ class WorldDetailWidget(QWidget):
                 return
 
             if trigger == "click":
-                # Rich editor: queue follow, then request save
-                if isinstance(self.edit, RichTextEditor):
+                # Rich editor inside a pane: queue follow, then request save
+                inner_editor = None
+                from ui.widgets.rich_editor_pane import RichEditorPane  # already imported at top
+
+                if isinstance(self.edit, RichEditorPane):
+                    inner_editor = self.edit.editor
+                elif isinstance(self.edit, RichTextEditor):
+                    inner_editor = self.edit
+
+                if isinstance(inner_editor, RichTextEditor):
                     print("[WorldDetailWidget] wikilink click → queue follow after save; wid=", wid)
                     self._pending_follow_world_item_id = wid
-                    self.edit.request_save()
+                    inner_editor.request_save()
                     return
 
 
@@ -426,6 +456,14 @@ class WorldDetailWidget(QWidget):
             href = payload.get("href") or payload.get("url")
             if href and trigger == "click":
                 QDesktopServices.openUrl(QUrl(href))
+
+    def _hide_editor_hover_immediate(self):
+        """Hide any active hovercard immediately and stop polling."""
+        print("[WorldDetailWidget] _hide_editor_hover_immediate")
+        if self._editor_hover_card is not None:
+            self._editor_hover_card.hide()
+        if self._editor_hover_poll.isActive():
+            self._editor_hover_poll.stop()
 
     def _hide_editor_hover_if_outside(self) -> None:
         """
@@ -512,14 +550,21 @@ class WorldDetailWidget(QWidget):
         print("[WorldDetailWidget] _save_current_if_dirty; wid=", wid, "dirty=", self._dirty)
 
         if not wid or not self._dirty:
+            print("[WorldDetailWidget] _save_current_if_dirty: not dirty - nothing to do")
             return
 
-        if isinstance(self.edit, RichTextEditor):
-            print("[WorldDetailWidget] delegating save to RichTextEditor.request_save()")
-            self.edit.request_save()
+        print("[WorldDetailWidget] auto-saving dirty world item on navigation")
+
+        # Prefer the RichTextEditor path when available (via the pane)
+        inner_editor = self.edit.editor
+        if isinstance(inner_editor, RichTextEditor):
+            # Use the real editor's save mechanism (JS → bridge → DB)
+            print("[WorldDetailWidget] _save_current_if_dirty: using RichTextEditor")
+            inner_editor.request_save()
             return
 
         # --- Legacy plain-text path (fallback only) ---
+        print("[WorldDetailWidget] _save_current_if_dirty: using plain text editor")
         md = self.edit.toPlainText() or ""
 
         # 1) persist MD
@@ -659,12 +704,14 @@ class WorldDetailWidget(QWidget):
             doc_config = {
                 "docType": "world_item",
                 "docId": str(self._current_world_item_id),
-                "versionId": 1,   # we can introduce true versioning later
+                "versionId": 1,   # true versioning later
                 "markdown": md,
                 "worldIndex": world_index,
                 "prefs": prefs,
             }
             e.load_document(doc_config)
+        else:
+            print("[WorldDetailWidget] _refresh_render_only: skipping edit pane refresh")
 
         self._dirty = False
 

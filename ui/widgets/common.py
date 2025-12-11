@@ -179,98 +179,6 @@ class StatusLine(QLabel):
         super().closeEvent(ev)
 
 
-
-class EditStateController(QObject):
-    stateChanged = Signal(str)   # "Viewing" | "Editing"
-
-    def __init__(self, initial="Viewing", parent=None):
-        super().__init__(parent)
-        self._state = initial
-
-    @property
-    def state(self):
-        return self._state
-
-    def set_viewing(self):
-        self._set("Viewing")
-
-    def set_editing(self):
-        self._set("Editing")
-
-    def _set(self, val):
-        if self._state != val:
-            self._state = val
-            self.stateChanged.emit(val)
-
-
-class RichEditorToolbar(QFrame):
-    """
-    Small toolbar for the embedded rich text editor.
-
-    Currently exposes two preferences:
-      - showWikilinks: "full" or "ctrlReveal"
-      - linkFollowMode: "ctrlClick" or "click"
-
-    Emits prefsChanged(dict) whenever the user changes a control.
-    """
-    prefsChanged = Signal(dict)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFrameShape(QFrame.NoFrame)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-
-        lbl_links = QLabel("Links:", self)
-        self.cmbLinkMode = QComboBox(self)
-        self.cmbLinkMode.addItem("Show links", "full")
-        self.cmbLinkMode.addItem("Reveal on Ctrl", "ctrlReveal")
-
-        lbl_follow = QLabel("Follow:", self)
-        self.cmbFollowMode = QComboBox(self)
-        self.cmbFollowMode.addItem("Ctrl+Click", "ctrlClick")
-        self.cmbFollowMode.addItem("Click", "click")
-
-        layout.addWidget(lbl_links)
-        layout.addWidget(self.cmbLinkMode)
-        layout.addSpacing(12)
-        layout.addWidget(lbl_follow)
-        layout.addWidget(self.cmbFollowMode)
-        layout.addStretch(1)
-
-        self.cmbLinkMode.currentIndexChanged.connect(self._emit_prefs)
-        self.cmbFollowMode.currentIndexChanged.connect(self._emit_prefs)
-
-    def prefs(self) -> dict:
-        mode = self.cmbLinkMode.currentData()
-        follow = self.cmbFollowMode.currentData()
-        return {
-            "autoPairs": True,
-            "showWikilinks": mode or "full",
-            "highlightLinksWhileCtrl": True,
-            "linkFollowMode": follow or "ctrlClick",
-        }
-
-    def set_prefs(self, prefs: dict | None) -> None:
-        prefs = prefs or {}
-        mode = prefs.get("showWikilinks", "full")
-        follow = prefs.get("linkFollowMode", "ctrlClick")
-
-        idx = self.cmbLinkMode.findData(mode)
-        if idx != -1:
-            self.cmbLinkMode.setCurrentIndex(idx)
-
-        idx = self.cmbFollowMode.findData(follow)
-        if idx != -1:
-            self.cmbFollowMode.setCurrentIndex(idx)
-
-    def _emit_prefs(self) -> None:
-        self.prefsChanged.emit(self.prefs())
-
-
 class AliasPicker(QDialog):
     def __init__(self, conn, project_id, parent=None):
         super().__init__(parent)
@@ -383,25 +291,6 @@ class _HoverCardPopup(QFrame):
     def leaveEvent(self, e):
         self._inside = False
         super().leaveEvent(e)
-
-def _anchor_left_global(vp: QWidget, tb: QTextBrowser,
-                        href: str, pos_vp: QPoint) -> QPoint:
-    """
-    pos_vp is viewport-relative. We scan left on the same y to find the first pixel
-    that still returns this href, then return that point in GLOBAL coords.
-    """
-    y = pos_vp.y()
-    x = pos_vp.x()
-    # scan left (cap at 300 px to keep it cheap)
-    min_x = max(0, x - 300)
-    left_x = x
-    while left_x > min_x:
-        probe = QPoint(left_x - 1, y)
-        if tb.anchorAt(probe) != href:
-            break
-        left_x -= 1
-    # map the found viewport point to global
-    return vp.mapToGlobal(QPoint(left_x, y))
 
 # helper (place above the class)
 def _scan_anchor_bounds_global(vp: QWidget, tb: QTextBrowser,

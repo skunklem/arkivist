@@ -79,8 +79,8 @@ TO-Dos
   * chapter page will want a distraction-free mode where it's just the chapter and maybe links switch to only diplay with ctrl held.
 
 ### Center Tabs container
-* each tab will host a DocPage
-* allow multiple tabs to be open in their dirty state until user explicitely saves
+* each tab will host a DocPage (or similar)
+* allow multiple tabs to be open in their dirty state until user explicitly saves
 * chapters, world item details, and notes call all appear in a tab
 * world details: allow them to open in side panel, still?
   * if so, should each tab have its own right panel with its own item history or should the right panel be its own thing
