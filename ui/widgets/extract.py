@@ -346,6 +346,10 @@ def spacy_candidates_strict(text: str, known_phrases: set[str]) -> list[dict]:
         has_lower_det = any(_is_lower_det(i["surface"]) for i in items)
         detless_items = [i for i in items if i["surface"].strip().lower() == tail]
         rep_src = detless_items if (has_lower_det or detless_items) else items
+        if not rep_src:
+            # Defensive: if we somehow ended up with no candidates in this group,
+            # skip it rather than crashing.
+            continue
         rep = min(rep_src, key=lambda x: x["start_off"])
 
         surface = text[rep["start_off"]:rep["end_off"]]

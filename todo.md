@@ -20,6 +20,7 @@ TO-Dos
 * Figure out logging of user actions (in app and in Word for AFK detection)
 * Edit in word should bring up word in front of app, not behind
 * stop word sync closes the word doc but leaves Word open if there weren't already any other documents open. It should close the whole application (but not any other documents). If other docs are open, it works fine, currently, leaving them up.
+* swap word_integration to use partially-stripped HTML to docx
 * When creating blank chapter, start in edit mode with "New Chapter" title highlighted and ready to edit (or as the recommended text)
 * mass rename capabilities (of something like a character name) across all chapters/world items/outlines/to-dos/notes. Add old name to aliases with marking indicating that it's not used anymore. Defunct aliases will bring up a warning if found in text prior to export. NOTE: probably need to call pane.refresh_from_model() after changes implement
 * How to deal with interludes or Part/Act numbers that should sit between chapters but not imopact the chapter numbering
@@ -151,23 +152,20 @@ TO-Dos
   * graphics (x-axis can be time, if applicable, or chapter)
 * Allow for custom calendar systems
 
-# Advanced editor to use for all large text editing
-## Goals
+### Advanced editor (rich text editor) to use for all large text editing
+* make sure linkify and the JS-produced links use the same syntax.
+* 
+* check current zoom level and use it when loading
 * swap to a web editor for full rich editing + spellcheck + (future) autocomplete
 * Add in right-click for synonym replacement
-* tight click for linking text to existing (or new) items
-* Wikilinks render while editing
-  * For performance issued, re-refresh could be constrained by time, small chunks, or only on typing pauses
-* No more need for view mode
-* Will this help ensure center/right align and other alignment details persist through markdown conversion?
-  * How might that impact the current content_md and content_render fields used in the db?
-* preserve comments (especially if users export as docx, get comments from friends, reimport) and allow merging in external edits
-* Simple and complex versions depending on features needed (chapters need more formatting than simpler multi-line text containers)
-## Considerations
-* What areas of the app will this improve and what will have significant changes?
-* What other features will be important to add that will be useful for any current or anticipated app features?
-* What's the best option based on the needs of the app?
-* Any likely problems from adding this in?
+* right click for linking text to existing (or new) items
+* Quotation marks and apostrophes should auto-adjust to the expected type (open/close) based on nearby text/whitespace
+  * They can revert to simple version when converted form html to plain text so searching isn't picky
+  * Make sure this doesn't mess up linking entities containing apostrophes like "Joe's Place"
+* Things that open/close like "", (), {}, [] should have their end parter added automatically when opened
+  * This is definitely useful for highlighting a selection and hitting the open-symbol to get the whole section wrapped in parentheses or quotes.
+  * could be annoying while straight typing, but might also be nice as an optional setting.
+
 
 ### Theme/aesthetics complaints
 * Hovercard needs to be smaller (shrink to content?)

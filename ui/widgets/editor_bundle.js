@@ -101,6 +101,98 @@
     return text;
   }
 
+  function isAliasTextValidForSpan(spanEl, text) {
+    if (!_worldAliasIndex || _worldAliasIndex.length === 0) {
+      // No alias index means we can't validate; leave links alone.
+      console.warn("[RichEditor] No alias index available.");
+      return true;
+    }
+
+    const kindAttr = spanEl.getAttribute("data-kind") || "world";
+    const widAttr = spanEl.getAttribute("data-world-item-id") || "";
+    const aliasIdAttr = spanEl.getAttribute("data-alias-id") || "";
+    const candidateIdAttr = spanEl.getAttribute("data-candidate-id") || "";
+
+    const normalizedText = (text || "").trim();
+    if (!normalizedText) {
+      console.warn("[RichEditor] Empty text in wikilink span");
+      return false;
+    }
+
+    console.debug("[RichEditor] validate span text", 
+      kindAttr,
+      widAttr,
+      aliasIdAttr,
+      candidateIdAttr,
+      normalizedText,
+    );
+
+    for (const entry of _worldAliasIndex) {
+      const entryWid = String(entry.worldItemId || "");
+      const entryAliasId =
+        entry.aliasId != null ? String(entry.aliasId) : "";
+      const entryCandId =
+        entry.candidateId != null ? String(entry.candidateId) : "";
+
+      // Check target id matches
+      if (kindAttr === "candidate") {
+        if (entryCandId !== candidateIdAttr) continue;
+      } else {
+        if (entryWid !== widAttr) continue;
+        if (aliasIdAttr && entryAliasId !== aliasIdAttr) continue;
+      }
+
+      const aliasText = entry.alias || "";
+      if (!aliasText) continue;
+
+      console.debug("[RichEditor] comparing alias vs span text", 
+        aliasText,
+        normalizedText,
+        "caseMode:", entry.caseMode,
+      );
+
+      if (entry.caseMode === "case-sensitive") {
+        if (aliasText === normalizedText) {
+          console.debug("[RichEditor] alias match (case-sensitive)");
+          return true;
+        }
+      } else {
+        if (aliasText.toLowerCase() === normalizedText.toLowerCase()) {
+          console.debug("[RichEditor] alias match (case-insensitive)");
+          return true;
+        }
+      }
+    }
+
+    console.debug(
+      "[RichEditor] no matching alias for span text; will drop link"
+    );
+    return false;
+  }
+
+  function cleanupStaleWikilinks() {
+    if (!editorDiv || !_worldAliasIndex || _worldAliasIndex.length === 0) {
+      return;
+    }
+
+    const spans = editorDiv.querySelectorAll("span.wikilink");
+    spans.forEach((spanEl) => {
+      const text = spanEl.textContent || "";
+      if (!isAliasTextValidForSpan(spanEl, text)) {
+        const parent = spanEl.parentNode;
+        if (!parent) return;
+
+        const children = Array.from(spanEl.childNodes);
+        let refNode = spanEl;
+        for (const child of children) {
+          parent.insertBefore(child, refNode);
+          refNode = child;
+        }
+        parent.removeChild(spanEl);
+      }
+    });
+  }
+
   function updateWorldIndex(payload) {
     if (!payload || !Array.isArray(payload.worldIndex)) {
       console.warn("[RichEditor] updateWorldIndex called with bad payload", payload);
@@ -370,7 +462,145 @@
     syncModifierFromEvent(ev);
   }
 
+  function dropLinkIfTypingInside() {
+    if (!editorDiv) return;
+
+    const sel = window.getSelection && window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+
+    const range = sel.getRangeAt(0);
+    const caretNode = range.startContainer;
+    const caretOffset = range.startOffset;
+    if (!caretNode) return;
+
+    // Walk up from the caret to see if we are inside a wikilink span
+    let el = (caretNode.nodeType === Node.ELEMENT_NODE)
+      ? caretNode
+      : caretNode.parentNode;
+
+    let linkEl = null;
+    while (el && el !== editorDiv) {
+      if (
+        el.nodeType === Node.ELEMENT_NODE &&
+        el.tagName === "SPAN" &&
+        el.classList.contains("wikilink")
+      ) {
+        linkEl = el;
+        break;
+      }
+      el = el.parentNode;
+    }
+
+    if (!linkEl) {
+      return; // not inside a wikilink
+    }
+
+    // If we're editing at the edges of the link text, try to keep the
+    // alias core linked and move newly-typed text outside the span.
+    if (
+      linkEl.childNodes.length === 1 &&
+      linkEl.firstChild.nodeType === Node.TEXT_NODE &&
+      caretNode === linkEl.firstChild
+    ) {
+      const text = linkEl.firstChild.textContent || "";
+      const len = text.length;
+
+      if (caretOffset <= 0 || caretOffset >= len) {
+        const handled = maybeSplitEdgeTypingOutOfLink(
+          linkEl,
+          caretNode,
+          caretOffset
+        );
+        if (handled) {
+          // We successfully split prefix/suffix out of the span and
+          // restored the caret; nothing else to do.
+          return;
+        }
+        // If we couldn't split (no alias entry, etc.), fall through
+        // to the generic "unwrap the whole link" behavior below.
+      }
+    }
+
+    const parent = linkEl.parentNode;
+    if (!parent) return;
+
+    const children = Array.from(linkEl.childNodes);
+
+    // Unwrap the contents of the span into its parent
+    let refNode = linkEl;
+    for (const child of children) {
+      parent.insertBefore(child, refNode);
+      refNode = child;
+    }
+    parent.removeChild(linkEl);
+
+    const sel2 = window.getSelection && window.getSelection();
+    if (!sel2) return;
+
+    const newRange = document.createRange();
+
+    let focusNode = caretNode;
+    let focusOffset = caretOffset;
+
+    // If the caret was on the span element itself, move into its first child
+    if (focusNode === linkEl && children.length > 0) {
+      const first = children[0];
+      if (first.nodeType === Node.TEXT_NODE) {
+        focusNode = first;
+        focusOffset = 0;
+      } else if (first.firstChild && first.firstChild.nodeType === Node.TEXT_NODE) {
+        focusNode = first.firstChild;
+        focusOffset = 0;
+      }
+    }
+
+    // If the original caret node is no longer attached or not a text node,
+    // fall back to "end of the unwrapped content" behavior.
+    if (!editorDiv.contains(focusNode) || focusNode.nodeType !== Node.TEXT_NODE) {
+      if (children.length > 0) {
+        const last = children[children.length - 1];
+        if (last.nodeType === Node.TEXT_NODE) {
+          focusNode = last;
+          focusOffset = (last.textContent || "").length;
+        } else if (last.childNodes.length > 0) {
+          const innerLast = last.childNodes[last.childNodes.length - 1];
+          if (innerLast.nodeType === Node.TEXT_NODE) {
+            focusNode = innerLast;
+            focusOffset = (innerLast.textContent || "").length;
+          } else {
+            focusNode = last;
+            focusOffset = last.childNodes.length;
+          }
+        } else {
+          focusNode = last;
+          focusOffset = 0;
+        }
+      } else {
+        // Span had no children; put caret at its former position in the parent
+        focusNode = parent;
+        let idx = Array.prototype.indexOf.call(parent.childNodes, refNode);
+        if (idx < 0) {
+          idx = parent.childNodes.length;
+        }
+        focusOffset = idx;
+      }
+    } else {
+      // Clamp offset to the new text length
+      const len = focusNode.textContent ? focusNode.textContent.length : 0;
+      if (focusOffset > len) {
+        focusOffset = len;
+      }
+    }
+
+    newRange.setStart(focusNode, focusOffset);
+    newRange.collapse(true);
+    sel2.removeAllRanges();
+    sel2.addRange(newRange);
+  }
+
   function handleInput(_ev) {
+    // If the user is typing inside a wikilink, drop the link wrapper
+    dropLinkIfTypingInside();
     notifyDocChangedDebounced(true);
   }
 
@@ -592,7 +822,22 @@
         _docConfig.candidateIndex || []
       );
 
-      const rawHtml = naiveMarkdownToHtml(_docConfig.markdown || "");
+      // Prefer a stored HTML snapshot when provided (e.g. content_render for chapters).
+      // Fallback to markdown → HTML conversion otherwise.
+      let rawHtml;
+      if (
+        _docConfig.html &&
+        typeof _docConfig.html === "string" &&
+        _docConfig.html.trim() !== ""
+      ) {
+        rawHtml = _docConfig.html;
+        // Keep markdown in sync with the HTML snapshot so host code that relies
+        // on markdown (e.g. quick-parse) still sees the latest text.
+        _docConfig.markdown = htmlToMarkdown(rawHtml);
+      } else {
+        rawHtml = naiveMarkdownToHtml(_docConfig.markdown || "");
+      }
+
       console.debug("[RichEditor] Converted HTML:\n", rawHtml);
       const html = autoLinkTextWithAliases(rawHtml, _worldAliasIndex);
 
@@ -617,6 +862,11 @@
 
     requestSaveFromHost: function () {
       if (!editorDiv) return;
+
+      // Make sure any links whose text no longer matches a known alias
+      // are unwrapped before we snapshot HTML/markdown.
+      cleanupStaleWikilinks();
+
       const html = editorDiv.innerHTML;
       const markdown = htmlToMarkdown(html);
 

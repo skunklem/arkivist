@@ -168,6 +168,13 @@ class Database:
             return row["text"] if row else None
         else:
             return self.chapter_content_by_version(version_id)
+        
+    def chapter_content_render(self, chapter_id: int, version_id: int | None = None) -> str | None:
+        if version_id is None:
+            row = self.chapter_active_version_row(chapter_id)
+            return row["content_render"] if row else None
+        else:
+            return self.chapter_content_render_by_version(version_id)
 
     def chapter_project_id(self, chapter_id: int) -> Optional[int]:
         c = self.conn.cursor()
@@ -180,6 +187,12 @@ class Database:
         c.execute("SELECT text FROM chapter_versions WHERE id=?", (version_id,))
         row = c.fetchone()
         return row["text"] if row else None
+
+    def chapter_content_render_by_version(self, version_id: int) -> str | None:
+        c = self.conn.cursor()
+        c.execute("SELECT content_render FROM chapter_versions WHERE id=?", (version_id,))
+        row = c.fetchone()
+        return row["content_render"] if row else None
 
     def chapter_version_hash(self, version_id: int) -> str | None:
         c = self.conn.cursor()

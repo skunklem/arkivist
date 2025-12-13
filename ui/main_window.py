@@ -33,6 +33,7 @@ from ui.widgets.character_editor import CharacterEditorDialog
 from ui.widgets.character_dialog import CharacterDialog
 from ui.widgets.chapter_todos import ChapterTodosWidget
 from ui.widgets.chapters_tree import ChaptersTree
+from ui.widgets.doc_page import DocPage
 from ui.widgets.notes_tree import NotesTree
 from ui.widgets.notes_notebook import NotesNotebook
 from ui.widgets.helpers import DropPane, PlainNoTab, chapter_display_label, normalize_possessive, parse_internal_url, scrub_markdown_for_ner
@@ -653,10 +654,10 @@ class StoryArkivist(QMainWindow):
         # 3) Linkify in Markdown space, then render
         html_content = self._render_html_from_md(md, known_only=False, scope=("chapter", chap_id, ver_id))
 
-        # 4) Persist to chapter_versions.content_render (cache)
-        print("Caching rendered HTML for chapter", chap_id, "version", ver_id)
-        print(html_content[:100])
-        self.db.chapter_version_render_update(ver_id, html_content)
+        # 4) Do not persist html here; DocPage handles canonical content_render.
+        # print("Caching rendered HTML for chapter", chap_id, "version", ver_id)
+        # print(html_content[:100])
+        # self.db.chapter_version_render_update(ver_id, html_content)
 
         # 5) Show it
         self.centerView.document().setDefaultStyleSheet(self._doc_css())
@@ -1204,6 +1205,7 @@ class StoryArkivist(QMainWindow):
 
     def load_world_item(self, world_item_id: int, edit_mode: bool = False, item_type: str = None):
         """Show a world item in the right panel and focus it in the tree."""
+        print("Attempting to load world item", world_item_id)
         if not item_type:
             item_type = self.db.world_item_type(world_item_id)
         if item_type == "character" and edit_mode:
@@ -2086,6 +2088,54 @@ class StoryArkivist(QMainWindow):
         self.tabSearch.itemDoubleClicked.connect(self.open_search_result)
         self.bottomTabs.addTab(self.tabSearch,  "Search")
 
+    def _init_experimental_editor(self) -> None:
+        """
+        Bottom 'Experimental Editor' tab.
+
+        For now, this hosts a single chapter DocPage instance.
+        """
+        container = self.tabExperimentalEditor
+
+        # Ensure the tab has a simple layout we can add/remove pages from.
+        layout = container.layout()
+        if layout is None:
+            layout = QVBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+
+        self._experimental_doc_page: DocPage | None = None
+
+        # If we already have a current chapter at startup, show it there.
+        chap_id = getattr(self, "_current_chapter_id", None)
+        if chap_id is not None:
+            self._set_experimental_doc_page(chap_id)
+
+    def _set_experimental_doc_page(self, chapter_id: int) -> None:
+        """
+        Replace the Experimental Editor content with a DocPage for the given chapter.
+        """
+        container = self.tabExperimentalEditor
+        layout = container.layout()
+        if layout is None:
+            layout = QVBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+
+        # Remove any existing page
+        if getattr(self, "_experimental_doc_page", None) is not None:
+            layout.removeWidget(self._experimental_doc_page)
+            self._experimental_doc_page.deleteLater()
+            self._experimental_doc_page = None
+
+        page = DocPage(
+            app=self,
+            doc_type="chapter",
+            doc_id=int(chapter_id),
+            parent=container,
+        )
+        layout.addWidget(page)
+        self._experimental_doc_page = page
+
     def _add_splitters(self):
         # Splitters — final layout: Left | (Center+Right over Bottom)
         self.centerRightSplit = QSplitter(Qt.Horizontal)
@@ -2310,6 +2360,11 @@ class StoryArkivist(QMainWindow):
                 self.worldDetail._save_current_if_dirty()
             except Exception as e:
                 print("[StoryArkivist] Error saving world detail on Ctrl+S:", e)
+
+        # Experimental DocPage tab (for now, treat it as a live editor)
+        if hasattr(self, "_experimental_doc_page") and self._experimental_doc_page is not None:
+            if self.tabExperimentalEditor.isVisible():
+                self._experimental_doc_page.request_save_all_editors()
 
         # TODO (later): center doc pages, chapter tabs, etc.
         # if hasattr(self, "docTabs") and self.docTabs.isVisible():
@@ -2830,7 +2885,18 @@ class StoryArkivist(QMainWindow):
         if not data or data[0] != "chapter": return
         chap_id = data[1]
         self.save_current_if_dirty()
+
+        if hasattr(self, "_current_chapter_id") and self._current_chapter_id == chap_id:
+            print("[StoryArkivist] Chapter clicked is already active; ignoring reload")
+            return
+
+        # Load chapter in center editor
         self.load_chapter(chap_id)
+
+        # Also mirror this chapter into the Experimental Editor DocPage
+        if hasattr(self, "_set_experimental_doc_page"):
+            self._set_experimental_doc_page(chap_id)
+
 
     def on_world_clicked(self, item, col):
         data = item.data(0, Qt.UserRole)
