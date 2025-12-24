@@ -232,6 +232,7 @@ html, body {{
   margin: 0;
   padding: 0;
   height: 100%;
+  overflow: hidden;
   box-sizing: border-box;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 14px;
@@ -242,11 +243,29 @@ html, body {{
   box-sizing: border-box;
 }}
 #editorRoot {{
-  min-height: 120px;
+  height: 100%;
+  width: 100%;
+  box-sizing: border-box;
   padding: 8px;
   outline: none;
   white-space: pre-wrap;
   word-break: break-word;
+  overflow-y: auto;
+}}
+
+/* Keep Shift+Enter vs Enter visually distinct:
+   - Shift+Enter stays within the same <p> (just <br>)
+   - Enter creates a new <p>/<div> and gets spacing */
+#editorRoot > p,
+#editorRoot > div {{
+  margin-top: 0;
+  margin-bottom: 0.75em; /* tweak to taste */
+}}
+
+/* Avoid extra whitespace at the very end */
+#editorRoot > p:last-child,
+#editorRoot > div:last-child {{
+  margin-bottom: 0;
 }}
 
 /* Base: distraction-friendly, links visually blend into text */
@@ -262,13 +281,13 @@ html, body {{
 #editorRoot.links-full .wikilink {{
   color: #3b82f6;            /* tweak to theme */
   text-decoration: underline;
-  cursor: pointer;
+  cursor: text;
 }}
 #editorRoot.links-full .wikilink-candidate,
 #editorRoot.links-minimal.ctrl-links-active .wikilink-candidate {{
   color: #10b981;             /* e.g., green for candidates */
   text-decoration: underline;
-  cursor: pointer;
+  cursor: text;
   border-bottom: 1px dashed currentColor;
 }}
 
@@ -277,7 +296,7 @@ html, body {{
 #editorRoot.links-minimal.ctrl-links-active .wikilink {{
   color: #3b82f6;
   text-decoration: underline;
-  cursor: pointer;
+  cursor: text;
 }}
 
 /* Optional: a bit of extra emphasis while Ctrl is down */
@@ -287,6 +306,28 @@ html, body {{
 
 #editorRoot .wikilink:hover {{
   text-decoration-thickness: 2px;
+}}
+
+/* Show pointer cursor when follow mode is click-to-follow */
+#editorRoot.follow-click.links-full a,
+#editorRoot.follow-click.links-full .wikilink,
+#editorRoot.follow-click.links-full .wikilink-candidate,
+#editorRoot.follow-click.links-minimal.ctrl-links-active a,
+#editorRoot.follow-click.links-minimal.ctrl-links-active .wikilink,
+#editorRoot.follow-click.links-minimal.ctrl-links-active .wikilink-candidate {{
+  cursor: pointer;
+}}
+
+/* Ctrl/Cmd down: links are "actionable", show pointer on hover */
+#editorRoot.modifier-down a,
+#editorRoot.modifier-down .wikilink,
+#editorRoot.modifier-down .wikilink-candidate {{
+  cursor: pointer;
+}}
+
+/* Find highlight (if Custom Highlight API is supported) */
+::highlight(sa-find-current) {{
+  background: rgba(250, 204, 21, 0.35);
 }}
 
 </style>

@@ -10,7 +10,7 @@ from PySide6.QtGui import (
     QShortcut, QDesktopServices, QCursor, QPalette, QTextCursor
 )
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
+    QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout, QStackedWidget,
     QTreeWidget, QTreeWidgetItem, QPlainTextEdit, QTextBrowser, QMessageBox,
     QLineEdit, QLabel, QPushButton, QTabWidget, QFileDialog, QToolBar,
     QDialog, QSizePolicy, QInputDialog, QMenu, QToolButton, QToolTip,
@@ -35,6 +35,7 @@ from ui.widgets.chapter_todos import ChapterTodosWidget
 from ui.widgets.chapters_tree import ChaptersTree
 from ui.widgets.doc_page import DocPage
 from ui.widgets.notes_tree import NotesTree
+from ui.widgets.doc_tabs import SplitTabsContainer
 from ui.widgets.notes_notebook import NotesNotebook
 from ui.widgets.helpers import DropPane, PlainNoTab, chapter_display_label, normalize_possessive, parse_internal_url, scrub_markdown_for_ner
 from ui.widgets.common import StatusLine, _WikiHoverFilter, AliasPicker
@@ -1331,9 +1332,14 @@ class StoryArkivist(QMainWindow):
     def _rename_chapter(self, chap_id: int):
         title = self.db.chapter(chap_id)
         new, ok = QInputDialog.getText(self, "Rename Chapter", "New title:", text=title or "")
-        if not ok or not new.strip(): return
-        if title == new.strip(): return
-        self.db.chapter_update(chap_id, title=new.strip())
+        new_title = new.strip()
+        if not ok or not new_title: return
+        if title == new_title: return
+        self.db.chapter_update(chap_id, title=new_title)
+
+        if hasattr(self, "centerTabs") and self.centerTabs is not None:
+            self.centerTabs.update_doc_title("chapter", chap_id, new_title)
+
         self.populate_chapters_tree()
         self.focus_chapter_in_tree(chap_id)
         self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
@@ -1353,7 +1359,6 @@ class StoryArkivist(QMainWindow):
         self.populate_chapters_tree()
         # clear editor if we just hid the active chapter
         if getattr(self, "_current_chapter_id", None) == chap_id:
-            self._current_chapter_id = None
             self._current_chapter_id = None
             self.titleEdit.setText("")
             self.centerEdit.setPlainText("")
@@ -1392,6 +1397,9 @@ class StoryArkivist(QMainWindow):
                 order_hint, clean = parse_chapter_filename(Path(p).name, split_mode=None)
                 md = read_file_as_markdown(p)
                 new_id = self.db.chapter_insert(pid, bid, insert_at, clean, md)
+                ver_id = self.db.get_active_version_id(new_id)
+                if ver_id:
+                    self.db.chapter_version_render_update(ver_id, md_to_html(md))
                 self.db.conn.commit()
                 self.recompute_chapter_references(new_id, md)
                 self.populate_chapters_tree()
@@ -1453,6 +1461,9 @@ class StoryArkivist(QMainWindow):
             for i, (_, _, title, p) in enumerate(parsed):
                 md = read_file_as_markdown(p)
                 new_id = self.db.chapter_insert(pid, bid, base_index + i, title, md)
+                ver_id = self.db.get_active_version_id(new_id)
+                if ver_id:
+                    self.db.chapter_version_render_update(ver_id, md_to_html(md))
                 new_ids.append(new_id)
                 self.recompute_chapter_references(new_id, md)
 
@@ -1763,6 +1774,10 @@ class StoryArkivist(QMainWindow):
 
     def _on_outline_rename_requested(self, chap_id: int, new_title: str):
         self.db.chapter_update(chap_id, title=new_title)
+
+        if hasattr(self, "centerTabs") and self.centerTabs is not None:
+            self.centerTabs.update_doc_title("chapter", chap_id, new_title)
+
         meta = self.db.chapter_meta(chap_id)
         self.db.conn.commit()
         self._refresh_outline_and_tree(meta["book_id"], focus_cid=chap_id)
@@ -2021,12 +2036,29 @@ class StoryArkivist(QMainWindow):
         self.centerPane = DropPane(self)
         cv = QVBoxLayout(self.centerPane)
         cv.setContentsMargins(0,0,0,0)
-        cv.addWidget(topBar)
-        cv.addWidget(self.centerView)   # default: start in View mode
-        cv.addWidget(self.centerEdit)
 
-        # start in view mode
-        self._center_set_mode(view_mode=True)
+        # NEW: tabs container
+        self.centerTabs = SplitTabsContainer(self, parent=self.centerPane)
+        self.centerTabs.currentChanged.connect(self._on_center_active_doc_changed)
+
+        # Legacy editor container (kept for now to avoid breaking old code paths)
+        legacy = QWidget(self.centerPane)
+        legacyLay = QVBoxLayout(legacy)
+        legacyLay.setContentsMargins(0, 0, 0, 0)
+        legacyLay.setSpacing(0)
+        legacyLay.addWidget(self.centerView)
+        legacyLay.addWidget(self.centerEdit)
+
+        self.centerStack = QStackedWidget(self.centerPane)
+        self.centerStack.addWidget(self.centerTabs)
+        self.centerStack.addWidget(legacy)
+        self.centerStack.setCurrentWidget(self.centerTabs)
+
+        cv.addWidget(topBar)
+        cv.addWidget(self.centerStack, 1)
+
+        # The view/edit toggle isn't meaningful for rich editor tabs
+        self.centerModeBtn.hide()
 
     def _add_right_panel(self):
         # Right detail panel
@@ -2349,26 +2381,25 @@ class StoryArkivist(QMainWindow):
         """
         Handle Ctrl+S at the window level.
 
-        For now, delegate to the world-detail panel if it's active.
-        Later, this will also save the current DocPage (chapter, note, etc.).
+        MVP: save the active doc tab in the center SplitTabsContainer if present.
+        Otherwise, fall back to the experimental editor and world detail.
         """
         print("[StoryArkivist] Global Ctrl+S pressed")
 
-        # World-detail panel
-        if hasattr(self, "worldDetail") and self.worldDetail.isVisible():
-            try:
-                self.worldDetail._save_current_if_dirty()
-            except Exception as e:
-                print("[StoryArkivist] Error saving world detail on Ctrl+S:", e)
+        # 1) Center tabs: ACTIVE tab only
+        if hasattr(self, "centerTabs") and self.centerTabs is not None and self.centerTabs.isVisible():
+            if self.centerTabs.save_current_doc():
+                return
 
-        # Experimental DocPage tab (for now, treat it as a live editor)
+        # 2) Experimental DocPage tab (temporary)
         if hasattr(self, "_experimental_doc_page") and self._experimental_doc_page is not None:
             if self.tabExperimentalEditor.isVisible():
                 self._experimental_doc_page.request_save_all_editors()
+                return
 
-        # TODO (later): center doc pages, chapter tabs, etc.
-        # if hasattr(self, "docTabs") and self.docTabs.isVisible():
-        #     self.docTabs.save_current_doc()
+        # 3) World-detail panel (only if visible)
+        if hasattr(self, "worldDetail") and self.worldDetail is not None and self.worldDetail.isVisible():
+            self.worldDetail._save_current_if_dirty()
 
     def insert_new_world_item_inline(self, category_id: int, category_item: QTreeWidgetItem,
                                     mode: str = "end", ref_item: QTreeWidgetItem | None = None):
@@ -2646,6 +2677,23 @@ class StoryArkivist(QMainWindow):
         t.expandAll()
 
     def populate_chapters_tree(self):
+        # --- Preserve expand/collapse state + current selection
+        was_empty = (self.chaptersTree.topLevelItemCount() == 0)
+
+        expanded_books = set()
+        for i in range(self.chaptersTree.topLevelItemCount()):
+            b = self.chaptersTree.topLevelItem(i)
+            d = b.data(0, Qt.UserRole)
+            if d and d[0] == "book" and b.isExpanded():
+                expanded_books.add(int(d[1]))
+
+        cur_item = self.chaptersTree.currentItem()
+        cur_chap_id = None
+        if cur_item is not None:
+            cd = cur_item.data(0, Qt.UserRole)
+            if cd and cd[0] == "chapter":
+                cur_chap_id = int(cd[1])
+
         self.chaptersTree.clear()
         pid = self._current_project_id
 
@@ -2657,6 +2705,10 @@ class StoryArkivist(QMainWindow):
             bitem.setFlags(bitem.flags() | Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDropEnabled)
             self.chaptersTree.addTopLevelItem(bitem)
 
+            # Restore expansion state for this book if it was expanded before
+            if bid in expanded_books:
+                bitem.setExpanded(True)
+
             # Add chapters under book
             for ch in self.db.chapter_list(pid, bid):
                 label = chapter_display_label(ch["position"], ch["title"])
@@ -2666,9 +2718,19 @@ class StoryArkivist(QMainWindow):
                 citem.setData(0, Qt.UserRole, ("chapter", int(ch["id"])))
                 citem.setFlags(flags)
                 bitem.addChild(citem)
-        self.chaptersTree.expandAll()
+
+        # Keep the old behavior on first build only
+        if was_empty and not expanded_books:
+            self.chaptersTree.expandAll()
 
         self._emit_chapter_order()
+
+        # Re-focus selection if we had one (or if a chapter is active)
+        active_id = getattr(self, "_current_chapter_id", None)
+        if active_id:
+            self.focus_chapter_in_tree(int(active_id))
+        elif cur_chap_id:
+            self.focus_chapter_in_tree(int(cur_chap_id))
 
     def _emit_chapter_order(self):
         rows = self.db.chapter_list(self._current_project_id, self._current_book_id)
@@ -2884,11 +2946,6 @@ class StoryArkivist(QMainWindow):
         data = item.data(0, Qt.UserRole)
         if not data or data[0] != "chapter": return
         chap_id = data[1]
-        self.save_current_if_dirty()
-
-        if hasattr(self, "_current_chapter_id") and self._current_chapter_id == chap_id:
-            print("[StoryArkivist] Chapter clicked is already active; ignoring reload")
-            return
 
         # Load chapter in center editor
         self.load_chapter(chap_id)
@@ -2942,6 +2999,21 @@ class StoryArkivist(QMainWindow):
 
     def load_chapter(self, chap_id: int):
         """Load a chapter into the center pane. Saves current edits first."""
+
+        if hasattr(self, "centerTabs") and self.centerTabs is not None:
+            self.centerTabs.open_doc(
+                doc_type="chapter",
+                doc_id=int(chap_id),
+                version_id=None,
+                prefer_existing=True,
+                show_header=False,  # avoid duplicate title row
+                show_status_line=True,
+                initial_prefs=None,
+            )
+            return
+
+        # legacy behavior below (unchanged for now)
+
         self._prepare_to_switch_chapter()
 
         self._current_chapter_id = chap_id
@@ -3007,6 +3079,35 @@ class StoryArkivist(QMainWindow):
         self._render_center_preview(version_id=self._view_version_id)  # None => active
         self._center_set_mode(view_mode=True)
         self._update_word_sync_ui()
+
+    def _on_center_active_doc_changed(self, key) -> None:
+        if not key:
+            return
+        if getattr(key, "doc_type", None) != "chapter":
+            return
+
+        self._current_chapter_id = int(key.doc_id)
+        # view version for now stays None (active) unless later wired
+        self._view_version_id = getattr(key, "version_id", None)
+
+        # Update top bar title
+        title = self.db.chapter(self._current_chapter_id) or ""
+        self.titleEdit.blockSignals(True)
+        self.titleEdit.setText(title)
+        self.titleEdit.blockSignals(False)
+
+        if key.doc_type == "chapter":
+            chap_id = int(key.doc_id)
+            self.focus_chapter_in_tree(chap_id)
+
+        # Update dependent panes
+        self._bind_bottom_tabs(self._current_chapter_id)
+        self.populate_refs_tree(self._current_chapter_id)
+        self._update_word_sync_ui()
+
+        # Populate header version combo (existing helper)
+        outline_row = self._resolve_outline_row(self._current_chapter_id)
+        self._populate_version_combo(outline_row, self._current_chapter_id)
 
     def _bind_bottom_tabs(self, chap_id: int):
         self.tabTodos.set_chapter(chap_id)
@@ -3094,6 +3195,8 @@ class StoryArkivist(QMainWindow):
         self.db.conn.commit()
         # update FTS row via trigger; refresh tree label
         if not old_title == title:
+            if hasattr(self, "centerTabs") and self.centerTabs is not None:
+                self.centerTabs.update_doc_title("chapter", self._current_chapter_id, title)
             self.populate_chapters_tree()
             self.outlineWorkspace.load_from_db(self.db, self._current_project_id, self._current_book_id)
 
@@ -3791,16 +3894,36 @@ class StoryArkivist(QMainWindow):
             self.worldDetail.show_item(oid)
 
     def focus_chapter_in_tree(self, chap_id: int):
-        # expand all books and select
-        self.chaptersTree.expandAll()
+        if not chap_id:
+            return
+
+        # If already focused, just ensure visible
+        cur = self.chaptersTree.currentItem()
+        if cur is not None:
+            dcur = cur.data(0, Qt.UserRole)
+            if dcur and dcur[0] == "chapter" and int(dcur[1]) == int(chap_id):
+                self.chaptersTree.scrollToItem(cur)
+                return
+
+        # Expand only the book containing the chapter, then select+scroll
         for i in range(self.chaptersTree.topLevelItemCount()):
-            b = self.chaptersTree.topLevelItem(i)
-            for j in range(b.childCount()):
-                c = b.child(j)
-                d = c.data(0, Qt.UserRole)
-                if d and d[0] == "chapter" and d[1] == chap_id:
-                    self.chaptersTree.setCurrentItem(c)
-                    self.chaptersTree.scrollToItem(c)
+            book = self.chaptersTree.topLevelItem(i)
+            bd = book.data(0, Qt.UserRole)
+            if not (bd and bd[0] == "book"):
+                continue
+
+            for j in range(book.childCount()):
+                ch = book.child(j)
+                cd = ch.data(0, Qt.UserRole)
+                if cd and cd[0] == "chapter" and int(cd[1]) == int(chap_id):
+                    # Ensure the containing book is expanded
+                    book.setExpanded(True)
+
+                    # Programmatic selection: block signals to be future-proof
+                    with QSignalBlocker(self.chaptersTree):
+                        self.chaptersTree.setCurrentItem(ch)
+
+                    self.chaptersTree.scrollToItem(ch)
                     return
 
     def focus_world_item_in_tree(self, world_item_id: int) -> bool:
@@ -3929,7 +4052,6 @@ class StoryArkivist(QMainWindow):
         self.populate_notes_tree()
         self.populate_refs_tree(None)
         # clear center/right panes
-        self._current_chapter_id = None
         self._current_chapter_id = None
         self.titleEdit.setText("")
         self.centerEdit.setPlainText("")

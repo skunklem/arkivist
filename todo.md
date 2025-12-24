@@ -2,6 +2,7 @@ TO-Dos
 ## To do
 
 ### Miscellaneous
+* undo stack should remember which step last save happened so it can remove the dirty designation if back at starting point.
 * separate world-item window
   * allow world items to be sorted by selectable categories (possibly different tabs for major categories).
   * Maybe user wants to sort people by organizations they're a part of (if member of multiple, name can appear under each supercategory). Maybe there's a high level category with characters, but if you look through locations it could have a subcategory with citizens that lets you find some of the same people there, too.
@@ -153,8 +154,8 @@ TO-Dos
 * Allow for custom calendar systems
 
 ### Advanced editor (rich text editor) to use for all large text editing
+* reloadWholeDocument (or elsewhere) needs to account for known quoted literature within chapter so that link isn't lost
 * make sure linkify and the JS-produced links use the same syntax.
-* 
 * check current zoom level and use it when loading
 * swap to a web editor for full rich editing + spellcheck + (future) autocomplete
 * Add in right-click for synonym replacement

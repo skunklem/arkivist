@@ -26,6 +26,886 @@
   let _linkModifierDown = false; // true when Ctrl/Cmd is held
 
   // ---------------------------------------------------------------------------
+  // Find UI (Ctrl+F) - MVP: next/prev within the current editor
+  // ---------------------------------------------------------------------------
+
+  let _findBar = null;
+  let _findInput = null;
+  let _findPrevBtn = null;
+  let _findNextBtn = null;
+  let _findCloseBtn = null;
+  let _findStatus = null;
+
+  let _findCacheDirty = true;
+  let _findTextNodes = null;
+  let _findCurrentRange = null;
+  let _findOverlay = null;
+
+  let _findMatches = [];                 // [{ nodeIdx, pos }]
+  let _findMatchIndexByKey = new Map();  // "nodeIdx:pos" -> matchIndex
+  let _findMatchesQuery = "";
+  let _findMatchesTextVersion = -1;
+  let _findCurrentMatchIndex = -1;
+
+  let _findTextVersion = 0;              // increment on any editor input affecting text
+
+  let _findOverlayAll = null;            // dim highlight layer
+  let _findOverlayCurrent = null;        // bright highlight layer
+
+  const FIND_ALL_HIGHLIGHT_CAP = 500;    // keep UI responsive for common words
+  let _findAllHighlightsCapped = false;
+
+  let _findAnchorRange = null;
+  let _findAnchorSeq = 0;
+  let _findMoveSeq = 0;
+
+  let _editorPadTopBasePx = null;
+  let _findClearancePx = 0;
+  let _editorPadBottomBasePx = null;
+  let _findBottomFillPx = 0;
+
+  function _getPaddingBottomPx(el) {
+    const cs = window.getComputedStyle(el);
+    const v = parseFloat(cs.paddingBottom || "0");
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  function _getPaddingTopPx(el) {
+    const cs = window.getComputedStyle(el);
+    const v = parseFloat(cs.paddingTop || "0");
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  function _calcFindClearancePx() {
+    if (!_findBar) return 0;
+    const r = _findBar.getBoundingClientRect();
+    const h = r && r.height ? r.height : 0;
+    // A little breathing room (or tighter if neg) so text isn’t tight to the bar
+    return Math.ceil(h + -5);
+  }
+
+  function _rectsIntersect(a, b) {
+    return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  }
+
+  function _isCurrentMatchCoveredByFindBar() {
+    if (!_findBar || _findBar.style.display === "none") return false;
+    if (!_findCurrentRange) return false;
+
+    const barRect = _findBar.getBoundingClientRect();
+    const rects = Array.from(_findCurrentRange.getClientRects());
+    for (const r of rects) {
+      if (_rectsIntersect(r, barRect)) return true;
+    }
+    return false;
+  }
+
+  function _applyFindClearance(enabled) {
+    if (!editorDiv) return false;
+
+    if (_editorPadTopBasePx == null) _editorPadTopBasePx = _getPaddingTopPx(editorDiv);
+    if (_editorPadBottomBasePx == null) _editorPadBottomBasePx = _getPaddingBottomPx(editorDiv);
+
+    const prevClear = _findClearancePx;
+    const prevFill = _findBottomFillPx;
+
+    const desired = enabled ? _calcFindClearancePx() : 0;
+    const delta = desired - prevClear;
+
+    _findClearancePx = desired;
+
+    // 1) Always apply top clearance when enabled
+    editorDiv.style.paddingTop = `${_editorPadTopBasePx + desired}px`;
+    editorDiv.style.scrollPaddingTop = `${desired}px`;
+
+    // 2) Ensure we can scroll "up into" the clearance even for short docs.
+    //    We do this by padding-bottom so maxScrollTop >= desired.
+    if (enabled) {
+      // reset to base bottom first (so our measurement isn't cumulative)
+      editorDiv.style.paddingBottom = `${_editorPadBottomBasePx}px`;
+
+    const max0 = Math.max(0, editorDiv.scrollHeight - editorDiv.clientHeight);
+
+    // Guarantee: at least ONE viewport of scroll + clearance.
+    // (So even short docs get a scrollbar while Find is open.)
+    const pagePx = Math.max(0, editorDiv.clientHeight);
+    const minMaxScroll = desired + pagePx;
+
+    const fill = Math.max(0, minMaxScroll - max0);
+
+      _findBottomFillPx = fill;
+      editorDiv.style.paddingBottom = `${_editorPadBottomBasePx + fill}px`;
+    } else {
+      _findBottomFillPx = 0;
+      editorDiv.style.paddingBottom = `${_editorPadBottomBasePx}px`;
+    }
+
+    // 3) Compensate scrollTop by delta to keep the visible content from "jumping"
+    //    when we change padding-top.
+    if (delta !== 0) {
+      const max = Math.max(0, editorDiv.scrollHeight - editorDiv.clientHeight);
+      editorDiv.scrollTop = Math.max(0, Math.min(editorDiv.scrollTop + delta, max));
+    }
+
+    return (delta !== 0) || (prevFill !== _findBottomFillPx);
+  }
+
+  function _captureFindAnchorFromSelection() {
+    if (!editorDiv) return;
+
+    const sel = window.getSelection && window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+
+    const r = sel.getRangeAt(0);
+    if (!r || !editorDiv.contains(r.startContainer)) return;
+
+    const c = r.cloneRange();
+    c.collapse(true);
+
+    _findAnchorRange = c;
+    _findAnchorSeq += 1;
+  }
+  
+  function _clearOverlay(ov) {
+    if (ov) ov.innerHTML = "";
+  }
+
+  function _paintRectsToOverlay(ov, rects, fillRgba, outlineRgba) {
+    if (!editorDiv || !ov) return;
+
+    const editorRect = editorDiv.getBoundingClientRect();
+
+    for (const r of rects) {
+      if (!r || (r.width === 0 && r.height === 0)) continue;
+
+      const box = document.createElement("div");
+      box.style.position = "absolute";
+      box.style.left = `${(r.left - editorRect.left) + editorDiv.scrollLeft}px`;
+      box.style.top = `${(r.top - editorRect.top) + editorDiv.scrollTop}px`;
+      box.style.width = `${r.width}px`;
+      box.style.height = `${r.height}px`;
+      box.style.borderRadius = "3px";
+      box.style.background = fillRgba;
+
+      if (outlineRgba) {
+        box.style.outline = `1px solid ${outlineRgba}`;
+        box.style.outlineOffset = "-1px";
+      }
+
+      ov.appendChild(box);
+    }
+  }
+
+  function _rangeForMatch(m) {
+    const node = _findTextNodes[m.nodeIdx];
+    const r = document.createRange();
+    r.setStart(node, m.pos);
+    r.setEnd(node, m.pos + _findMatchesQuery.length);
+    return r;
+  }
+
+  function _paintAllFindHighlights() {
+    _ensureFindOverlay();
+    _clearOverlay(_findOverlayAll);
+
+    const total = _findMatches.length;
+    if (total === 0) return;
+
+    // cap: if too many matches, don’t paint all (still count them)
+    if (total > FIND_ALL_HIGHLIGHT_CAP) {
+      _findAllHighlightsCapped = true;
+      return;
+    }
+    _findAllHighlightsCapped = false;
+
+    // yellow (dim)
+    for (const m of _findMatches) {
+      const r = _rangeForMatch(m);
+      _paintRectsToOverlay(_findOverlayAll, Array.from(r.getClientRects()),
+        "rgba(255, 235, 59, 0.34)",   // brighter yellow fill
+        "rgba(255, 235, 59, 0.62)"    // yellow outline
+      );
+    }
+  }
+
+  function _paintCurrentFindHighlight(range) {
+    _ensureFindOverlay();
+    _clearOverlay(_findOverlayCurrent);
+
+    if (!range) return;
+
+    // orange (bright)
+    _paintRectsToOverlay(_findOverlayCurrent, Array.from(range.getClientRects()),
+      "rgba(255, 140, 0, 0.44)",    // brighter orange fill
+      "rgba(255, 140, 0, 0.80)"     // orange outline
+    );
+  }
+
+  function _ensureFindOverlay() {
+    if (_findOverlayAll && _findOverlayCurrent) return;
+    if (!editorDiv) return;
+    
+    // Make editorDiv a positioning context (safe even if already set)
+    if (!editorDiv.style.position) editorDiv.style.position = "relative";
+
+    const mk = () => {
+      const ov = document.createElement("div");
+      ov.style.position = "absolute";
+      ov.style.left = "0";
+      ov.style.top = "0";
+      ov.style.right = "0";
+      ov.style.bottom = "0";
+      ov.style.pointerEvents = "none";
+      ov.style.zIndex = "9998";
+      ov.style.overflow = "visible";
+      return ov;
+    };
+
+    _findOverlayAll = mk();      // dim layer (under)
+    _findOverlayCurrent = mk();  // bright layer (over)
+
+    editorDiv.appendChild(_findOverlayAll);
+    editorDiv.appendChild(_findOverlayCurrent);
+  }
+
+  function clearFindHighlight() {
+    _findCurrentRange = null;
+    _findCurrentMatchIndex = -1;
+    _clearOverlay(_findOverlayCurrent);
+    _updateFindStatus();
+  }
+
+  function clearAllFindHighlights() {
+    clearFindHighlight();
+    _clearOverlay(_findOverlayAll);
+  }
+
+  function setFindHighlight(range, nodeIdx, pos) {
+    _findCurrentRange = range;
+
+    if (nodeIdx == null || pos == null) {
+      _paintCurrentFindHighlight(range);
+      _updateFindStatus();
+      return true;
+    }
+
+    let idx = _findMatchIndexByKey.get(_matchKey(nodeIdx, pos));
+    if (idx == null) {
+      idx = -1;
+      for (let i = 0; i < _findMatches.length; i++) {
+        const m = _findMatches[i];
+        if (m.nodeIdx === nodeIdx && m.pos === pos) { idx = i; break; }
+      }
+    }
+
+    _findCurrentMatchIndex = idx;
+    _paintCurrentFindHighlight(range);
+    _updateFindStatus();
+    return true;
+  }
+
+  function _paintFindOverlay(range) {
+    if (!editorDiv) return;
+    _ensureFindOverlay();
+    if (!_findOverlay) return;
+
+    _findOverlay.innerHTML = "";
+
+    const editorRect = editorDiv.getBoundingClientRect();
+    const rects = Array.from(range.getClientRects());
+
+    for (const r of rects) {
+      if (!r || (r.width === 0 && r.height === 0)) continue;
+
+      const box = document.createElement("div");
+      box.style.position = "absolute";
+      box.style.left = `${(r.left - editorRect.left) + editorDiv.scrollLeft}px`;
+      box.style.top = `${(r.top - editorRect.top) + editorDiv.scrollTop}px`;
+      box.style.width = `${r.width}px`;
+      box.style.height = `${r.height}px`;
+      box.style.borderRadius = "3px";
+      box.style.background = "rgba(255, 220, 80, 0.35)";
+      box.style.boxShadow = "0 0 0 1px rgba(255, 220, 80, 0.35) inset";
+
+      _findOverlay.appendChild(box);
+    }
+  }
+
+  function _ensureFindUI() {
+    if (_findBar) return;
+    const wrap = document.getElementById("wrapper") || document.body;
+
+    const bar = document.createElement("div");
+    bar.style.position = "absolute";
+    bar.style.top = "0px";
+    bar.style.right = "16px"; // leave room for the scrollbar
+    bar.style.zIndex = "9999";
+    bar.style.display = "none";
+    bar.style.gap = "6px";
+    bar.style.alignItems = "center";
+    bar.style.padding = "2px 2px";
+    bar.style.border = "1px solid rgba(0,0,0,0.25)";
+    bar.style.borderRadius = "4px";
+    bar.style.background = "rgba(30,30,30,0.92)";
+    bar.style.backdropFilter = "blur(6px)";
+    bar.style.color = "white";
+    bar.style.fontFamily = "system-ui, -apple-system, Segoe UI, sans-serif";
+    bar.style.fontSize = "13px";
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Find…";
+    input.style.width = "240px";
+    input.style.padding = "4px 6px";
+    input.style.borderRadius = "6px";
+    input.style.border = "1px solid rgba(255,255,255,0.25)";
+    input.style.outline = "none";
+    input.style.background = "rgba(0,0,0,0.25)";
+    input.style.color = "white";
+
+    const mkBtn = (label) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+
+      // Base (idle) look: effectively “no outline”
+      b.style.margin = "0";
+      b.style.padding = "2px 6px";
+      b.style.borderRadius = "4px";
+      b.style.border = "1px solid transparent";
+      b.style.background = "transparent";
+      b.style.color = "#ddd";
+      b.style.cursor = "pointer";
+      b.style.lineHeight = "1";
+      b.style.transition = "border-color 80ms linear, background 80ms linear";
+
+      const applyHover = (on) => {
+        if (on) {
+          b.style.borderColor = "rgba(80, 170, 255, 0.95)";   // blue border on hover
+          b.style.background = "rgba(80, 170, 255, 0.12)";    // subtle fill (optional)
+        } else {
+          b.style.borderColor = "transparent";
+          b.style.background = "transparent";
+        }
+      };
+
+      b.addEventListener("mouseenter", () => applyHover(true));
+      b.addEventListener("mouseleave", () => applyHover(false));
+      b.addEventListener("focus", () => applyHover(true));
+      b.addEventListener("blur", () => applyHover(false));
+
+      return b;
+    };
+
+    const prevBtn = mkBtn("↑");
+    const nextBtn = mkBtn("↓");
+    const closeBtn = mkBtn("✕");
+
+    const status = document.createElement("span");
+    status.style.opacity = "0.85";
+    status.style.marginLeft = "4px";
+    status.style.display = "inline-block";
+    status.style.minWidth = "88px";         // keeps arrows from moving
+    status.style.textAlign = "right";
+    status.style.fontVariantNumeric = "tabular-nums";
+    status.textContent = "0 of 0";
+
+    bar.appendChild(input);
+    bar.appendChild(prevBtn);
+    bar.appendChild(nextBtn);
+    bar.appendChild(closeBtn);
+    bar.appendChild(status);
+
+    wrap.style.position = wrap.style.position || "relative";
+    wrap.appendChild(bar);
+
+    _findBar = bar;
+    _findInput = input;
+    _findPrevBtn = prevBtn;
+    _findNextBtn = nextBtn;
+    _findCloseBtn = closeBtn;
+    _findStatus = status;
+
+    prevBtn.addEventListener("click", () => _findNext(true));
+    nextBtn.addEventListener("click", () => _findNext(false));
+    closeBtn.addEventListener("click", () => _hideFind());
+
+    input.addEventListener("input", () => {
+      const q = input.value;
+
+      if (q.length === 0) {
+        _findMatches = [];
+        _findMatchIndexByKey = new Map();
+        _findMatchesQuery = "";
+        _findCurrentMatchIndex = -1;
+        _findMatchesTextVersion = -1;
+
+        clearAllFindHighlights();
+        if (_findStatus) _findStatus.textContent = "0 of 0";
+        return;
+      }
+
+      _findNext(false, true);
+    });
+
+    _findInput.addEventListener("keydown", (ev) => {
+      ev.stopPropagation(); // critical: prevent editor from seeing keys
+      if (ev.key === "Escape") { ev.preventDefault(); _hideFind(); return; }
+      if (ev.key === "Enter") { ev.preventDefault(); _findNext(ev.shiftKey); return; }
+    });
+    _findInput.addEventListener("keypress", (ev) => ev.stopPropagation());
+    _findInput.addEventListener("keyup", (ev) => ev.stopPropagation());
+  }
+
+  function _showFind(prefillText) {
+    _ensureFindUI();
+    // capture editor selection BEFORE focus() clears it
+    _captureFindAnchorFromSelection();
+
+    _findBar.style.display = "flex";
+
+    if (typeof prefillText === "string" && prefillText.length > 0) {
+      _findInput.value = prefillText;
+      _findCacheDirty = true;
+    }
+
+    _findInput.focus();
+    _findInput.select();
+
+    requestAnimationFrame(() => {
+      const changed = _applyFindClearance(true);
+
+      // Pick the “current” match after clearance exists
+      _jumpFindToAnchorOrFirst();
+
+      // Always repaint on show (cheap and avoids edge-state weirdness)
+      if (_findMatches.length) _paintAllFindHighlights();
+      if (_findCurrentRange) _paintCurrentFindHighlight(_findCurrentRange);
+    });
+  }
+
+  function _hideFind() {
+    if (!_findBar) return;
+    _applyFindClearance(false);
+    _findBar.style.display = "none";
+    _findStatus.textContent = "0 of 0";
+    clearAllFindHighlights();   // <- clears yellow + orange
+    if (editorDiv) editorDiv.focus();
+  }
+
+  function _buildFindTextNodeCache() {
+    _findTextNodes = [];
+    if (!editorDiv) return;
+
+    const walker = document.createTreeWalker(
+      editorDiv,
+      NodeFilter.SHOW_TEXT,
+      {
+        acceptNode: (n) => {
+          if (!n || !n.nodeValue) return NodeFilter.FILTER_REJECT;
+          return n.nodeValue.length ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+        }
+      }
+    );
+
+    let n;
+    while ((n = walker.nextNode())) {
+      _findTextNodes.push(n);
+    }
+  }
+
+  function _selectFindMatchAt(nodeIdx, pos, qLen) {
+    const node = _findTextNodes[nodeIdx];
+    if (!node || node.nodeType !== Node.TEXT_NODE) return false;
+
+    const range = document.createRange();
+    range.setStart(node, pos);
+    range.setEnd(node, pos + qLen);
+
+    setFindHighlight(range, nodeIdx, pos);
+    _findMoveSeq = _findAnchorSeq;
+
+    requestAnimationFrame(() => scrollRangeIntoViewIfNeeded(range));
+
+    if (_findInput) _findInput.focus({ preventScroll: true });
+    return true;
+  }
+
+  function _jumpFindToAnchorOrFirst() {
+    const q = (_findInput && _findInput.value ? _findInput.value : "");
+    if (q.length === 0) return false;
+
+    const qLower = q.toLowerCase();
+    const qLen = q.length;
+
+    _ensureFindMatches(qLower);
+    _updateFindStatus();
+
+    if (!_findMatches.length) {
+      clearFindHighlight();
+      _updateFindStatus();
+      return false;
+    }
+
+    const a = _findAnchorRange;
+    if (a && a.startContainer && a.startContainer.nodeType === Node.TEXT_NODE && editorDiv.contains(a.startContainer)) {
+      const nodeIdx = _findTextNodes.indexOf(a.startContainer);
+      if (nodeIdx >= 0) {
+        const off = a.startOffset;
+
+        // Find the first match that contains the caret, else first match at/after caret, else after node, else first.
+        let bestIdx = -1;
+
+        for (let i = 0; i < _findMatches.length; i++) {
+          const m = _findMatches[i];
+          if (m.nodeIdx !== nodeIdx) continue;
+          const start = m.pos;
+          const end = m.pos + qLen;
+          if (start <= off && off <= end) { bestIdx = i; break; }
+        }
+
+        if (bestIdx < 0) {
+          for (let i = 0; i < _findMatches.length; i++) {
+            const m = _findMatches[i];
+            if (m.nodeIdx !== nodeIdx) continue;
+            if (m.pos >= off) { bestIdx = i; break; }
+          }
+        }
+
+        if (bestIdx < 0) {
+          for (let i = 0; i < _findMatches.length; i++) {
+            const m = _findMatches[i];
+            if (m.nodeIdx > nodeIdx) { bestIdx = i; break; }
+          }
+        }
+
+        if (bestIdx < 0) bestIdx = 0;
+        const m = _findMatches[bestIdx];
+        return _selectFindMatchAt(m.nodeIdx, m.pos, qLen);
+      }
+    }
+
+    const m0 = _findMatches[0];
+    return _selectFindMatchAt(m0.nodeIdx, m0.pos, qLen);
+  }
+
+  function scrollRangeIntoViewIfNeeded(range) {
+    if (!editorDiv || !range) return;
+
+    const rect = range.getBoundingClientRect();
+    const boxRect = editorDiv.getBoundingClientRect();
+
+    // If rect is empty/invalid, fall back to element scrollIntoView (matches caret logic style)
+    if (!rect || (rect.top === 0 && rect.bottom === 0)) {
+      let node = range.startContainer;
+      if (node && node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+      if (node && node.scrollIntoView) node.scrollIntoView({ block: "nearest", inline: "nearest" });
+      return;
+    }
+
+    const pad = 24;
+
+    // If Find is visible, treat the clearance as the “top safe zone”.
+    // This makes autoscroll happen only when the match is near/under the bar.
+    const findVisible = _findBar && _findBar.style.display !== "none";
+    const topPad = findVisible ? Math.max(pad, _findClearancePx + 6) : pad;
+
+    const topLimit = boxRect.top + topPad;
+    const botLimit = boxRect.bottom - pad;
+
+    if (rect.top < topLimit) {
+      editorDiv.scrollTop -= (topLimit - rect.top);
+    } else if (rect.bottom > botLimit) {
+      editorDiv.scrollTop += (rect.bottom - botLimit);
+    }
+  }
+
+  function _findNext(backwards, fromTop) {
+    if (!editorDiv) return;
+    _ensureFindUI();
+
+    const q = (_findInput && _findInput.value ? _findInput.value : "");
+    if (q.length === 0) {
+      clearAllFindHighlights();     // or clearFindHighlight() if you prefer
+      _findStatus.textContent = "0 of 0";
+      return;
+    }
+
+    if (_findCacheDirty || !_findTextNodes) {
+      _buildFindTextNodeCache();
+      _findCacheDirty = false;
+    }
+
+    const nodes = _findTextNodes || [];
+    if (!nodes.length) {
+      _findStatus.textContent = "No matches";
+      clearFindHighlight();
+      return;
+    }
+
+    const qLower = q.toLowerCase();
+    _ensureFindMatches(qLower);
+    _updateFindStatus();
+
+    // Base range:
+    // - if user moved caret since last find, use caret anchor
+    // - otherwise use current found match range
+    let base = null;
+    const useAnchor = (_findAnchorRange && _findAnchorSeq > _findMoveSeq);
+    if (!fromTop) {
+      if (useAnchor) base = _findAnchorRange;
+      else if (_findCurrentRange) base = _findCurrentRange;
+    }
+
+    let startNodeIdx = backwards ? (nodes.length - 1) : 0;
+    let startOff = backwards ? Number.MAX_SAFE_INTEGER : 0;
+
+    if (!fromTop && base && base.startContainer && base.startContainer.nodeType === Node.TEXT_NODE) {
+      const container = backwards ? base.startContainer : base.endContainer;
+      const off = backwards ? (base.startOffset - 1) : base.endOffset;
+
+      const idx = nodes.indexOf(container);
+      if (idx >= 0) {
+        startNodeIdx = idx;
+        startOff = off;
+      }
+    } else if (!fromTop) {
+      // fall back to current editor selection if it exists in the editor
+      const sel = window.getSelection && window.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        const r = sel.getRangeAt(0);
+        if (r && editorDiv.contains(r.startContainer) && r.startContainer.nodeType === Node.TEXT_NODE) {
+          const container = backwards ? r.startContainer : r.endContainer;
+          const off = backwards ? (r.startOffset - 1) : r.endOffset;
+          const idx = nodes.indexOf(container);
+          if (idx >= 0) {
+            startNodeIdx = idx;
+            startOff = off;
+          }
+        }
+      }
+    }
+
+    const trySelect = (nodeIdx, pos) => {
+      const node = _findTextNodes[nodeIdx];
+      if (!node || node.nodeType !== Node.TEXT_NODE) return false; // prevents Range.setStart crash
+
+      const range = document.createRange();
+      range.setStart(node, pos);
+      range.setEnd(node, pos + q.length);
+
+      // temp debug log
+      const key = _matchKey(nodeIdx, pos);
+      const idx = _findMatchIndexByKey.get(key);
+
+      setFindHighlight(range, nodeIdx, pos);      // sets _findCurrentRange internally
+
+      const changed = _applyFindClearance(true);
+      if (changed) {
+        requestAnimationFrame(() => {
+          if (_findMatches.length) _paintAllFindHighlights();
+          if (_findCurrentRange) _paintCurrentFindHighlight(_findCurrentRange);
+        });
+      }
+
+      _findMoveSeq = _findAnchorSeq; // selection now becomes the base unless user moves caret
+
+      requestAnimationFrame(() => scrollRangeIntoViewIfNeeded(range));
+
+      if (_findInput) _findInput.focus({ preventScroll: true });
+      return true;
+    };
+
+    const findInNodeForward = (node, fromOff) => {
+      const t = node.nodeValue || "";
+      const hay = t.toLowerCase();
+      const off = Math.max(0, fromOff || 0);
+      const pos = hay.indexOf(qLower, off);
+      return pos >= 0 ? pos : -1;
+    };
+
+    const findInNodeBackward = (node, fromOff) => {
+      const t = node.nodeValue || "";
+      const hay = t.toLowerCase();
+
+      // fromOff is the last index we allow; if < 0, no match in this node
+      if (fromOff < 0) return -1;
+
+      const end = Math.min(hay.length, fromOff + 1);
+      if (end <= 0) return -1;
+
+      const pos = hay.lastIndexOf(qLower, end - 1);
+      return pos >= 0 ? pos : -1;
+    };
+
+    let found = false;
+
+    if (backwards) {
+      // 1) search current -> beginning
+      for (let i = startNodeIdx; i >= 0; i--) {
+        const off = (i === startNodeIdx) ? startOff : Number.MAX_SAFE_INTEGER;
+        const pos = findInNodeBackward(nodes[i], off);
+        if (pos >= 0) { found = trySelect(i, pos); break; }
+      }
+
+      // 2) wrap: search end -> (startNodeIdx + 1), EXCLUDING current node to avoid "stuck at 0"
+      if (!found) {
+        for (let i = nodes.length - 1; i > startNodeIdx; i--) {
+          const pos = findInNodeBackward(nodes[i], Number.MAX_SAFE_INTEGER);
+          if (pos >= 0) { found = trySelect(i, pos); break; }
+        }
+      }
+    } else {
+      // 1) search current -> end
+      for (let i = startNodeIdx; i < nodes.length; i++) {
+        const off = (i === startNodeIdx) ? startOff : 0;
+        const pos = findInNodeForward(nodes[i], off);
+        if (pos >= 0) { found = trySelect(i, pos); break; }
+      }
+
+      // 2) wrap: search beginning -> (startNodeIdx - 1), EXCLUDING current node
+      if (!found) {
+        for (let i = 0; i < startNodeIdx; i++) {
+          const pos = findInNodeForward(nodes[i], 0);
+          if (pos >= 0) { found = trySelect(i, pos); break; }
+        }
+      }
+    }
+
+    if (!found && _findMatches.length > 0) {
+      const m = backwards ? _findMatches[_findMatches.length - 1] : _findMatches[0];
+      found = trySelect(m.nodeIdx, m.pos);
+    }
+
+    if (!found) {
+      clearFindHighlight();
+      _updateFindStatus(); // will show 0 of N (or 0 of 0)
+    }
+  }
+
+  function _matchKey(nodeIdx, pos) {
+    return `${nodeIdx}:${pos}`;
+  }
+
+  function _ensureFindMatches(qLower) {
+    if (!editorDiv) return;
+
+    // Empty query: avoid indexOf("", ...) infinite loop
+    if (!qLower) {
+      _findMatchesQuery = "";
+      _findMatchesTextVersion = _findTextVersion;
+      _findMatches = [];
+      _findMatchIndexByKey = new Map();
+      _findAllHighlightsCapped = false;
+      _clearOverlay(_findOverlayAll);
+      return;
+    }
+
+    const needRebuild =
+      (qLower !== _findMatchesQuery) ||
+      (_findMatchesTextVersion !== _findTextVersion) ||
+      _findCacheDirty;
+
+    if (!needRebuild) return;
+
+    _findMatchesQuery = qLower;
+    _findMatchesTextVersion = _findTextVersion;
+    _findMatches = [];
+    _findMatchIndexByKey = new Map();
+    _findAllHighlightsCapped = false;
+
+    // Make sure text nodes cache exists (your code already does this in _findNext, but safe here)
+    if (_findCacheDirty || !_findTextNodes) {
+      _buildFindTextNodeCache();
+      _findCacheDirty = false;
+    }
+
+    const nodes = _findTextNodes || [];
+    const qLen = qLower.length;
+
+    for (let nodeIdx = 0; nodeIdx < nodes.length; nodeIdx++) {
+      const t = nodes[nodeIdx].nodeValue || "";
+      const hay = t.toLowerCase();
+
+      let start = 0;
+      while (true) {
+        const pos = hay.indexOf(qLower, start);
+        if (pos < 0) break;
+
+        const idx = _findMatches.length;
+        _findMatches.push({ nodeIdx, pos });
+        _findMatchIndexByKey.set(_matchKey(nodeIdx, pos), idx);
+
+        // advance non-overlapping
+        start = pos + qLen;
+      }
+    }
+
+    // repaint dim-all when query changes / doc changes (but cap for performance)
+    _paintAllFindHighlights();
+  }
+
+  function _updateFindStatus() {
+    if (!_findStatus) return;
+
+    const total = _findMatches.length;
+    const cur = (_findCurrentMatchIndex >= 0) ? (_findCurrentMatchIndex + 1) : 0;
+
+    _findStatus.textContent = `${cur} of ${total}`;
+
+    // let s = `${cur} of ${total}`;
+    // if (_findAllHighlightsCapped) s += " (highlights capped)";
+    // _findStatus.textContent = s;
+  }
+
+  let _findEditRefreshTimer = null;
+
+  function _isFindVisible() {
+    return _findBar && _findBar.style.display !== "none";
+  }
+
+  function _scheduleFindRefreshAfterEdit() {
+    if (!_isFindVisible()) return;
+    if (!_findInput) return;
+
+    const q = _findInput.value;
+    if (!q || q.length === 0) return;
+
+    if (_findEditRefreshTimer) clearTimeout(_findEditRefreshTimer);
+    _findEditRefreshTimer = setTimeout(() => {
+      _findEditRefreshTimer = null;
+
+      // Force cache rebuild from latest DOM
+      _findCacheDirty = true;
+
+      const qLower = q.toLowerCase();
+      _ensureFindMatches(qLower);
+      _updateFindStatus();
+
+      if (_findMatches.length === 0) {
+        clearFindHighlight();
+        _updateFindStatus();
+        return;
+      }
+
+      // Keep the same "match number" if possible
+      let idx = _findCurrentMatchIndex;
+      if (idx < 0) idx = 0;
+      if (idx >= _findMatches.length) idx = _findMatches.length - 1;
+
+      const m = _findMatches[idx];
+      const node = _findTextNodes && _findTextNodes[m.nodeIdx];
+      if (!node || node.nodeType !== Node.TEXT_NODE) return;
+
+      const range = document.createRange();
+      range.setStart(node, m.pos);
+      range.setEnd(node, m.pos + q.length);
+
+      // repaint + update status, but no scroll/focus
+      setFindHighlight(range, m.nodeIdx, m.pos);
+    }, 60);
+  }
+
+  // ---------------------------------------------------------------------------
   // Helpers: alias index + linkifying
   // ---------------------------------------------------------------------------
 
@@ -439,20 +1319,64 @@
     }
   }
 
+  function updateModifierDownClass() {
+    if (!editorDiv) return;
+    if (_linkModifierDown) {
+      editorDiv.classList.add("modifier-down");
+    } else {
+      editorDiv.classList.remove("modifier-down");
+    }
+  }
+
   // Keep _linkModifierDown in sync with the current event's modifier state.
   function syncModifierFromEvent(ev) {
     const mod = !!(ev.ctrlKey || ev.metaKey);
     if (mod !== _linkModifierDown) {
       _linkModifierDown = mod;
       updateCtrlHighlight();
+      updateModifierDownClass();
     }
+  }
+
+  function _isAllSpaces(s) {
+    // Treat normal space + NBSP as “spaces”
+    return s.length > 0 && /^[ \u00A0]+$/.test(s);
+  }
+
+  function _prefillFromSelection(raw) {
+    if (typeof raw !== "string" || raw.length === 0) return "";
+
+    // If selection is ONLY spaces, keep it exactly (user may want to find indenting / alignment)
+    if (_isAllSpaces(raw)) return raw;
+
+    // Otherwise, strip ONLY edge spaces (not internal spaces)
+    return raw.replace(/^[ \u00A0]+|[ \u00A0]+$/g, "");
   }
 
   function handleKeyDown(ev) {
     syncModifierFromEvent(ev);
 
-    // We let Qt's QShortcut(QKeySequence.Save, ...) handle Ctrl+S.
-    // Here we just track typing activity; actual docChanged is driven by handleInput.
+    // Ctrl/Cmd+F: open Find bar (prefill with selection if present)
+    if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && (ev.key === "f" || ev.key === "F")) {
+      ev.preventDefault();
+      ev.stopPropagation();
+
+      const sel = window.getSelection && window.getSelection();
+      const rawSelected = sel ? (sel.toString() || "") : "";
+      const selected = _prefillFromSelection(rawSelected);
+      _showFind(selected);
+      return;
+    }
+
+    // Esc closes Find if it's open
+    if (ev.key === "Escape" && _findBar && _findBar.style.display !== "none") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      _hideFind();
+      return;
+    }
+
+    // Normal typing activity
     sendActivity("typing");
   }
 
@@ -460,6 +1384,83 @@
     // Some engines are flaky about keyup for modifiers; this will still run
     // for any other key and keep us in sync.
     syncModifierFromEvent(ev);
+    _captureFindAnchorFromSelection();
+  }
+
+  function expectedAliasForSpan(spanEl) {
+    if (!_worldAliasIndex || _worldAliasIndex.length === 0) return null;
+
+    const kindAttr = spanEl.getAttribute("data-kind") || "world";
+    const widAttr = spanEl.getAttribute("data-world-item-id") || "";
+    const aliasIdAttr = spanEl.getAttribute("data-alias-id") || "";
+    const candIdAttr = spanEl.getAttribute("data-candidate-id") || "";
+
+    for (const entry of _worldAliasIndex) {
+      const entryWid = String(entry.worldItemId || "");
+      const entryAliasId = entry.aliasId != null ? String(entry.aliasId) : "";
+      const entryCandId = entry.candidateId != null ? String(entry.candidateId) : "";
+
+      if (kindAttr === "candidate") {
+        if (entryCandId !== candIdAttr) continue;
+      } else {
+        if (entryWid !== widAttr) continue;
+        if (entryAliasId !== aliasIdAttr) continue;
+      }
+      return entry.alias || null;
+    }
+    return null;
+  }
+
+  function setCaret(node, offset) {
+    const sel = window.getSelection && window.getSelection();
+    if (!sel) return;
+    const r = document.createRange();
+    r.setStart(node, Math.max(0, offset));
+    r.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+
+  function maybeSplitEdgeTypingOutOfLink(linkEl, caretNode, caretOffset) {
+    // Goal: keep the linked alias intact when typing at the *edges* of a wikilink,
+    // moving any extra prefix/suffix outside the span.
+    if (!linkEl || !caretNode || caretNode.nodeType !== Node.TEXT_NODE) return false;
+    const parent = linkEl.parentNode;
+    if (!parent) return false;
+
+    const expected = expectedAliasForSpan(linkEl);
+    if (!expected) return false;
+
+    const full = caretNode.textContent || "";
+    if (full === expected) return false;
+
+    // Suffix typed at end: "John" -> "Johns"
+    if (full.startsWith(expected)) {
+      const suffix = full.slice(expected.length);
+      if (suffix.length > 0) {
+        caretNode.textContent = expected;
+        const suffixNode = document.createTextNode(suffix);
+        parent.insertBefore(suffixNode, linkEl.nextSibling);
+        // put caret in the suffix, at end (feels like "typing continues outside the link")
+        setCaret(suffixNode, suffix.length);
+        return true;
+      }
+    }
+
+    // Prefix typed at start: "John" -> "xJohn"
+    if (full.endsWith(expected)) {
+      const prefix = full.slice(0, full.length - expected.length);
+      if (prefix.length > 0) {
+        caretNode.textContent = expected;
+        const prefixNode = document.createTextNode(prefix);
+        parent.insertBefore(prefixNode, linkEl);
+        // caret at end of prefix
+        setCaret(prefixNode, prefix.length);
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function dropLinkIfTypingInside() {
@@ -598,14 +1599,55 @@
     sel2.addRange(newRange);
   }
 
-  function handleInput(_ev) {
+  function scrollCaretIntoViewIfNeeded() {
+    if (!editorDiv) return;
+
+    const sel = window.getSelection && window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+
+    const r = sel.getRangeAt(0).cloneRange();
+    r.collapse(true);
+
+    const caretRect = r.getBoundingClientRect();
+    const boxRect = editorDiv.getBoundingClientRect();
+
+    // If rect is empty/invalid, fall back to element scrollIntoView
+    if (!caretRect || (caretRect.top === 0 && caretRect.bottom === 0)) {
+      let node = r.startContainer;
+      if (node && node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+      if (node && node.scrollIntoView) node.scrollIntoView({ block: "nearest", inline: "nearest" });
+      return;
+    }
+
+    const pad = 24;
+    const topLimit = boxRect.top + pad;
+    const botLimit = boxRect.bottom - pad;
+
+    if (caretRect.top < topLimit) {
+      editorDiv.scrollTop -= (topLimit - caretRect.top);
+    } else if (caretRect.bottom > botLimit) {
+      editorDiv.scrollTop += (caretRect.bottom - botLimit);
+    }
+  }
+
+  function handleInput(ev) {
     // If the user is typing inside a wikilink, drop the link wrapper
     dropLinkIfTypingInside();
+    _findCacheDirty = true;
+    _findTextVersion += 1;
+    _scheduleFindRefreshAfterEdit();
     notifyDocChangedDebounced(true);
+
+    if (ev && (ev.inputType === "historyUndo" || ev.inputType === "historyRedo")) {
+      requestAnimationFrame(scrollCaretIntoViewIfNeeded);
+    }
   }
 
   function handleScroll(_ev) {
     sendActivity("scrolling");
+    if (_findBar && _findBar.style.display !== "none" && _findCurrentRange) {
+      requestAnimationFrame(() => _paintCurrentFindHighlight(_findCurrentRange));
+    }
   }
 
   function handleMouseDown(ev) {
@@ -615,6 +1657,38 @@
     const followMode = prefs.linkFollowMode || "ctrlClick";
 
     const modifierDown = !!(ev.ctrlKey || ev.metaKey);
+
+    // If the user clicks on "empty" space inside the editor root, Chromium can fail
+    // to move the caret. Explicitly place it based on click point, fallback to end.
+    if (ev.button === 0 && ev.target === editorDiv) {
+      ev.preventDefault();
+      editorDiv.focus();
+
+      const sel = window.getSelection && window.getSelection();
+      if (sel) {
+        let range = null;
+
+        if (document.caretRangeFromPoint) {
+          range = document.caretRangeFromPoint(ev.clientX, ev.clientY);
+        } else if (document.caretPositionFromPoint) {
+          const pos = document.caretPositionFromPoint(ev.clientX, ev.clientY);
+          if (pos) {
+            range = document.createRange();
+            range.setStart(pos.offsetNode, pos.offset);
+            range.collapse(true);
+          }
+        }
+
+        if (!range || !editorDiv.contains(range.startContainer)) {
+          range = document.createRange();
+          range.selectNodeContents(editorDiv);
+          range.collapse(false);
+        }
+
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    }
 
     // Decide whether this click should follow links at all.
     if (followMode === "ctrlClick") {
@@ -779,7 +1853,21 @@
       editorDiv.addEventListener("input", handleInput);
       editorDiv.addEventListener("scroll", handleScroll);
       editorDiv.addEventListener("mousedown", handleMouseDown);
+      editorDiv.addEventListener("mouseup", _captureFindAnchorFromSelection);
       editorDiv.addEventListener("mousemove", handleMouseMove);
+
+      _ensureFindUI();
+      window.addEventListener("resize", () => {
+        if (_findBar && _findBar.style.display !== "none") {
+          requestAnimationFrame(() => {
+            const changed = _applyFindClearance(true);
+            if (changed) {
+              if (_findMatches.length) _paintAllFindHighlights();
+              if (_findCurrentRange) _paintCurrentFindHighlight(_findCurrentRange);
+            }
+          });
+        }
+      });
     },
 
     loadDocument: function (config) {
@@ -806,6 +1894,18 @@
       // Apply link display mode to the editor root
       const prefs = _docConfig.prefs || {};
       const mode = prefs.showWikilinks || "full";
+
+      updateModifierDownClass();
+
+      const followMode = prefs.linkFollowMode || "ctrlClick";
+      editorDiv.classList.remove("follow-click", "follow-ctrlClick", "follow-none");
+      if (followMode === "click") {
+        editorDiv.classList.add("follow-click");
+      } else if (followMode === "ctrlClick") {
+        editorDiv.classList.add("follow-ctrlClick");
+      } else {
+        editorDiv.classList.add("follow-none");
+      }
 
       editorDiv.classList.remove("links-full", "links-minimal");
       if (mode === "ctrlReveal") {

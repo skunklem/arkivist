@@ -23,6 +23,7 @@ class DocPage(QtWidgets.QWidget):
 
     # Could be expanded later (e.g. dirtyChanged, titleChanged)
     saved = Signal(int)  # emit doc_id on successful hard save
+    titleChanged = Signal(str)     # emit new title text
 
     def __init__(
         self,
@@ -31,18 +32,25 @@ class DocPage(QtWidgets.QWidget):
         doc_id: int,
         parent: Optional[QtWidgets.QWidget] = None,
         initial_prefs: Optional[Dict[str, Any]] = None,
+        show_header: bool = True,
+        show_status_line: bool = True,
     ) -> None:
         super().__init__(parent)
         self.app = app
         self.doc_type = doc_type
         self.doc_id = int(doc_id)
 
+        self._show_header = bool(show_header)
+        self._show_status_line = bool(show_status_line)
+
         self._dirty = False
-        self._current_version_id: int = 0
+        self._current_version_id: int | None = None  # IMPORTANT: None default
+
         self._editor_prefs: Dict[str, Any] = dict(initial_prefs or {
             "showWikilinks": "full",
             "highlightLinksWhileCtrl": True,
             "linkFollowMode": "ctrlClick",
+            "hardSaveOnBlur": False,   # IMPORTANT for tabs staying dirty
         })
 
         self._build_ui()
@@ -68,11 +76,13 @@ class DocPage(QtWidgets.QWidget):
         header.addStretch(1)
         header.addWidget(self.statusLabel)
 
-        vbox.addLayout(header)
+        if self._show_header:
+            vbox.addLayout(header)
 
         # Optional status line (like world detail)
         self.statusLine = StatusLine(self)
-        vbox.addWidget(self.statusLine)
+        if self._show_status_line:
+            vbox.addWidget(self.statusLine)
         self.statusLine.show_neutral("Loaded")
 
         # Main editor pane
@@ -144,7 +154,6 @@ class DocPage(QtWidgets.QWidget):
             return
 
         # Keep the card if the pointer is still over the editor (or a child)
-        from PySide6 import QtWidgets  # or put at top of file if you prefer
         w = QtWidgets.QApplication.widgetAt(pos)
 
         def _is_child_of(a: QtWidgets.QWidget, b: QtWidgets.QWidget) -> bool:
@@ -245,6 +254,21 @@ class DocPage(QtWidgets.QWidget):
 
     # --- Loading / saving ---------------------------------------------------
 
+    def is_dirty(self) -> bool:
+        return bool(self._dirty)
+
+    def title_text(self) -> str:
+        return self.titleLabel.text() if self.titleLabel else ""
+    
+    def set_title_text(self, title: str) -> None:
+        title = (title or "").strip() or "(Untitled)"
+        cur = self.titleLabel.text() if self.titleLabel else ""
+        if cur == title:
+            return
+        if self.titleLabel:
+            self.titleLabel.setText(title)
+        self.titleChanged.emit(title)
+
     def _load_from_db(self) -> None:
         """
         Load chapter/note metadata and text from the DB and feed the editor.
@@ -267,7 +291,7 @@ class DocPage(QtWidgets.QWidget):
             # This helper lazily creates an active version row if needed.
             ver_id = db.chapter_active_version_id(chap_id)
 
-        self._current_version_id = int(ver_id) if ver_id else 0
+        self._current_version_id = int(ver_id) if ver_id is not None else None
 
         # Use the same helper used elsewhere for chapter text
         md = db.chapter_content(chap_id, version_id=ver_id) or ""
@@ -333,7 +357,7 @@ class DocPage(QtWidgets.QWidget):
 
         # Resolve version: prefer the one from the editor, otherwise fall back to our cache,
         # then to DB helpers that know how to pick/create an active version.
-        ver_id = int(version_id) if version_id else 0
+        ver_id = int(version_id) if version_id else None
         if not ver_id:
             if self._current_version_id:
                 ver_id = int(self._current_version_id)
@@ -343,6 +367,9 @@ class DocPage(QtWidgets.QWidget):
         if not ver_id:
             # If this ever triggers, we have a schema/logic issue and should fix it explicitly.
             raise RuntimeError(f"Could not resolve a chapter_version_id for chapter {chap_id}")
+
+        if chap_id is None or ver_id is None:
+            return
 
         markdown = markdown or ""
         html_snapshot = html_snapshot or ""
@@ -367,7 +394,7 @@ class DocPage(QtWidgets.QWidget):
         self._editor_prefs = dict(prefs or {})
 
     def _on_editor_focus_lost(self) -> None:
-        if self._dirty:
+        if self._dirty and self._editor_prefs.get("hardSaveOnBlur", False):
             # mirror world-detail: auto-save-on-blur, but via our hard-save path
             self.request_save_all_editors()
         self.statusLine.show_neutral("Viewing")
